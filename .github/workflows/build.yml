@@ -6,6 +6,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (e.g. v0.2.0). Leave empty to build only."
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -63,7 +68,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -75,9 +80,15 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Name Linux asset
+        run: cp dist/GakumasLauncher dist/GakumasLauncher-linux
+
       - uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
           files: |
             dist/GakumasLauncher.exe
-            dist/GakumasLauncher
+            dist/GakumasLauncher-linux
           generate_release_notes: true
+          fail_on_unmatched_files: true

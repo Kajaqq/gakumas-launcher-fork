@@ -2,7 +2,7 @@
 
 A Windows and Linux launcher that runs Gakuen Idolmaster (DMM version) without DMM GAME PLAYER or a VPN. The built-in VPN engines are user space, so no OS-level VPN or network configuration is needed.
 
-Download `GakumasLauncher.exe` from [Releases](../../releases) and run it. The game must have been installed at least once through DMM GAME PLAYER.
+Download `GakumasLauncher.exe` from [Releases](../../releases) and run it. DMM GAME PLAYER does not need to be installed: the launcher handles login, the launch token, and the game file downloads directly. Point **Game folder → Change** at an existing installation, or at an **empty folder** — the launcher will download the game files from scratch on first start.
 
 ## This fork's features
 
