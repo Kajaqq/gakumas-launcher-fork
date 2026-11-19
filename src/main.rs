@@ -20,80 +20,6 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::DialogExt;
 
-/// Register a desktop entry and icon so Wayland compositors show the app icon
-/// instead of a generic one. The GTK app id comes from `enableGTKAppId` in
-/// tauri.conf.json and must match this desktop file's name/StartupWMClass.
-#[cfg(not(windows))]
-fn install_desktop_entry() {
-    const APP_ID: &str = "local.gakumas.launcher";
-    let Some(home) = std::env::var_os("HOME") else {
-        return;
-    };
-    let home = PathBuf::from(home);
-    let applications = home.join(".local/share/applications");
-    let icons_root = home.join(".local/share/icons/hicolor");
-    if std::fs::create_dir_all(&applications).is_err()
-        || std::fs::create_dir_all(&icons_root).is_err()
-    {
-        return;
-    }
-    let mut changed = false;
-
-    // A user-level hicolor tree needs its own index.theme to be discoverable.
-    let index = icons_root.join("index.theme");
-    if !index.exists() {
-        changed = true;
-        let _ = std::fs::write(
-            &index,
-            "[Icon Theme]\nName=Hicolor\nComment=Fallback icon theme\nDirectories=16x16/apps,32x32/apps,48x48/apps,64x64/apps,128x128/apps,256x256/apps,512x512/apps\n\n[16x16/apps]\nSize=16\nType=Application\n\n[32x32/apps]\nSize=32\nType=Application\n\n[48x48/apps]\nSize=48\nType=Application\n\n[64x64/apps]\nSize=64\nType=Application\n\n[128x128/apps]\nSize=128\nType=Application\n\n[256x256/apps]\nSize=256\nType=Application\n\n[512x512/apps]\nSize=512\nType=Application\n",
-        );
-    }
-
-    // Taskbars request small icons; a single 512px entry can fall back to the
-    // generic icon, so install the standard sizes from the embedded PNG.
-    for size in [16, 32, 48, 64, 128, 256, 512] {
-        let dir = icons_root.join(format!("{size}x{size}/apps"));
-        if std::fs::create_dir_all(&dir).is_err() {
-            continue;
-        }
-        let path = dir.join(format!("{APP_ID}.png"));
-        if path.exists() {
-            continue;
-        }
-        // GTK scales the source image to the size declared in index.theme.
-        let _ = std::fs::write(&path, include_bytes!("../icons/icon.png"));
-    }
-
-    let desktop = applications.join(format!("{APP_ID}.desktop"));
-    if let Ok(exe) = std::env::current_exe() {
-        let exec = exe.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
-        let contents = format!(
-            "[Desktop Entry]\nType=Application\nName=Gakumas Launcher\nExec=\"{exec}\"\nIcon={APP_ID}\nStartupWMClass={APP_ID}\nTerminal=false\nCategories=Game;\n"
-        );
-        let same = std::fs::read_to_string(&desktop)
-            .map(|s| s == contents)
-            .unwrap_or(false);
-        if !same {
-            changed = true;
-            let _ = std::fs::write(&desktop, contents);
-        }
-    }
-
-    if changed {
-        let _ = std::process::Command::new("gtk-update-icon-cache")
-            .arg("-f")
-            .arg("-t")
-            .arg(&icons_root)
-            .status();
-        let _ = std::process::Command::new("update-desktop-database")
-            .arg(&applications)
-            .status();
-    }
-}
-
-#[cfg(windows)]
-fn install_desktop_entry() {}
-
 /// Status returned on platforms without Proton support, with the same keys.
 fn proton_unavailable() -> Value {
     json!({
@@ -790,7 +716,6 @@ fn main() {
             }
         })
         .setup(|app| {
-            install_desktop_entry();
             if let Some(win) = app.get_webview_window("main") {
                 fit_to_screen(&win);
             }
