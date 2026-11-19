@@ -1,0 +1,10 @@
+{
+    "delTextureRemoteAfterUpdate": true,
+    "enableConsole": true,
+    "transRemoteZipUrl": "",
+    "useAPIAssets": true,
+    "useAPIAssetsURL": "https://api.github.com/repos/NatsumeLS/Gakumas-Translation-Data-EN/releases/latest",
+    "useAPITextureAssets": false,
+    "useAPITextureAssetsURL": "",
+    "useRemoteAssets": false
+}

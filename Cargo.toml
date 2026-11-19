@@ -39,6 +39,8 @@ httparse = "1"
 # Plain HTTPS (login API, file list, game file downloads) over the normal connection.
 ureq = { version = "2", default-features = false, features = ["tls", "native-tls", "cookies"] }
 cookie_store = { version = "0.21.1", default-features = false }
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+tempfile = "3"
 # TLS for www.vpngate.net, which only offers TLS 1.2 CBC suites that rustls does not support.
 # Uses schannel on Windows and OpenSSL on Linux.
 native-tls = "0.2"
