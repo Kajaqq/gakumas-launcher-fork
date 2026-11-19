@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Main window only. The DMM login windows load external pages and get no IPC access.",
-  "windows": ["main"],
+  "windows": ["main", "dmm_browser"],
   "permissions": [
     "core:default",
     "core:window:allow-minimize",

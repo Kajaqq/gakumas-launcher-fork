@@ -110,6 +110,7 @@ struct AppState {
     auto_start_pending: Mutex<bool>,
     /// 진행 중에도 닫겠다고 확인했는지
     force_close: AtomicBool,
+    browser_proxy: Mutex<Option<gakumas_launcher::browser_proxy::BrowserProxy>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -401,6 +402,14 @@ async fn start_game(app: AppHandle) -> Result<String, String> {
         launcher::start_game(store, &get_code, &progress, true)
     })
     .await;
+    // New accounts (result_code 313) need a one-time DMM GAMES profile
+    // registration on the website. Open it automatically so the user only
+    // has to finish it in the browser, then press Start again.
+    if let Err(e) = &result {
+        if e.contains("profile registration is required") {
+            let _ = open_dmm_browser(app.clone(), Some(DMM_SETUP_URL.to_string()));
+        }
+    }
     // 게임이 실행됐고 '게임 실행 후 런처 종료'가 켜져 있으면 런처를 닫음
     if result.is_ok() && app.state::<AppState>().store.settings().close_after_launch {
         app.exit(0);
@@ -543,22 +552,78 @@ async fn proton_install_dw(app: AppHandle) -> Result<String, String> {
     }
 }
 
+const DMM_BROWSER_LABEL: &str = "dmm_browser";
+const DMM_TOP_URL: &str = "https://www.dmm.com/";
+/// Official new-account setup URL (profile registration -> game installer).
+const DMM_SETUP_URL: &str = "https://accounts.dmm.com/service/login/password?channel=games&path=https%3A%2F%2Fpersonal.games.dmm.com%2Fprofile%2Fregist%2Fskip%3Fback_url%3Dhttps%253A%252F%252Fsite-gameplayer.dmm.com%252Fgameplayer%252Fgame%252Finstaller%252Fwin%252Fx86%252Fgakumas%252Fcl%252Fgeneral";
+/// Open (or focus) a freely navigable DMM browser window. Uses the same
+/// WebView approach as the login window. The injected script adds an address bar.
+#[tauri::command]
+fn open_dmm_browser(app: AppHandle, url: Option<String>) -> Result<String, String> {
+    if let Some(win) = app.get_webview_window(DMM_BROWSER_LABEL) {
+        if let Some(u) = url {
+            if let Ok(target) = u.parse::<tauri::Url>() {
+                let _ = win.navigate(target);
+            }
+        }
+        let _ = win.show();
+        let _ = win.set_focus();
+        return Ok("DMM browser already open".to_string());
+    }
+    let target_url = url.unwrap_or_else(|| DMM_TOP_URL.to_string());
+    let url: tauri::Url = target_url
+        .parse()
+        .map_err(|e| format!("Invalid DMM URL: {e}"))?;
+
+    let proxy_url: Option<tauri::Url> = {
+        let state = app.state::<AppState>();
+        let mode = state.store.settings().mode;
+        let mut guard = state.browser_proxy.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(
+                gakumas_launcher::browser_proxy::start(&state.store, &mode)
+                    .map_err(|e| format!("Failed to start the VPN browser proxy: {e}"))?,
+            );
+        }
+        guard.as_ref().and_then(|p| p.url().parse().ok())
+    };
+
+    let mut builder = WebviewWindowBuilder::new(&app, DMM_BROWSER_LABEL, WebviewUrl::External(url))
+        .title("DMM Browser")
+        .inner_size(1100.0, 800.0)
+        .center()
+        .initialization_script(include_str!("dmm_browser.js"));
+    if let Some(p) = proxy_url {
+        builder = builder.proxy_url(p);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("Failed to open the DMM browser: {e}"))?;
+    Ok("DMM browser opened".to_string())
+}
+
+/// Navigate the DMM browser window to a user-entered URL.
+#[tauri::command]
+fn dmm_browser_navigate(app: AppHandle, url: String) -> Result<String, String> {
+    let target: tauri::Url = url.parse().map_err(|e| format!("Invalid URL: {e}"))?;
+    if !matches!(target.scheme(), "http" | "https") {
+        return Err("Only http and https URLs are allowed".to_string());
+    }
+    let win = app
+        .get_webview_window(DMM_BROWSER_LABEL)
+        .ok_or("DMM browser is not open")?;
+    win.navigate(target).map_err(|e| e.to_string())?;
+    Ok(String::new())
+}
+
 #[tauri::command]
 async fn localify_install(app: AppHandle) -> Result<String, String> {
-    #[cfg(not(windows))]
-    {
-        run_busy(app.clone(), |app, store| {
-            let base = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
-            let progress = |m: &str, p: Option<f32>| emit_progress(app, m, p);
-            gakumas_launcher::proton::install_localify(&base, store, &progress)
-        })
-        .await
-    }
-    #[cfg(windows)]
-    {
-        let _ = app;
-        Err("Localify install is only available on Linux".into())
-    }
+    run_busy(app.clone(), |app, store| {
+        let base = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+        let progress = |m: &str, p: Option<f32>| emit_progress(app, m, p);
+        gakumas_launcher::localify::install(&base, store, &progress)
+    })
+    .await
 }
 
 /// 화면(작업 표시줄 제외)보다 창이 크면 높이를 줄여 화면 안에 들어오게 함.
@@ -613,6 +678,7 @@ fn main() {
                 busy: Mutex::new(false),
                 auto_start_pending: Mutex::new(settings.auto_start),
                 force_close: AtomicBool::new(false),
+                browser_proxy: Mutex::new(None),
             });
             // 시작하자마자 VPN Gate 서버 목록을 새로 받아 둠 (게임 시작은 받는 동안에도 쓰쿠바대 서버로 먼저 시도)
             if vpngate_mode {
@@ -647,7 +713,9 @@ fn main() {
             set_proton_prefix,
             proton_setup,
             proton_install_dw,
-            localify_install
+            localify_install,
+            open_dmm_browser,
+            dmm_browser_navigate
         ])
         .run(tauri::generate_context!())
         .expect("error while running application");

@@ -310,7 +310,7 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
       </div>
       <div class="item">
         <div class="item-main"><div class="item-title">DMM Account</div><div class="item-sub account"><span class="dot" id="accountDot"></span><span id="accountText">-</span></div></div>
-        <div class="item-actions"><button class="pill" id="accountBtn">Login</button></div>
+        <div class="item-actions"><button class="pill" id="accountBtn">Login</button><button class="pill" id="dmmBrowserBtn">Browser</button></div>
       </div>
     </div>
   </section>
@@ -429,7 +429,7 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
   }
   function setBusy(b) {
     busy = b;
-    for (const id of ['folder', 'exePick', 'exeClear', 'accountBtn', 'auto', 'closeAfter', 'vpnPick', 'vpnAuth', 'protonApply', 'protonSetup', 'protonInstallDw', 'protonRefresh', 'localifyInstall']) $(id).disabled = b;
+    for (const id of ['folder', 'exePick', 'exeClear', 'accountBtn', 'dmmBrowserBtn', 'auto', 'closeAfter', 'vpnPick', 'vpnAuth', 'protonApply', 'protonSetup', 'protonInstallDw', 'protonRefresh', 'localifyInstall']) $(id).disabled = b;
     $('mode').querySelectorAll('button').forEach((x) => (x.disabled = b));
     if (!b) setMeter(null);
     updateStart();
@@ -580,6 +580,13 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
     }
   };
   $('vpnAuth').onclick = () => askVpnAuth();
+  $('dmmBrowserBtn').onclick = async () => {
+    try {
+      setStatus(await invoke('open_dmm_browser', { url: null }));
+    } catch (e) {
+      setStatus(String(e), true);
+    }
+  };
   $('accountBtn').onclick = async () => {
     if (!loggedIn) return run('login');
     const ok = await openModal({

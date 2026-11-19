@@ -9,11 +9,13 @@
 //! - `proton`   : Linux 에서 Proton/Wine 실행 (Windows 를 에뮬레이션하는 DMM 클라이언트)
 
 pub mod platform;
+pub mod browser_proxy;
 #[cfg(not(windows))]
 pub mod proton;
 
 pub mod http;
 pub mod launcher;
+pub mod localify;
 pub mod netstack;
 pub mod openvpn;
 pub mod vpngate;

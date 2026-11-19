@@ -305,6 +305,75 @@ impl TunnelStack {
     }
 
     /// TCP/IP 스택 한 번 돌리기: 보낼 패킷을 터널로, 터널에서 온 패킷을 스택으로
+    /// Open a raw TCP socket through the tunnel; returns a handle. The caller
+    /// uses tcp_send/tcp_recv/tcp_close, locking only for each short operation
+    /// so the keepalive thread can run between them.
+    pub fn tcp_open(&mut self, host: &str, port: u16, timeout: Duration) -> Result<SocketHandle, String> {
+        let ip = match self.hosts.get(host) {
+            Some(ip) => *ip,
+            None => self.resolve_in_tunnel(host)?,
+        }
+        .octets();
+        let mut sock = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 65535]),
+            tcp::SocketBuffer::new(vec![0u8; 65535]),
+        );
+        let mut r = [0u8; 2];
+        getrandom::getrandom(&mut r).map_err(|e| e.to_string())?;
+        let local_port = 49152 + (u16::from_le_bytes(r) % 16000);
+        sock.connect(
+            self.iface.context(),
+            (IpAddress::v4(ip[0], ip[1], ip[2], ip[3]), port),
+            local_port,
+        )
+        .map_err(|e| format!("TCP connect: {e:?}"))?;
+        let handle = self.sockets.add(sock);
+        let deadline = Instant::now() + timeout;
+        loop {
+            if Instant::now() >= deadline {
+                self.sockets.get_mut::<tcp::Socket>(handle).abort();
+                let _ = self.sockets.remove(handle);
+                return Err("TCP connect timed out".to_string());
+            }
+            self.step()?;
+            if self.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Established {
+                return Ok(handle);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    pub fn tcp_send(&mut self, handle: SocketHandle, data: &[u8]) -> Result<usize, String> {
+        self.step()?;
+        let sock = self.sockets.get_mut::<tcp::Socket>(handle);
+        if sock.can_send() {
+            sock.send_slice(data).map_err(|e| format!("{e:?}"))
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn tcp_recv(&mut self, handle: SocketHandle, buf: &mut [u8]) -> Result<usize, String> {
+        self.step()?;
+        let sock = self.sockets.get_mut::<tcp::Socket>(handle);
+        if sock.can_recv() {
+            sock.recv_slice(buf).map_err(|e| format!("{e:?}"))
+        } else if matches!(sock.state(), tcp::State::Closed | tcp::State::CloseWait) {
+            Ok(0)
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn tcp_close(&mut self, handle: SocketHandle) {
+        self.sockets.get_mut::<tcp::Socket>(handle).abort();
+        let _ = self.sockets.remove(handle);
+    }
+
+    pub fn keepalive(&mut self) -> Result<(), String> {
+        self.step()
+    }
+
     fn step(&mut self) -> Result<(), String> {
         let now = self.now();
         self.iface.poll(now, &mut self.dev, &mut self.sockets);
@@ -500,3 +569,5 @@ impl TunnelStack {
         }
     }
 }
+
+

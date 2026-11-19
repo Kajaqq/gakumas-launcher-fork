@@ -487,6 +487,54 @@ impl JapanLink {
     }
 }
 
+/// Open a raw user-space tunnel for the local browser proxy.
+pub fn open_tunnel_stack(store: &Store, mode: &str) -> Result<TunnelStack, String> {
+    let mut tried = HashSet::new();
+    let (link, _) = open_japan_link(store, mode, &|_, _| {}, &mut tried)?;
+    match link {
+        JapanLink::Tunnel(stack) => Ok(*stack),
+        JapanLink::Direct => Err("A VPN tunnel is required for the browser proxy".to_string()),
+    }
+}
+
+/// Whether the game is already in the account's My Games list.
+pub fn is_in_mygames(token: &str) -> Result<bool, String> {
+    let r = direct_post("/v5/mygames", &json!({ "user_os": "win" }), Some(token))?;
+    Ok(r["data"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .any(|g| g["product_id"].as_str() == Some(PRODUCT_ID))
+        })
+        .unwrap_or(false))
+}
+
+/// Add the game to the account's My Games using DMM's own endpoint.
+/// Call this after profile registration (313) has been completed.
+pub fn add_to_mygames(store: &Store, mode: &str, token: &str) -> Result<String, String> {
+    let mut stack = open_tunnel_stack(store, mode)?;
+    let req = http::dmm_post(
+        "/v5/detail/mygame/add",
+        &json!({ "product_id": PRODUCT_ID, "game_type": "cl", "game_os": "win" }).to_string(),
+        Some(token),
+    );
+    let raw = stack.request(
+        DMM_HOST,
+        443,
+        Some(http::dmm_tls_config()),
+        &req,
+        Duration::from_secs(30),
+    )?;
+    let (status, body) = http::parse_response(&raw)?;
+    let r: Value = serde_json::from_slice(&body)
+        .map_err(|_| format!("DMM returned HTTP {status} for My Games add"))?;
+    match r["result_code"].as_i64().unwrap_or(-1) {
+        100 => Ok("Game added to My Games".to_string()),
+        313 => Err("DMM GAMES profile registration is required first (click Setup).".to_string()),
+        c => Err(format!("Failed to add game to My Games (result_code {c}, {})", r["error"])),
+    }
+}
+
 /// 일본 연결을 엶. VPN Gate 면 `tried` 에 없는 서버 중에서 고르고, 고른 서버 이름을 함께 돌려줌
 fn open_japan_link(
     store: &Store,
@@ -803,6 +851,8 @@ pub fn start_game(
     });
 
     let mut relogged = false;
+    let mut agreed = false;
+    let mut added_mygame = false;
     let mut tried: HashSet<String> = HashSet::new();
     let mut attempts = 0;
     let data = loop {
@@ -811,7 +861,22 @@ pub fn start_game(
         let can_retry = settings.mode == MODE_VPNGATE && attempts < VPNGATE_LAUNCH_ATTEMPTS;
         let (mut link, host) = open_japan_link(store, &settings.mode, progress, &mut tried)?;
         progress("Preparing to launch", None);
-        let result = link.post("/v5/r2/launch/cl", &body, &token);
+        let result = if agreed {
+            // 308 = game terms not accepted. Confirm, then retry the launch.
+            match link.post(
+                "/v5/agreement/confirm/client",
+                &json!({ "product_id": PRODUCT_ID, "is_notification": false }),
+                &token,
+            ) {
+                Ok(_) => {
+                    agreed = false;
+                    link.post("/v5/r2/launch/cl", &body, &token)
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            link.post("/v5/r2/launch/cl", &body, &token)
+        };
         drop(link); // 일본 IP 는 여기까지만 필요
         let r = match result {
             Ok(r) => r,
@@ -836,6 +901,22 @@ pub fn start_game(
                 progress("DMM rejected the VPN server; trying another server", None);
             }
             801 | 803 => return Err(region_error(&settings.mode)),
+            308 if !agreed => {
+                progress("Game terms not accepted; confirming...", None);
+                agreed = true;
+            }
+            313 if !added_mygame => {
+                // New account: register the title to My Games through DMM's
+                // own endpoint, then retry the launch once.
+                progress("New account: adding game to My Games...", None);
+                if let Err(e) = add_to_mygames(store, &settings.mode, &token) {
+                    return Err(e);
+                }
+                added_mygame = true;
+            }
+            313 => {
+                return Err("DMM GAMES profile registration is required. Open the Browser and register this account, then try again.".to_string());
+            }
             c => return Err(format!("Failed to prepare launch (result_code {c}, {})", r["error"])),
         }
     };
