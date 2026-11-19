@@ -640,10 +640,9 @@ impl JapanLink {
             JapanLink::Direct => direct_post(path, body, Some(token)),
             JapanLink::Tunnel(shared) => {
                 let req = http::dmm_post(path, &body.to_string(), Some(token));
-                let raw = shared
-                    .lock()
-                    .map_err(|e| e.to_string())?
-                    .request(DMM_HOST, 443, Some(http::dmm_tls_config()), &req, Duration::from_secs(30))?;
+                let raw = TunnelStack::request_shared(
+                    shared, DMM_HOST, 443, Some(http::dmm_tls_config()), &req, Duration::from_secs(30),
+                )?;
                 let (status, b) = http::parse_response(&raw)?;
                 match serde_json::from_slice(&b) {
                     Ok(v) => Ok(v),
@@ -655,45 +654,67 @@ impl JapanLink {
     }
 }
 
-/// Whether the game is already in the account's My Games list (through the shared VPN).
-pub fn is_in_mygames(store: &Store, mode: &str, token: &str) -> Result<bool, String> {
-    let shared = shared_tunnel(store, mode, &|_, _| {})?;
-    let req = http::dmm_post("/v5/mygames", "{\"user_os\":\"win\"}", Some(token));
-    let raw = shared
-        .lock()
-        .map_err(|e| e.to_string())?
-        .request(DMM_HOST, 443, Some(http::dmm_tls_config()), &req, Duration::from_secs(30))?;
-    let (_, body) = http::parse_response(&raw)?;
-    let r: Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
-    Ok(r["data"]
-        .as_array()
-        .map(|list| list.iter().any(|g| g["product_id"].as_str() == Some(PRODUCT_ID)))
-        .unwrap_or(false))
+const PROFILE_REGISTRATION_REQUIRED: &str = "DMM GAMES profile registration is required. Open the Browser and register this account, then try again.";
+
+fn require_dmm_success(response: &Value, operation: &str) -> Result<(), String> {
+    match response["result_code"].as_i64() {
+        Some(100) => Ok(()),
+        Some(code) => Err(format!("Failed to {operation} (DMM result_code {code})")),
+        None => Err(format!("Failed to {operation}: DMM response had no valid result_code")),
+    }
 }
 
-/// Add the game to My Games through the shared VPN tunnel.
+fn check_mygames_response(response: &Value, operation: &str) -> Result<(), String> {
+    if response["result_code"].as_i64() == Some(313) {
+        return Err(PROFILE_REGISTRATION_REQUIRED.into());
+    }
+    require_dmm_success(response, operation)
+}
+
+fn mygames_contains_game(response: &Value) -> Result<bool, String> {
+    check_mygames_response(response, "read My Games")?;
+    let games = response["data"].as_array().ok_or("DMM returned an invalid My Games list")?;
+    Ok(games.iter().any(|g| g["product_id"].as_str() == Some(PRODUCT_ID)))
+}
+
+/// Whether the game is already in the account's My Games list.
+pub fn is_in_mygames(store: &Store, mode: &str, token: &str) -> Result<bool, String> {
+    open_japan_link(store, mode, &|_, _| {})?.is_in_mygames(token)
+}
+
+/// Add the game to My Games over the selected connection mode.
 pub fn add_to_mygames(store: &Store, mode: &str, token: &str) -> Result<String, String> {
-    if is_in_mygames(store, mode, token)? {
-        return Ok("Game is already in My Games".to_string());
+    open_japan_link(store, mode, &|_, _| {})?.add_to_mygames(token)
+}
+
+impl JapanLink {
+    fn is_in_mygames(&mut self, token: &str) -> Result<bool, String> {
+        let response = self.post("/v5/mygames", &json!({ "user_os": "win" }), token)?;
+        mygames_contains_game(&response)
     }
-    let shared = shared_tunnel(store, mode, &|_, _| {})?;
-    let req = http::dmm_post(
-        "/v5/detail/mygame/add",
-        &json!({ "product_id": PRODUCT_ID, "game_type": "cl", "game_os": "win" }).to_string(),
-        Some(token),
-    );
-    let raw = shared
-        .lock()
-        .map_err(|e| e.to_string())?
-        .request(DMM_HOST, 443, Some(http::dmm_tls_config()), &req, Duration::from_secs(30))?;
-    let (status, body) = http::parse_response(&raw)?;
-    let r: Value = serde_json::from_slice(&body)
-        .map_err(|_| format!("DMM returned HTTP {status} for My Games add"))?;
-    match r["result_code"].as_i64().unwrap_or(-1) {
-        100 => Ok("Game added to My Games".to_string()),
-        313 => Err("DMM GAMES profile registration is required first.".to_string()),
-        c => Err(format!("Failed to add game to My Games (result_code {c}, {})", r["error"])),
+
+    fn add_to_mygames(&mut self, token: &str) -> Result<String, String> {
+        if self.is_in_mygames(token)? {
+            return Ok("Game is already in My Games".into());
+        }
+        let response = self.post(
+            "/v5/detail/mygame/add",
+            &json!({ "product_id": PRODUCT_ID, "game_type": "cl", "game_os": "win" }),
+            token,
+        )?;
+        check_mygames_response(&response, "add the game to My Games")?;
+        Ok("Game added to My Games".into())
     }
+}
+
+fn confirm_terms_once(
+    attempted: &mut bool,
+    confirm: impl FnOnce() -> Result<Value, String>,
+) -> Result<(), String> {
+    if std::mem::replace(attempted, true) {
+        return Err("DMM still requires the game terms after confirmation. Accept them in DMM and try again.".into());
+    }
+    require_dmm_success(&confirm()?, "confirm the game terms")
 }
 
 /// 일본 연결을 엶. VPN Gate 면 `tried` 에 없는 서버 중에서 고르고, 고른 서버 이름을 함께 돌려줌
@@ -1006,7 +1027,7 @@ pub fn start_game(
     });
 
     let mut relogged = false;
-    let mut agreed = false;
+    let mut tried_terms_confirmation = false;
     let mut added_mygame = false;
     let mut attempts = 0;
     let data = loop {
@@ -1015,22 +1036,7 @@ pub fn start_game(
         let can_retry = settings.mode == MODE_VPNGATE && attempts < VPNGATE_LAUNCH_ATTEMPTS;
         let mut link = open_japan_link(store, &settings.mode, progress)?;
         progress("Preparing to launch", None);
-        let result = if agreed {
-            // 308 = game terms not accepted. Confirm, then retry the launch.
-            match link.post(
-                "/v5/agreement/confirm/client",
-                &json!({ "product_id": PRODUCT_ID, "is_notification": false }),
-                &token,
-            ) {
-                Ok(_) => {
-                    agreed = false;
-                    link.post("/v5/r2/launch/cl", &body, &token)
-                }
-                Err(e) => Err(e),
-            }
-        } else {
-            link.post("/v5/r2/launch/cl", &body, &token)
-        };
+        let result = link.post("/v5/r2/launch/cl", &body, &token);
         let r = match result {
             Ok(r) => r,
             Err(e) if can_retry => {
@@ -1053,22 +1059,24 @@ pub fn start_game(
                 link.rotate_failed_server()?;
             }
             801 | 803 => return Err(region_error(&settings.mode)),
-            308 if !agreed => {
-                progress("Game terms not accepted; confirming...", None);
-                agreed = true;
+            308 => {
+                confirm_terms_once(&mut tried_terms_confirmation, || {
+                    progress("Game terms not accepted; confirming...", None);
+                    link.post(
+                        "/v5/agreement/confirm/client",
+                        &json!({ "product_id": PRODUCT_ID, "is_notification": false }),
+                        &token,
+                    )
+                })?;
             }
             313 if !added_mygame => {
                 // New account: register the title to My Games through DMM's
                 // own endpoint, then retry the launch once.
-                let message = add_to_mygames(store, &settings.mode, &token)?;
-                if !message.contains("already") {
-                    progress(&message, None);
-                }
+                let message = link.add_to_mygames(&token)?;
+                progress(&message, None);
                 added_mygame = true;
             }
-            313 => {
-                return Err("DMM GAMES profile registration is required. Open the Browser and register this account, then try again.".to_string());
-            }
+            313 => return Err(PROFILE_REGISTRATION_REQUIRED.into()),
             c => return Err(format!("Failed to prepare launch (result_code {c}, {})", r["error"])),
         }
     };
@@ -1400,6 +1408,29 @@ fn update_game(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terms_confirmation_is_checked_and_not_repeated() {
+        let mut attempted = false;
+        assert!(confirm_terms_once(&mut attempted, || Ok(json!({ "result_code": 100 }))).is_ok());
+        assert!(confirm_terms_once(&mut attempted, || panic!("repeated confirmation")).is_err());
+
+        let mut attempted = false;
+        let error = confirm_terms_once(&mut attempted, || Ok(json!({ "result_code": 308 }))).unwrap_err();
+        assert!(error.contains("result_code 308"));
+        assert!(attempted);
+    }
+
+    #[test]
+    fn mygames_distinguishes_empty_lists_and_profile_errors() {
+        assert_eq!(mygames_contains_game(&json!({ "result_code": 100, "data": [] })), Ok(false));
+        assert_eq!(mygames_contains_game(&json!({
+            "result_code": 100, "data": [{ "product_id": PRODUCT_ID }],
+        })), Ok(true));
+        assert_eq!(mygames_contains_game(&json!({ "result_code": 313 })), Err(PROFILE_REGISTRATION_REQUIRED.into()));
+        assert!(mygames_contains_game(&json!({ "result_code": 100 })).is_err());
+        assert!(mygames_contains_game(&json!({ "result_code": 203, "data": [] })).is_err());
+    }
 
     #[test]
     fn resolves_windows_style_paths_into_nested_paths() {

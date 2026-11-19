@@ -5,7 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, ToSocketAddrs};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -79,6 +79,61 @@ mod tests {
         assert_eq!(&buf[..5], b"world");
         assert_eq!(client.tcp_recv(ready, &mut buf).unwrap(), Some(0));
         assert!(!client.tcp_connected(slow).unwrap());
+    }
+
+    #[test]
+    fn shared_api_wait_does_not_block_browser_data() {
+        let (client, mut server) = pair();
+        let client = Arc::new(Mutex::new(client));
+        let mut listen = |port| {
+            let buf = || tcp::SocketBuffer::new(vec![0; 8192]);
+            let mut sock = tcp::Socket::new(buf(), buf());
+            sock.listen(port).unwrap();
+            server.sockets.add(sock)
+        };
+        let api_peer = listen(80);
+        let browser_peer = listen(443);
+        let api = {
+            let client = client.clone();
+            std::thread::spawn(move || {
+                TunnelStack::request_shared(
+                    &client, "10.0.0.2", 80, None, b"GET / HTTP/1.1\r\n\r\n", Duration::from_secs(5),
+                )
+            })
+        };
+        let until = Instant::now() + Duration::from_secs(3);
+        let mut browser = None;
+        let mut sent = false;
+        let mut replied = false;
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        while Instant::now() < until && !api.is_finished() {
+            server.keepalive().unwrap();
+            let waiting_for_response = server.sockets.get::<tcp::Socket>(api_peer).can_recv();
+            if let Ok(mut stack) = client.try_lock() {
+                if waiting_for_response && browser.is_none() {
+                    browser = Some(stack.tcp_start(Ipv4Addr::new(10, 0, 0, 2), 443).unwrap());
+                }
+                stack.keepalive().unwrap();
+                if let Some(handle) = browser {
+                    let mut buf = [0; 16];
+                    if stack.tcp_connected(handle).unwrap() && !replied {
+                        let peer = server.sockets.get_mut::<tcp::Socket>(browser_peer);
+                        if peer.can_send() && !sent {
+                            peer.send_slice(b"browser data").unwrap();
+                            sent = true;
+                        }
+                        if let Some(n) = stack.tcp_recv(handle, &mut buf).unwrap() {
+                            assert_eq!(&buf[..n], b"browser data");
+                            server.sockets.get_mut::<tcp::Socket>(api_peer).send_slice(response).unwrap();
+                            replied = true;
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(replied, "browser must receive data before the API is allowed to finish");
+        assert_eq!(api.join().unwrap().unwrap(), response);
     }
 
     #[test]
@@ -525,6 +580,39 @@ impl TunnelStack {
         self.request_ip(ip, host, port, tls, req, timeout)
     }
 
+    /// Drive a launcher request on the same VPN as the browser without holding
+    /// the stack lock across DNS resolution or the entire TCP/TLS exchange.
+    pub(crate) fn request_shared(
+        shared: &Mutex<Self>,
+        host: &str,
+        port: u16,
+        tls: Option<Arc<ClientConfig>>,
+        req: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, String> {
+        let lock = || shared.lock().map_err(|e| e.to_string());
+        let cached = lock()?.cached_ip(host);
+        let ip = match cached {
+            Some(ip) => ip,
+            None => resolve_v4(host)?,
+        };
+        let mut exchange = Exchange::new(host, tls, req, timeout, http::is_complete)?;
+        let handle = lock()?.start_socket(ip, port)?;
+        let result = loop {
+            let tick = {
+                let mut stack = lock()?;
+                stack.advance_exchange(handle, &mut exchange)
+            };
+            match tick {
+                Ok(false) => std::thread::sleep(Duration::from_millis(2)),
+                Ok(true) => break Ok(exchange.response),
+                Err(e) => break Err(e),
+            }
+        };
+        lock()?.retire_exchange(handle);
+        result
+    }
+
     /// `ip` 로 접속해 `host` 이름으로 HTTP(S) 요청
     fn request_ip(
         &mut self,
@@ -550,25 +638,52 @@ impl TunnelStack {
         timeout: Duration,
         complete: fn(&[u8]) -> bool,
     ) -> Result<Vec<u8>, String> {
+        let mut exchange = Exchange::new(host, tls, req, timeout, complete)?;
         let h = self.start_socket(ip, port)?;
-        let result = self.exchange(h, host, tls, req, timeout, complete);
-        self.sockets.get_mut::<tcp::Socket>(h).abort();
-        let _ = self.step();
-        self.sockets.remove(h);
+        let result = loop {
+            match self.advance_exchange(h, &mut exchange) {
+                Ok(false) => (),
+                Ok(true) => break Ok(exchange.response),
+                Err(e) => break Err(e),
+            }
+        };
+        self.retire_exchange(h);
         result
     }
 
-    fn exchange(
-        &mut self,
-        h: SocketHandle,
+    fn retire_exchange(&mut self, h: SocketHandle) {
+        self.sockets.get_mut::<tcp::Socket>(h).abort();
+        // Let the next pump flush the reset before recycling the handle.
+        self.retired.push((h, Instant::now()));
+    }
+
+    fn advance_exchange(&mut self, h: SocketHandle, exchange: &mut Exchange) -> Result<bool, String> {
+        if Instant::now() >= exchange.deadline {
+            return Err(if exchange.connected { "response timed out" } else { "TCP connect timed out" }.into());
+        }
+        self.step()?;
+        exchange.advance(self.sockets.get_mut::<tcp::Socket>(h))
+    }
+}
+
+struct Exchange {
+    deadline: Instant,
+    conn: Option<ClientConnection>,
+    outgoing: Vec<u8>,
+    response: Vec<u8>,
+    connected: bool,
+    complete: fn(&[u8]) -> bool,
+}
+
+impl Exchange {
+    fn new(
         host: &str,
         tls: Option<Arc<ClientConfig>>,
         req: &[u8],
         timeout: Duration,
         complete: fn(&[u8]) -> bool,
-    ) -> Result<Vec<u8>, String> {
-        let deadline = Instant::now() + timeout;
-        let mut conn = match tls {
+    ) -> Result<Self, String> {
+        let conn = match tls {
             Some(cfg) => {
                 let name = ServerName::try_from(host.to_string())
                     .map_err(|e| format!("server name: {e}"))?;
@@ -581,93 +696,68 @@ impl TunnelStack {
             }
             None => None,
         };
-        let mut out_pending: Vec<u8> = if conn.is_none() {
-            req.to_vec()
-        } else {
-            Vec::new()
-        };
-        let mut resp = Vec::new();
-        let mut buf = vec![0u8; 16384];
-        let mut connected = false;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(if connected {
-                    "response timed out"
-                } else {
-                    "TCP connect timed out"
-                }
-                .into());
-            }
-            self.step()?;
-            let sock = self.sockets.get_mut::<tcp::Socket>(h);
-            if sock.state() == tcp::State::Established {
-                connected = true;
-            }
-            if let Some(c) = conn.as_mut() {
-                while c.wants_write() {
-                    c.write_tls(&mut out_pending)
-                        .map_err(|e| format!("TLS write: {e}"))?;
-                }
-            }
-            if sock.can_send() && !out_pending.is_empty() {
-                let n = sock
-                    .send_slice(&out_pending)
-                    .map_err(|e| format!("TCP send: {e:?}"))?;
-                out_pending.drain(..n);
-            }
-            let mut tls_closed = false;
-            while sock.can_recv() {
-                let n = sock
-                    .recv_slice(&mut buf)
-                    .map_err(|e| format!("TCP recv: {e:?}"))?;
-                if n == 0 {
-                    break;
-                }
-                match conn.as_mut() {
-                    Some(c) => {
-                        let mut rd: &[u8] = &buf[..n];
-                        while !rd.is_empty() {
-                            c.read_tls(&mut rd).map_err(|e| format!("TLS read: {e}"))?;
-                            c.process_new_packets().map_err(|e| format!("TLS: {e}"))?;
-                        }
-                        let mut pb = [0u8; 16384];
-                        loop {
-                            match c.reader().read(&mut pb) {
-                                Ok(0) => {
-                                    tls_closed = true;
-                                    break;
-                                }
-                                Ok(k) => resp.extend_from_slice(&pb[..k]),
-                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                Err(e) => return Err(format!("TLS plaintext: {e}")),
-                            }
-                        }
-                    }
-                    None => resp.extend_from_slice(&buf[..n]),
-                }
-            }
-            if complete(&resp) || tls_closed {
-                return Ok(resp);
-            }
-            let remote_closed = matches!(
-                sock.state(),
-                tcp::State::CloseWait
-                    | tcp::State::LastAck
-                    | tcp::State::Closing
-                    | tcp::State::TimeWait
-                    | tcp::State::Closed
-            );
-            if remote_closed && !sock.can_recv() {
-                if !resp.is_empty() {
-                    return Ok(resp);
-                }
-                return Err(if connected {
-                    "connection closed without a response"
-                } else {
-                    "connection refused"
-                }
-                .into());
+        Ok(Self {
+            deadline: Instant::now() + timeout,
+            outgoing: if conn.is_none() { req.to_vec() } else { Vec::new() },
+            conn,
+            response: Vec::new(),
+            connected: false,
+            complete,
+        })
+    }
+
+    fn advance(&mut self, sock: &mut tcp::Socket<'_>) -> Result<bool, String> {
+        if matches!(sock.state(), tcp::State::Established | tcp::State::CloseWait) {
+            self.connected = true;
+        }
+        if let Some(c) = self.conn.as_mut() {
+            while c.wants_write() {
+                c.write_tls(&mut self.outgoing)
+                    .map_err(|e| format!("TLS write: {e}"))?;
             }
         }
+        if sock.can_send() && !self.outgoing.is_empty() {
+            let n = sock.send_slice(&self.outgoing).map_err(|e| format!("TCP send: {e:?}"))?;
+            self.outgoing.drain(..n);
+        }
+        let mut tls_closed = false;
+        if sock.can_recv() {
+            // Read at most one chunk per turn to give other sockets lock time.
+            let mut buf = [0; 16384];
+            let n = sock.recv_slice(&mut buf).map_err(|e| format!("TCP recv: {e:?}"))?;
+            if let Some(c) = self.conn.as_mut() {
+                let mut rd = &buf[..n];
+                while !rd.is_empty() {
+                    c.read_tls(&mut rd).map_err(|e| format!("TLS read: {e}"))?;
+                    c.process_new_packets().map_err(|e| format!("TLS: {e}"))?;
+                    let mut plain = [0; 16384];
+                    loop {
+                        match c.reader().read(&mut plain) {
+                            Ok(0) => { tls_closed = true; break; }
+                            Ok(k) => self.response.extend_from_slice(&plain[..k]),
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(e) => return Err(format!("TLS plaintext: {e}")),
+                        }
+                    }
+                }
+            } else {
+                self.response.extend_from_slice(&buf[..n]);
+            }
+            if (self.complete)(&self.response) || tls_closed {
+                return Ok(true);
+            }
+        }
+        let remote_closed = matches!(sock.state(), tcp::State::CloseWait | tcp::State::LastAck
+            | tcp::State::Closing | tcp::State::TimeWait | tcp::State::Closed);
+        if remote_closed && !sock.can_recv() {
+            return if !self.response.is_empty() {
+                Ok(true)
+            } else if self.connected {
+                Err("connection closed without a response".into())
+            } else {
+                Err("connection refused".into())
+            };
+        }
+        Ok(false)
     }
 }
