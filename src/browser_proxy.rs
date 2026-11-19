@@ -1,11 +1,11 @@
 //! Local HTTP CONNECT proxy forwarding WebView traffic through the in-app VPN tunnel.
-//! The tunnel mutex is held only for each short smoltcp operation, so the
-//! keepalive thread can run between them and keep the VPN session alive.
+//! Each operation fetches the current shared tunnel, so a dead session can be
+//! rotated to a different VPN Gate server without restarting the proxy.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::launcher;
 use crate::netstack::TunnelStack;
@@ -20,26 +20,71 @@ impl BrowserProxy {
     }
 }
 
+/// Rate-limited error logging: the browser opens dozens of connections and a
+/// dead tunnel would otherwise produce hundreds of identical lines.
+static LAST_ERROR: OnceLock<Mutex<(String, Instant)>> = OnceLock::new();
+
+fn log_error(msg: &str) {
+    let cell = LAST_ERROR.get_or_init(|| Mutex::new((String::new(), Instant::now())));
+    let mut guard = cell.lock().unwrap();
+    let now = Instant::now();
+    if guard.0 != msg || now.duration_since(guard.1) > Duration::from_secs(3) {
+        launcher::netlog(&format!("[proxy] {msg}"));
+        guard.0 = msg.to_string();
+        guard.1 = now;
+    }
+}
+
+fn is_dead(e: &str) -> bool {
+    e.contains("VPN server closed the connection")
+        || e.contains("Broken pipe")
+        || e.contains("no A record")
+        || e.contains("DNS error code")
+        || e.contains("TCP connect timed out")
+        || e.contains("VPN send")
+}
+
+/// Run an operation on the current shared tunnel; on a dead-session error,
+/// rotate to a different VPN server and retry once.
+fn with_tunnel<T>(mut op: impl FnMut(&Mutex<TunnelStack>) -> Result<T, String>) -> Result<T, String> {
+    let stack = launcher::current_tunnel().ok_or("No VPN tunnel available")?;
+    match op(&stack) {
+        Ok(v) => Ok(v),
+        Err(e) if is_dead(&e) => {
+            log_error(&e);
+            launcher::netlog("Reconnecting to a different VPN server...");
+            let stack = launcher::rotate_tunnel()?;
+            op(&stack)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub fn start(store: &launcher::Store, mode: &str) -> Result<BrowserProxy, String> {
-    let stack = launcher::shared_tunnel(store, mode, &|_, _| {})?;
+    launcher::shared_tunnel(store, mode, &|m, _| launcher::netlog(m))?;
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    launcher::netlog(&format!("Browser proxy listening on 127.0.0.1:{port}"));
 
-    let keepalive_stack = Arc::clone(&stack);
     std::thread::spawn(move || loop {
-        if let Ok(mut guard) = keepalive_stack.lock() {
-            let _ = guard.keepalive();
+        if let Some(stack) = launcher::current_tunnel() {
+            if let Ok(mut guard) = stack.lock() {
+                if let Err(e) = guard.keepalive() {
+                    if is_dead(&e) {
+                        log_error(&e);
+                        let _ = launcher::rotate_tunnel();
+                    }
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(500));
     });
 
-    let shared = Arc::clone(&stack);
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let stack = Arc::clone(&shared);
             std::thread::spawn(move || {
-                if let Err(e) = handle(stream, stack) {
-                    eprintln!("[proxy] {e}");
+                if let Err(e) = handle(stream) {
+                    log_error(&e);
                 }
             });
         }
@@ -47,8 +92,8 @@ pub fn start(store: &launcher::Store, mode: &str) -> Result<BrowserProxy, String
     Ok(BrowserProxy { port })
 }
 
-fn handle(mut client: TcpStream, stack: Arc<Mutex<TunnelStack>>) -> Result<(), String> {
-    let _ = client.set_read_timeout(Some(Duration::from_millis(100)));
+fn handle(mut client: TcpStream) -> Result<(), String> {
+    let _ = client.set_read_timeout(Some(Duration::from_millis(10)));
     let _ = client.set_write_timeout(Some(Duration::from_secs(10)));
 
     let mut request = Vec::new();
@@ -77,28 +122,31 @@ fn handle(mut client: TcpStream, stack: Arc<Mutex<TunnelStack>>) -> Result<(), S
     let (host, port) = target.rsplit_once(':').ok_or("bad CONNECT target")?;
     let port: u16 = port.parse::<u16>().map_err(|e| e.to_string())?;
 
-    let handle = {
-        let mut guard = stack.lock().map_err(|e| e.to_string())?;
-        guard.tcp_open(host, port, Duration::from_secs(30))?
-    };
+    launcher::netlog(&format!("CONNECT {host}:{port}"));
+
+    let handle = with_tunnel(|s| {
+        let mut guard = s.lock().map_err(|e| e.to_string())?;
+        guard.tcp_open(host, port, Duration::from_secs(30))
+    })?;
 
     client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .map_err(|e| e.to_string())?;
 
-    let mut buf = [0u8; 16384];
+    let mut buf = [0u8; 65536];
     let result = loop {
+        // Drain client -> tunnel without blocking for long.
         match client.read(&mut buf) {
             Ok(0) => break Ok(()),
             Ok(n) => {
                 let mut sent = 0;
                 while sent < n {
-                    let written = {
-                        let mut guard = stack.lock().map_err(|e| e.to_string())?;
-                        guard.tcp_send(handle, &buf[sent..n])?
-                    };
+                    let written = with_tunnel(|s| {
+                        let mut guard = s.lock().map_err(|e| e.to_string())?;
+                        guard.tcp_send(handle, &buf[sent..n])
+                    })?;
                     if written == 0 {
-                        std::thread::sleep(Duration::from_millis(2));
+                        std::thread::sleep(Duration::from_millis(1));
                     } else {
                         sent += written;
                     }
@@ -108,21 +156,27 @@ fn handle(mut client: TcpStream, stack: Arc<Mutex<TunnelStack>>) -> Result<(), S
             Err(e) => break Err(e.to_string()),
         }
 
-        let got = {
-            let mut guard = stack.lock().map_err(|e| e.to_string())?;
-            guard.tcp_recv(handle, &mut buf)?
-        };
-        if got > 0 {
-            if let Err(e) = client.write_all(&buf[..got]) {
-                break Err(e.to_string());
+        // Drain ALL available tunnel data before waiting on the client again.
+        // One recv per loopiteration with a 100 ms client timeout is what made
+        // page loads crawl when many resources were fetched in parallel.
+        loop {
+            let got = with_tunnel(|s| {
+                let mut guard = s.lock().map_err(|e| e.to_string())?;
+                guard.tcp_recv(handle, &mut buf)
+            })?;
+            if got == 0 {
+                break;
             }
-        } else {
-            std::thread::sleep(Duration::from_millis(2));
+            if client.write_all(&buf[..got]).is_err() {
+                break;
+            }
         }
     };
 
-    if let Ok(mut guard) = stack.lock() {
-        guard.tcp_close(handle);
+    if let Some(stack) = launcher::current_tunnel() {
+        if let Ok(mut guard) = stack.lock() {
+            guard.tcp_close(handle);
+        }
     }
     result
 }

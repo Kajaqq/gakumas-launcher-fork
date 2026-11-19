@@ -598,7 +598,18 @@ fn open_dmm_browser(app: AppHandle, url: Option<String>) -> Result<String, Strin
         .title("DMM Browser")
         .inner_size(1100.0, 800.0)
         .center()
-        .initialization_script(include_str!("dmm_browser.js"));
+        // Keep the window hidden while the page loads through the slow proxy,
+        // then reveal it only when real content is ready (no white screen).
+        .visible(false)
+        .initialization_script(include_str!("dmm_browser.js"))
+        .on_page_load(|win, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                // Reveal as soon as the document starts; the injected loading
+                // overlay covers the blank page while resources stream in.
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        });
     if let Some(p) = proxy_url {
         builder = builder.proxy_url(p);
     }

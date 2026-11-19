@@ -2,7 +2,7 @@
 //!
 //! Windows 네트워크 설정을 건드리지 않고, 이 프로그램이 여는 TCP 연결만 VPN 터널을 탑니다.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::sync::Arc;
@@ -106,6 +106,8 @@ pub struct TunnelStack {
     /// 터널 안에서 찾은 주소 (일본 쪽에서 본 주소)
     hosts: HashMap<String, Ipv4Addr>,
     dns: Vec<[u8; 4]>,
+    /// Handles created for the browser proxy (invalidated on rotation).
+    proxy_handles: HashSet<SocketHandle>,
 }
 
 /// DNS-over-TCP 질의 (2바이트 길이 + DNS 메시지, A 레코드)
@@ -222,7 +224,25 @@ impl TunnelStack {
             epoch: Instant::now(),
             hosts: HashMap::new(),
             dns: push.dns.clone(),
+            proxy_handles: HashSet::new(),
         })
+    }
+
+    /// Fast path: resolve with the OS resolver (milliseconds) before falling
+    /// back to the slow DoH-over-tunnel lookup. Cache the answer either way.
+    fn resolve_fast(&mut self, host: &str) -> Result<Ipv4Addr, String> {
+        if let Some(ip) = self.hosts.get(host) {
+            return Ok(*ip);
+        }
+        if let Ok(addrs) = (host, 0).to_socket_addrs() {
+            for addr in addrs {
+                if let std::net::IpAddr::V4(v4) = addr.ip() {
+                    self.hosts.insert(host.to_string(), v4);
+                    return Ok(v4);
+                }
+            }
+        }
+        self.resolve_in_tunnel(host)
     }
 
     /// `host` 의 주소를 터널 안에서(일본 쪽 DNS 로) 찾아 이후 요청에 씀.
@@ -309,11 +329,7 @@ impl TunnelStack {
     /// uses tcp_send/tcp_recv/tcp_close, locking only for each short operation
     /// so the keepalive thread can run between them.
     pub fn tcp_open(&mut self, host: &str, port: u16, timeout: Duration) -> Result<SocketHandle, String> {
-        let ip = match self.hosts.get(host) {
-            Some(ip) => *ip,
-            None => self.resolve_in_tunnel(host)?,
-        }
-        .octets();
+        let ip = self.resolve_fast(host)?.octets();
         let mut sock = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0u8; 65535]),
             tcp::SocketBuffer::new(vec![0u8; 65535]),
@@ -328,11 +344,13 @@ impl TunnelStack {
         )
         .map_err(|e| format!("TCP connect: {e:?}"))?;
         let handle = self.sockets.add(sock);
+        self.proxy_handles.insert(handle);
         let deadline = Instant::now() + timeout;
         loop {
             if Instant::now() >= deadline {
                 self.sockets.get_mut::<tcp::Socket>(handle).abort();
                 let _ = self.sockets.remove(handle);
+                self.proxy_handles.remove(&handle);
                 return Err("TCP connect timed out".to_string());
             }
             self.step()?;
@@ -343,8 +361,16 @@ impl TunnelStack {
         }
     }
 
+    fn live_socket(&mut self, handle: SocketHandle) -> bool {
+        // A handle from a previous (rotated) tunnel is not in this set.
+        self.proxy_handles.contains(&handle)
+    }
+
     pub fn tcp_send(&mut self, handle: SocketHandle, data: &[u8]) -> Result<usize, String> {
         self.step()?;
+        if !self.live_socket(handle) {
+            return Err("connection reset after VPN rotation".to_string());
+        }
         let sock = self.sockets.get_mut::<tcp::Socket>(handle);
         if sock.can_send() {
             sock.send_slice(data).map_err(|e| format!("{e:?}"))
@@ -355,19 +381,23 @@ impl TunnelStack {
 
     pub fn tcp_recv(&mut self, handle: SocketHandle, buf: &mut [u8]) -> Result<usize, String> {
         self.step()?;
+        if !self.live_socket(handle) {
+            return Err("connection reset after VPN rotation".to_string());
+        }
         let sock = self.sockets.get_mut::<tcp::Socket>(handle);
         if sock.can_recv() {
             sock.recv_slice(buf).map_err(|e| format!("{e:?}"))
-        } else if matches!(sock.state(), tcp::State::Closed | tcp::State::CloseWait) {
-            Ok(0)
         } else {
             Ok(0)
         }
     }
 
     pub fn tcp_close(&mut self, handle: SocketHandle) {
-        self.sockets.get_mut::<tcp::Socket>(handle).abort();
-        let _ = self.sockets.remove(handle);
+        if self.live_socket(handle) {
+            self.sockets.get_mut::<tcp::Socket>(handle).abort();
+            let _ = self.sockets.remove(handle);
+            self.proxy_handles.remove(&handle);
+        }
     }
 
     pub fn keepalive(&mut self) -> Result<(), String> {
@@ -386,7 +416,7 @@ impl TunnelStack {
             .map(|d| Duration::from_millis(d.total_millis()))
             .unwrap_or(Duration::from_millis(20));
         self.tun
-            .pump(delay.clamp(Duration::from_millis(1), Duration::from_millis(20)))?;
+            .pump(delay.clamp(Duration::from_millis(1), Duration::from_millis(4)))?;
         while let Some(p) = self.tun.take_inbound() {
             self.dev.rx.push_back(p);
         }

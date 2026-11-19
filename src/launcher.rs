@@ -456,12 +456,40 @@ fn direct_get_json(url: &str) -> Result<Value, String> {
     serde_json::from_str(&text).map_err(|e| format!("Failed to parse the DMM response: {e}"))
 }
 
+/// Timestamped network log so all tunnel/DNS/proxy activity is visible.
+pub fn netlog(msg: &str) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() % 86400)
+        .unwrap_or(0);
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    eprintln!("[{h:02}:{m:02}:{s:02}] {msg}");
+}
+
 /// One VPN tunnel shared by the launcher, My Games calls and the browser proxy.
 struct SharedTunnel {
     mode: String,
     stack: Arc<Mutex<TunnelStack>>,
+    /// Server host names already used — rotation skips these.
+    tried: HashSet<String>,
+    /// The server this tunnel is connected to.
+    server: Option<String>,
+    /// Data dir, so we can reopen after a dead session.
+    dir: PathBuf,
 }
 static SHARED_TUNNEL: OnceLock<Mutex<Option<SharedTunnel>>> = OnceLock::new();
+
+fn open_tunnel(store: &Store, mode: &str, tried: &mut HashSet<String>, progress: ProgressFn)
+    -> Result<(TunnelStack, Option<String>), String>
+{
+    if mode == MODE_FILE {
+        netlog("Opening VPN file tunnel");
+        return Ok((open_vpn_file(store, progress)?, None));
+    }
+    let (stack, host) = open_vpngate(store, progress, tried)?;
+    netlog(&format!("VPN tunnel connected via {host}"));
+    Ok((stack, Some(host)))
+}
 
 pub fn shared_tunnel(
     store: &Store,
@@ -479,17 +507,51 @@ pub fn shared_tunnel(
     if mode == MODE_DIRECT {
         return Err("Direct mode does not use a launcher tunnel".to_string());
     }
-    let stack = if mode == MODE_FILE {
-        open_vpn_file(store, progress)?
-    } else {
-        let (stack, _) = open_vpngate(store, progress, &mut HashSet::new())?;
-        stack
-    };
+    netlog(&format!("Opening shared tunnel (mode={mode})"));
+    let mut tried = HashSet::new();
+    let (stack, server) = open_tunnel(store, mode, &mut tried, progress)?;
     let stack = Arc::new(Mutex::new(stack));
     *guard = Some(SharedTunnel {
         mode: mode.to_string(),
         stack: Arc::clone(&stack),
+        tried,
+        server,
+        dir: store.dir.clone(),
     });
+    Ok(stack)
+}
+
+/// The current shared tunnel, if any — used by the proxy for each operation.
+pub fn current_tunnel() -> Option<Arc<Mutex<TunnelStack>>> {
+    let cell = SHARED_TUNNEL.get()?;
+    let guard = cell.lock().ok()?;
+    guard.as_ref().map(|s| Arc::clone(&s.stack))
+}
+
+/// Reconnect the shared tunnel on a DIFFERENT VPN Gate server.
+pub fn rotate_tunnel() -> Result<Arc<Mutex<TunnelStack>>, String> {
+    let cell = SHARED_TUNNEL.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().map_err(|e| e.to_string())?;
+    let Some(old) = guard.as_ref() else {
+        return Err("No tunnel to rotate".to_string());
+    };
+    let (mode, mut tried, dir) = (old.mode.clone(), old.tried.clone(), old.dir.clone());
+    if let Some(server) = &old.server {
+        tried.insert(server.clone());
+        netlog(&format!("Rotating away from failed server {server}"));
+    }
+    *guard = None; // drop the old stack before opening a new one
+    let store = Store::new(dir)?;
+    let (stack, server) = open_tunnel(&store, &mode, &mut tried, &|m, _| netlog(m))?;
+    let stack = Arc::new(Mutex::new(stack));
+    *guard = Some(SharedTunnel {
+        mode,
+        stack: Arc::clone(&stack),
+        tried,
+        server,
+        dir: store.dir.clone(),
+    });
+    netlog("VPN tunnel rotated successfully");
     Ok(stack)
 }
 

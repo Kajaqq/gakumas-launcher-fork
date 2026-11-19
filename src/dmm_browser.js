@@ -5,7 +5,38 @@
   if (window.__gakumasDmmBarInstalled) return;
   window.__gakumasDmmBarInstalled = true;
 
+  // Show a friendly loading screen instead of a blank white window while the
+  // VPN tunnel connects and the page downloads through the proxy.
+  function installLoading() {
+    if (document.getElementById('__gakumas_loading')) return;
+    const box = document.createElement('div');
+    box.id = '__gakumas_loading';
+    box.style.cssText = [
+      'position:fixed', 'inset:0', 'z-index:2147483640', 'display:flex',
+      'flex-direction:column', 'align-items:center', 'justify-content:center',
+      'gap:14px', 'background:#f5f5f4', 'color:#4f4b4b',
+      'font:700 17px sans-serif', 'text-align:center'
+    ].join(';');
+    box.innerHTML = '<div style="font-size:22px">Gakumas Launcher</div>' +
+      '<div>Connecting to DMM through the VPN…</div>' +
+      '<div style="width:36px;height:36px;border:4px solid #ddd;border-top-color:#ff7b00;border-radius:50%;animation:gkspin 1s linear infinite"></div>' +
+      '<style>@keyframes gkspin{to{transform:rotate(360deg)}}</style>';
+    (document.body || document.documentElement).appendChild(box);
+    let tries = 0;
+    const timer = setInterval(function () {
+      tries++;
+      const real = document.location.href &&
+        document.location.href !== 'about:blank' &&
+        (document.body && (document.body.innerText || '').trim().length > 120 || document.querySelector('main,#root,header'));
+      if (real || tries > 60) {
+        clearInterval(timer);
+        box.remove();
+      }
+    }, 250);
+  }
+
   function install() {
+    installLoading();
     if (!document.documentElement || document.getElementById('__gakumas_dmm_bar')) return;
 
     const bar = document.createElement('div');

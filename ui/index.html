@@ -158,6 +158,9 @@
   }
   .item-main { flex: 1; }
   .item-actions { display: flex; gap: 8px; flex: none; }
+  .account-actions { display: flex; flex-direction: column; gap: 8px; flex: 1; min-width: 150px; }
+  .account-actions .row { display: flex; gap: 8px; }
+  .account-actions .row .pill { flex: 1 1 0; min-width: 0; }
   .item-sub.account { display: flex; align-items: center; gap: 7px; }
   .item-sub.account .dot { width: 9px; height: 9px; border-radius: 50%; background: #ff6b6b; }
   .item-sub.account .dot.on { background: #4cd27e; }
@@ -310,7 +313,10 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
       </div>
       <div class="item">
         <div class="item-main"><div class="item-title">DMM Account</div><div class="item-sub account"><span class="dot" id="accountDot"></span><span id="accountText">-</span></div></div>
-        <div class="item-actions"><button class="pill" id="accountBtn">Login</button><button class="pill" id="dmmBrowserBtn">Browser</button></div>
+        <div class="item-actions account-actions">
+          <div class="row"><button class="pill" id="accountBtn">Login</button><button class="pill" id="registerBtn">Register</button></div>
+          <button class="pill" id="dmmBrowserBtn">Browser</button>
+        </div>
       </div>
     </div>
   </section>
@@ -429,7 +435,7 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
   }
   function setBusy(b) {
     busy = b;
-    for (const id of ['folder', 'exePick', 'exeClear', 'accountBtn', 'dmmBrowserBtn', 'auto', 'closeAfter', 'vpnPick', 'vpnAuth', 'protonApply', 'protonSetup', 'protonInstallDw', 'protonRefresh', 'localifyInstall']) $(id).disabled = b;
+    for (const id of ['folder', 'exePick', 'exeClear', 'accountBtn', 'dmmBrowserBtn', 'registerBtn', 'auto', 'closeAfter', 'vpnPick', 'vpnAuth', 'protonApply', 'protonSetup', 'protonInstallDw', 'protonRefresh', 'localifyInstall']) $(id).disabled = b;
     $('mode').querySelectorAll('button').forEach((x) => (x.disabled = b));
     if (!b) setMeter(null);
     updateStart();
@@ -583,6 +589,13 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
   $('dmmBrowserBtn').onclick = async () => {
     try {
       setStatus(await invoke('open_dmm_browser', { url: null }));
+    } catch (e) {
+      setStatus(String(e), true);
+    }
+  };
+  $('registerBtn').onclick = async () => {
+    try {
+      setStatus(await invoke('open_dmm_browser', { url: 'https://accounts.dmm.com/welcome/signup/email' }));
     } catch (e) {
       setStatus(String(e), true);
     }
