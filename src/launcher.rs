@@ -4,12 +4,12 @@
 //! 업데이트(바뀐 파일만, 일반 회선) → 게임 실행
 
 use std::collections::HashSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
@@ -123,8 +123,10 @@ pub struct VpnFile {
 /// 프로그램 데이터 (설정, 암호화된 로그인 토큰, 기기 ID, VPN Gate 목록 캐시, VPN 설정 파일)
 pub struct Store {
     dir: PathBuf,
-    vpngate_lock: Mutex<()>,
 }
+// Rotation reopens the same directory through a second Store. Both writers
+// must serialize access to the shared vpngate.csv.tmp file.
+static VPNGATE_CACHE_LOCK: Mutex<()> = Mutex::new(());
 
 fn file_age(p: &Path) -> Option<Duration> {
     fs::metadata(p).ok()?.modified().ok()?.elapsed().ok()
@@ -153,10 +155,7 @@ fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
 impl Store {
     pub fn new(dir: PathBuf) -> Result<Self, String> {
         fs::create_dir_all(&dir).map_err(|e| format!("Failed to create the data folder: {e}"))?;
-        Ok(Self {
-            dir,
-            vpngate_lock: Mutex::new(()),
-        })
+        Ok(Self { dir })
     }
 
     /// 저장해 둔 VPN Gate 서버 목록 (없으면 None)
@@ -167,7 +166,7 @@ impl Store {
     /// VPN Gate 서버 목록을 새로 받아 저장. `max_age` 보다 최근 목록이 있으면 그것을 씀.
     /// 동시에 불리면(시작할 때 받는 중에 연결 시도 등) 먼저 받는 쪽이 끝날 때까지 기다림
     pub fn refresh_vpngate_list(&self, max_age: Duration) -> Result<String, String> {
-        let _guard = self.vpngate_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = VPNGATE_CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cache = self.file("vpngate.csv");
         if file_age(&cache).is_some_and(|age| age < max_age) {
             if let Ok(body) = fs::read_to_string(&cache) {
@@ -219,7 +218,9 @@ impl Store {
         let text = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
         let tmp = self.file("settings.json.tmp");
         fs::write(&tmp, text).map_err(|e| format!("Failed to save settings: {e}"))?;
-        fs::rename(&tmp, self.file("settings.json")).map_err(|e| format!("Failed to save settings: {e}"))
+        fs::rename(&tmp, self.file("settings.json")).map_err(|e| format!("Failed to save settings: {e}"))?;
+        invalidate_route(self, |mode| mode != s.mode);
+        Ok(())
     }
 
     pub fn token(&self) -> Option<String> {
@@ -274,6 +275,7 @@ impl Store {
         };
         let json = serde_json::to_vec(&file).map_err(|e| e.to_string())?;
         write_private(&self.file("vpn_file.dat"), &platform::protect(&json)?)?;
+        invalidate_route(self, |mode| mode == MODE_FILE);
         Ok(file)
     }
 
@@ -289,7 +291,9 @@ impl Store {
 
     pub fn save_vpn_auth(&self, username: &str, password: &str) -> Result<(), String> {
         let json = json!({ "username": username, "password": password }).to_string();
-        write_private(&self.file("vpn_auth.dat"), &platform::protect(json.as_bytes())?)
+        write_private(&self.file("vpn_auth.dat"), &platform::protect(json.as_bytes())?)?;
+        invalidate_route(self, |mode| mode == MODE_FILE);
+        Ok(())
     }
 
     /// 저장된 토큰이 아직 `token` 일 때만 삭제 (그사이 새로 로그인했으면 그대로 둠)
@@ -468,16 +472,36 @@ pub fn netlog(msg: &str) {
 
 /// One VPN tunnel shared by the launcher, My Games calls and the browser proxy.
 struct SharedTunnel {
-    mode: String,
     stack: Arc<Mutex<TunnelStack>>,
     /// Server host names already used — rotation skips these.
     tried: HashSet<String>,
     /// The server this tunnel is connected to.
     server: Option<String>,
-    /// Data dir, so we can reopen after a dead session.
-    dir: PathBuf,
 }
-static SHARED_TUNNEL: OnceLock<Mutex<Option<SharedTunnel>>> = OnceLock::new();
+
+// Each route has its own setup lock. Its Arc also serves as the generation
+// token: a slow handshake cannot publish after the user replaced the route.
+struct Route {
+    setup: Arc<Mutex<()>>,
+    dir: PathBuf,
+    mode: String,
+    active: Option<SharedTunnel>,
+    last_error: Option<(Instant, String)>,
+}
+static ROUTE: Mutex<Option<Route>> = Mutex::new(None);
+
+fn invalidate_route(store: &Store, matches: impl FnOnce(&str) -> bool) {
+    let mut route = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+    if route.as_ref().is_some_and(|r| r.dir == store.dir && matches(&r.mode)) {
+        *route = None;
+    }
+}
+
+fn with_route<T>(setup: &Arc<Mutex<()>>, f: impl FnOnce(&mut Route) -> T) -> Result<T, String> {
+    let mut guard = ROUTE.lock().map_err(|e| e.to_string())?;
+    guard.as_mut().filter(|r| Arc::ptr_eq(&r.setup, setup)).map(f)
+        .ok_or_else(|| "VPN route changed during connection setup".to_string())
+}
 
 fn open_tunnel(store: &Store, mode: &str, tried: &mut HashSet<String>, progress: ProgressFn)
     -> Result<(TunnelStack, Option<String>), String>
@@ -491,77 +515,110 @@ fn open_tunnel(store: &Store, mode: &str, tried: &mut HashSet<String>, progress:
     Ok((stack, Some(host)))
 }
 
+/// Called only under this generation's setup lock. Share failed attempts for a
+/// short interval too, so queued connections don't each start a server search.
+fn dial_route(
+    setup: &Arc<Mutex<()>>, store: &Store, mode: &str, mut tried: HashSet<String>, progress: ProgressFn,
+) -> Result<Arc<Mutex<TunnelStack>>, String> {
+    if let Some(error) = with_route(setup, |r| r.last_error.as_ref()
+        .filter(|(at, _)| at.elapsed() < Duration::from_secs(3)).map(|(_, e)| e.clone()))? {
+        return Err(error);
+    }
+    match open_tunnel(store, mode, &mut tried, progress) {
+        Ok((stack, server)) => {
+            let stack = Arc::new(Mutex::new(stack));
+            with_route(setup, |r| {
+                r.active = Some(SharedTunnel { stack: stack.clone(), tried, server });
+                r.last_error = None;
+            })?;
+            Ok(stack)
+        }
+        Err(error) => {
+            with_route(setup, |r| {
+                r.last_error = Some((Instant::now(), error.clone()));
+                // A long-lived session may have exhausted every candidate.
+                // On the next search, exclude only the currently failed exit.
+                if let Some(active) = r.active.as_mut() {
+                    active.tried = active.server.iter().cloned().collect();
+                }
+            })?;
+            Err(error)
+        }
+    }
+}
+
 pub fn shared_tunnel(
     store: &Store,
     mode: &str,
     progress: ProgressFn,
 ) -> Result<Arc<Mutex<TunnelStack>>, String> {
-    let cell = SHARED_TUNNEL.get_or_init(|| Mutex::new(None));
-    let mut guard = cell.lock().map_err(|e| e.to_string())?;
-    if let Some(shared) = guard.as_ref() {
-        if shared.mode == mode {
-            return Ok(Arc::clone(&shared.stack));
-        }
-        *guard = None;
+    let mut guard = ROUTE.lock().map_err(|e| e.to_string())?;
+    // A window or launch task may still carry a mode captured before the
+    // settings change. Don't let it reinstall that route after invalidation.
+    if fs::read(store.file("settings.json")).ok()
+        .and_then(|b| serde_json::from_slice::<Settings>(&b).ok())
+        .is_some_and(|s| s.mode != mode) {
+        return Err("VPN mode changed; retry using the current settings".into());
     }
     if mode == MODE_DIRECT {
+        *guard = None;
         return Err("Direct mode does not use a launcher tunnel".to_string());
     }
+    if !guard.as_ref().is_some_and(|r| r.mode == mode && r.dir == store.dir) {
+        *guard = Some(Route {
+            setup: Arc::default(), dir: store.dir.clone(), mode: mode.into(), active: None, last_error: None,
+        });
+    }
+    let setup = guard.as_ref().unwrap().setup.clone();
+    drop(guard);
+    let _opening = setup.lock().map_err(|e| e.to_string())?;
+    if let Some(stack) = with_route(&setup, |r| r.active.as_ref().map(|s| s.stack.clone()))? {
+        return Ok(stack);
+    }
     netlog(&format!("Opening shared tunnel (mode={mode})"));
-    let mut tried = HashSet::new();
-    let (stack, server) = open_tunnel(store, mode, &mut tried, progress)?;
-    let stack = Arc::new(Mutex::new(stack));
-    *guard = Some(SharedTunnel {
-        mode: mode.to_string(),
-        stack: Arc::clone(&stack),
-        tried,
-        server,
-        dir: store.dir.clone(),
-    });
-    Ok(stack)
+    dial_route(&setup, store, mode, HashSet::new(), progress)
 }
 
-/// The current shared tunnel, if any — used by the proxy for each operation.
-pub fn current_tunnel() -> Option<Arc<Mutex<TunnelStack>>> {
-    let cell = SHARED_TUNNEL.get()?;
-    let guard = cell.lock().ok()?;
-    guard.as_ref().map(|s| Arc::clone(&s.stack))
+pub(crate) struct TunnelRoute(Arc<Mutex<()>>);
+
+impl TunnelRoute {
+    pub(crate) fn for_stack(stack: &Arc<Mutex<TunnelStack>>) -> Result<Self, String> {
+        let guard = ROUTE.lock().map_err(|e| e.to_string())?;
+        guard.as_ref().filter(|r| r.active.as_ref().is_some_and(|s| Arc::ptr_eq(&s.stack, stack)))
+            .map(|r| Self(r.setup.clone())).ok_or_else(|| "VPN route changed; try again".into())
+    }
+
+    pub(crate) fn stack(&self) -> Option<Arc<Mutex<TunnelStack>>> {
+        with_route(&self.0, |r| r.active.as_ref().map(|s| s.stack.clone())).ok().flatten()
+    }
 }
 
-/// Reconnect the shared tunnel on a DIFFERENT VPN Gate server.
-pub fn rotate_tunnel() -> Result<Arc<Mutex<TunnelStack>>, String> {
-    let cell = SHARED_TUNNEL.get_or_init(|| Mutex::new(None));
-    let mut guard = cell.lock().map_err(|e| e.to_string())?;
-    let Some(old) = guard.as_ref() else {
-        return Err("No tunnel to rotate".to_string());
+/// Rotate only the stack that actually failed, coalescing concurrent reports.
+pub fn rotate_tunnel_if(failed: &Arc<Mutex<TunnelStack>>) -> Result<Arc<Mutex<TunnelStack>>, String> {
+    let (setup, dir, mode) = {
+        let guard = ROUTE.lock().map_err(|e| e.to_string())?;
+        let r = guard.as_ref().filter(|r| r.active.as_ref().is_some_and(|s| Arc::ptr_eq(&s.stack, failed)))
+            .ok_or("Failed VPN tunnel is no longer current")?;
+        (r.setup.clone(), r.dir.clone(), r.mode.clone())
     };
-    let (mode, mut tried, dir) = (old.mode.clone(), old.tried.clone(), old.dir.clone());
-    if let Some(server) = &old.server {
-        tried.insert(server.clone());
+    let _opening = setup.lock().map_err(|e| e.to_string())?;
+    let (stack, tried, server) = with_route(&setup, |r| {
+        r.active.as_ref().map(|s| (s.stack.clone(), s.tried.clone(), s.server.clone()))
+    })?.ok_or("No tunnel to rotate")?;
+    if !Arc::ptr_eq(&stack, failed) {
+        return Ok(stack);
+    }
+    if let Some(server) = server {
         netlog(&format!("Rotating away from failed server {server}"));
     }
-    *guard = None; // drop the old stack before opening a new one
-    let store = Store::new(dir)?;
-    let (stack, server) = open_tunnel(&store, &mode, &mut tried, &|m, _| netlog(m))?;
-    let stack = Arc::new(Mutex::new(stack));
-    *guard = Some(SharedTunnel {
-        mode,
-        stack: Arc::clone(&stack),
-        tried,
-        server,
-        dir: store.dir.clone(),
-    });
+    let stack = dial_route(&setup, &Store { dir }, &mode, tried, &|m, _| netlog(m))?;
     netlog("VPN tunnel rotated successfully");
     Ok(stack)
 }
 
 /// Discard the shared tunnel so the next call opens a fresh session.
 pub fn reset_shared_tunnel() {
-    if let Some(cell) = SHARED_TUNNEL.get() {
-        if let Ok(mut guard) = cell.lock() {
-            *guard = None;
-        }
-    }
+    *ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// 일본 IP 가 필요한 API 를 부르는 경로
@@ -571,6 +628,13 @@ enum JapanLink {
 }
 
 impl JapanLink {
+    fn rotate_failed_server(&self) -> Result<(), String> {
+        if let JapanLink::Tunnel(stack) = self {
+            rotate_tunnel_if(stack)?;
+        }
+        Ok(())
+    }
+
     fn post(&mut self, path: &str, body: &Value, token: &str) -> Result<Value, String> {
         match self {
             JapanLink::Direct => direct_post(path, body, Some(token)),
@@ -967,12 +1031,11 @@ pub fn start_game(
         } else {
             link.post("/v5/r2/launch/cl", &body, &token)
         };
-        drop(link); // 일본 IP 는 여기까지만 필요
         let r = match result {
             Ok(r) => r,
             Err(e) if can_retry => {
                 progress(&format!("{e} · trying another server"), None);
-                reset_shared_tunnel();
+                link.rotate_failed_server()?;
                 continue;
             }
             Err(e) => return Err(e),
@@ -987,7 +1050,7 @@ pub fn start_game(
             }
             801 | 803 if can_retry => {
                 progress("DMM rejected the VPN server; trying another server", None);
-                reset_shared_tunnel();
+                link.rotate_failed_server()?;
             }
             801 | 803 => return Err(region_error(&settings.mode)),
             308 if !agreed => {

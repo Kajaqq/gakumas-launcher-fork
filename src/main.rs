@@ -110,7 +110,9 @@ struct AppState {
     auto_start_pending: Mutex<bool>,
     /// 진행 중에도 닫겠다고 확인했는지
     force_close: AtomicBool,
-    browser_proxy: Mutex<Option<gakumas_launcher::browser_proxy::BrowserProxy>>,
+    /// Serialize open/reuse with changes to the route. UI-thread commands must
+    /// only try_lock: WebView2 creation on a worker needs a responsive UI thread.
+    browser_gate: Mutex<()>,
 }
 
 #[derive(Clone, Serialize)]
@@ -235,7 +237,7 @@ fn get_status(state: tauri::State<'_, AppState>) -> Status {
 }
 
 #[tauri::command]
-fn set_mode(state: tauri::State<'_, AppState>, mode: String) -> Result<Status, String> {
+fn set_mode(app: AppHandle, state: tauri::State<'_, AppState>, mode: String) -> Result<Status, String> {
     if ![
         launcher::MODE_VPNGATE,
         launcher::MODE_DIRECT,
@@ -246,6 +248,10 @@ fn set_mode(state: tauri::State<'_, AppState>, mode: String) -> Result<Status, S
         return Err("Unknown connection mode".into());
     }
     let mut s = state.store.settings();
+    if s.mode == mode {
+        return Ok(state.store.status());
+    }
+    let _gate = browser_settings_guard(&app, &state)?;
     s.mode = mode;
     state.store.save_settings(&s)?;
     Ok(state.store.status())
@@ -376,6 +382,7 @@ async fn pick_vpn_file(app: AppHandle, window: tauri::Window) -> Result<Status, 
         return Ok(state.store.status());
     };
     let path: PathBuf = picked.into_path().map_err(|e| e.to_string())?;
+    let _gate = browser_settings_guard(&app, &state)?;
     state.store.import_vpn_file(&path)?;
     Ok(state.store.status())
 }
@@ -383,6 +390,7 @@ async fn pick_vpn_file(app: AppHandle, window: tauri::Window) -> Result<Status, 
 /// VPN 아이디·비밀번호 저장 (사용자가 화면에 직접 입력한 값, DPAPI 로 암호화)
 #[tauri::command]
 fn set_vpn_auth(
+    app: AppHandle,
     state: tauri::State<'_, AppState>,
     username: String,
     password: String,
@@ -390,6 +398,7 @@ fn set_vpn_auth(
     if username.trim().is_empty() || password.is_empty() {
         return Err("Please enter both a username and password".into());
     }
+    let _gate = browser_settings_guard(&app, &state)?;
     state.store.save_vpn_auth(username.trim(), &password)?;
     Ok(state.store.status())
 }
@@ -407,7 +416,9 @@ async fn start_game(app: AppHandle) -> Result<String, String> {
     // has to finish it in the browser, then press Start again.
     if let Err(e) = &result {
         if e.contains("profile registration is required") {
-            let _ = open_dmm_browser(app.clone(), Some(DMM_SETUP_URL.to_string()));
+            if let Err(reason) = open_dmm_browser(app.clone(), Some(DMM_SETUP_URL.to_string())).await {
+                return Err(format!("{e}. Could not open the setup browser: {reason}"));
+            }
         }
     }
     // 게임이 실행됐고 '게임 실행 후 런처 종료'가 켜져 있으면 런처를 닫음
@@ -432,6 +443,7 @@ fn logout(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<Status, S
     if *state.busy.lock().unwrap() {
         return Err("Cannot log out while an operation is in progress".into());
     }
+    let _gate = browser_settings_guard(&app, &state)?;
     state.store.clear_token()?;
     if let Some(w) = app.get_webview_window("main") {
         // 로그인 창과 같은 저장소를 쓰므로 DMM 로그인 상태와 저장된 비밀번호도 함께 지워짐
@@ -556,76 +568,114 @@ const DMM_BROWSER_LABEL: &str = "dmm_browser";
 const DMM_TOP_URL: &str = "https://www.dmm.com/";
 /// Official new-account setup URL (profile registration -> game installer).
 const DMM_SETUP_URL: &str = "https://accounts.dmm.com/service/login/password?channel=games&path=https%3A%2F%2Fpersonal.games.dmm.com%2Fprofile%2Fregist%2Fskip%3Fback_url%3Dhttps%253A%252F%252Fsite-gameplayer.dmm.com%252Fgameplayer%252Fgame%252Finstaller%252Fwin%252Fx86%252Fgakumas%252Fcl%252Fgeneral";
-/// Open (or focus) a freely navigable DMM browser window. Uses the same
-/// WebView approach as the login window. The injected script adds an address bar.
+fn browser_settings_guard<'a>(app: &AppHandle, state: &'a AppState) -> Result<std::sync::MutexGuard<'a, ()>, String> {
+    let gate = state.browser_gate.try_lock().map_err(|_| "The DMM browser is being opened; try again after closing it")?;
+    if app.get_webview_window(DMM_BROWSER_LABEL).is_some() {
+        return Err("Close the DMM browser first".into());
+    }
+    Ok(gate)
+}
+
+fn browser_url(text: &str) -> Result<tauri::Url, String> {
+    let url: tauri::Url = text.parse().map_err(|e| format!("Invalid URL: {e}"))?;
+    if !is_browser_url(&url) {
+        return Err("Only external HTTP and HTTPS pages can be opened".into());
+    }
+    Ok(url)
+}
+
+fn is_browser_url(url: &tauri::Url) -> bool {
+    matches!(url.scheme(), "http" | "https") && url.host_str() != Some("tauri.localhost")
+}
+
 #[tauri::command]
-fn open_dmm_browser(app: AppHandle, url: Option<String>) -> Result<String, String> {
+async fn open_dmm_browser(app: AppHandle, url: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || open_browser_window(app, url))
+        .await.map_err(|e| e.to_string())?
+}
+
+fn open_browser_window(app: AppHandle, url: Option<String>) -> Result<String, String> {
+    let target = url.as_deref().map(browser_url).transpose()?;
+    let state = app.state::<AppState>();
+    let _gate = state.browser_gate.lock().map_err(|_| "Browser state unavailable")?;
     if let Some(win) = app.get_webview_window(DMM_BROWSER_LABEL) {
-        if let Some(u) = url {
-            if let Ok(target) = u.parse::<tauri::Url>() {
-                let _ = win.navigate(target);
-            }
+        if let Some(target) = target {
+            win.navigate(target).map_err(|e| e.to_string())?;
         }
-        let _ = win.show();
-        let _ = win.set_focus();
+        win.show().and_then(|_| win.set_focus()).map_err(|e| e.to_string())?;
         return Ok("DMM browser already open".to_string());
     }
-    let target_url = url.unwrap_or_else(|| DMM_TOP_URL.to_string());
-    let url: tauri::Url = target_url
-        .parse()
-        .map_err(|e| format!("Invalid DMM URL: {e}"))?;
-
-    let proxy_url: Option<tauri::Url> = {
-        let state = app.state::<AppState>();
-        let mode = state.store.settings().mode;
-        // Direct mode assumes the user already has a system VPN; the browser
-        // uses the system network and needs no launcher proxy.
-        if mode == gakumas_launcher::launcher::MODE_DIRECT {
-            None
-        } else {
-        let mut guard = state.browser_proxy.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(
-                gakumas_launcher::browser_proxy::start(&state.store, &mode)
-                    .map_err(|e| format!("Failed to start the VPN browser proxy: {e}"))?,
-            );
-        }
-        guard.as_ref().and_then(|p| p.url().parse().ok())
-        }
+    let url = target.unwrap_or_else(|| DMM_TOP_URL.parse().unwrap());
+    let mode = state.store.settings().mode;
+    let proxy = if mode == launcher::MODE_DIRECT {
+        None // Use the same system network and login cookies as the normal login window.
+    } else {
+        emit_progress(&app, "Connecting the DMM browser to the VPN…", None);
+        Some(gakumas_launcher::browser_proxy::start(&state.store, &mode)
+            .map_err(|e| format!("Failed to start the VPN browser proxy: {e}"))?)
     };
-
-    let mut builder = WebviewWindowBuilder::new(&app, DMM_BROWSER_LABEL, WebviewUrl::External(url))
-        .title("DMM Browser")
+    let endpoint = proxy.as_ref().map(|p| p.url().parse::<tauri::Url>()).transpose()
+        .map_err(|e| format!("Invalid browser proxy endpoint: {e}"))?;
+    let profile = app.path().app_local_data_dir().map_err(|e| e.to_string())?.join("DmmProxyWebView");
+    launcher::netlog(&format!("[browser] opening {} via {mode}", url.host_str().unwrap_or("?")));
+    let build = || {
+        let popup_app = app.clone();
+        let mut builder = WebviewWindowBuilder::new(&app, DMM_BROWSER_LABEL, WebviewUrl::External(url.clone()))
+        .title("DMM Browser — loading…")
         .inner_size(1100.0, 800.0)
         .center()
-        // Keep the window hidden while the page loads through the slow proxy,
-        // then reveal it only when real content is ready (no white screen).
-        .visible(false)
+        .on_navigation(is_browser_url)
+        .on_new_window(move |url, _| {
+            if is_browser_url(&url) {
+                if let Some(win) = popup_app.get_webview_window(DMM_BROWSER_LABEL) {
+                    // Leave the native popup callback before starting navigation.
+                    tauri::async_runtime::spawn_blocking(move || win.navigate(url));
+                }
+            }
+            tauri::webview::NewWindowResponse::Deny
+        })
         .initialization_script(include_str!("dmm_browser.js"))
         .on_page_load(|win, payload| {
-            if payload.event() == tauri::webview::PageLoadEvent::Started {
-                // Reveal as soon as the document starts; the injected loading
-                // overlay covers the blank page while resources stream in.
-                let _ = win.show();
-                let _ = win.set_focus();
-            }
+            let host = payload.url().host_str().unwrap_or("?");
+            let loading = payload.event() == tauri::webview::PageLoadEvent::Started;
+            launcher::netlog(&format!("[browser] {:?}: {host}", payload.event()));
+            let _ = win.set_title(&format!("DMM Browser — {host}{}", if loading { " (loading…)" } else { "" }));
         });
-    if let Some(p) = proxy_url {
-        builder = builder.proxy_url(p);
+        if let Some(endpoint) = &endpoint {
+            // WebView2 fixes proxy args per user-data directory; WebKitGTK
+            // sets the proxy on its context, keyed by directory in Tauri. Do
+            // not share either with main/login. Private browsing also keeps
+            // launcher logout from leaving DMM cookies in this separate store.
+            builder = builder.data_directory(profile.clone()).incognito(true).proxy_url(endpoint.clone());
+        }
+        builder.build()
+    };
+    let built = build();
+    #[cfg(windows)]
+    let mut built = built;
+    // On a quick reopen WebView2's old browser process can still own the
+    // directory with the previous proxy port (ERROR_INVALID_STATE, 0x8007139F).
+    #[cfg(windows)]
+    for _ in 0..20 {
+        if !built.as_ref().err().is_some_and(|e| format!("{e:?}").to_ascii_lowercase().contains("8007139f")) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        built = build();
     }
-    builder
-        .build()
-        .map_err(|e| format!("Failed to open the DMM browser: {e}"))?;
+    let win = built.map_err(|e| format!("Failed to open the DMM browser: {e}"))?;
+    if let Some(proxy) = proxy {
+        // Attach ownership to this window, not the reusable label. Tauri drops
+        // its event listeners on destruction, including if it closed during build.
+        win.on_window_event(move |_| { let _keep_alive = &proxy; });
+    }
     Ok("DMM browser opened".to_string())
 }
 
 /// Navigate the DMM browser window to a user-entered URL.
 #[tauri::command]
 fn dmm_browser_navigate(app: AppHandle, url: String) -> Result<String, String> {
-    let target: tauri::Url = url.parse().map_err(|e| format!("Invalid URL: {e}"))?;
-    if !matches!(target.scheme(), "http" | "https") {
-        return Err("Only http and https URLs are allowed".to_string());
-    }
+    let target = browser_url(&url)?;
     let win = app
         .get_webview_window(DMM_BROWSER_LABEL)
         .ok_or("DMM browser is not open")?;
@@ -668,13 +718,6 @@ fn main() {
         .on_window_event(|window, event| {
             // 업데이트 등이 진행 중이면 바로 닫지 않고 화면에서 확인을 받음
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                // The browser window can get stuck on a pending proxied
-                // navigation; tear it down immediately instead of waiting.
-                if window.label() == DMM_BROWSER_LABEL {
-                    api.prevent_close();
-                    let _ = window.destroy();
-                    return;
-                }
                 if window.label() == "main" {
                     if let Some(state) = window.try_state::<AppState>() {
                         if *state.busy.lock().unwrap() && !state.force_close.load(Ordering::SeqCst)
@@ -702,7 +745,7 @@ fn main() {
                 busy: Mutex::new(false),
                 auto_start_pending: Mutex::new(settings.auto_start),
                 force_close: AtomicBool::new(false),
-                browser_proxy: Mutex::new(None),
+                browser_gate: Mutex::new(()),
             });
             // 시작하자마자 VPN Gate 서버 목록을 새로 받아 둠 (게임 시작은 받는 동안에도 쓰쿠바대 서버로 먼저 시도)
             if vpngate_mode {

@@ -586,20 +586,24 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
     }
   };
   $('vpnAuth').onclick = () => askVpnAuth();
-  $('dmmBrowserBtn').onclick = async () => {
+  async function openBrowser(url) {
+    if (busy) return;
+    setBusy(true);
     try {
-      setStatus(await invoke('open_dmm_browser', { url: null }));
+      if (vpnState.mode === 'file') {
+        if (!vpnState.vpn_file) return setStatus('Please select a VPN file', true);
+        if (vpnState.vpn_needs_auth && !vpnState.vpn_has_auth && !(await askVpnAuth())) return;
+      }
+      setStatus('Opening DMM browser…');
+      setStatus(await invoke('open_dmm_browser', { url }));
     } catch (e) {
       setStatus(String(e), true);
+    } finally {
+      setBusy(false);
     }
-  };
-  $('registerBtn').onclick = async () => {
-    try {
-      setStatus(await invoke('open_dmm_browser', { url: 'https://accounts.dmm.com/welcome/signup/email' }));
-    } catch (e) {
-      setStatus(String(e), true);
-    }
-  };
+  }
+  $('dmmBrowserBtn').onclick = () => openBrowser(null);
+  $('registerBtn').onclick = () => openBrowser('https://accounts.dmm.com/welcome/signup/email');
   $('accountBtn').onclick = async () => {
     if (!loggedIn) return run('login');
     const ok = await openModal({

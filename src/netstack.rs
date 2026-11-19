@@ -2,10 +2,11 @@
 //!
 //! Windows 네트워크 설정을 건드리지 않고, 이 프로그램이 여는 TCP 연결만 VPN 터널을 탑니다.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
@@ -26,6 +27,74 @@ pub trait IpTunnel: Send {
     fn pump(&mut self, wait: Duration) -> Result<(), String>;
     /// 복호화된 IP 패킷 하나를 꺼냄
     fn take_inbound(&mut self) -> Option<Vec<u8>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    type Packets = Arc<Mutex<VecDeque<Vec<u8>>>>;
+    struct Pipe { addr: [u8; 4], rx: Packets, tx: Packets }
+    impl IpTunnel for Pipe {
+        fn address(&self) -> TunnelAddr {
+            TunnelAddr { local_ip: self.addr, prefix_len: 24, gateway: None, mtu: 1300, dns: vec![] }
+        }
+        fn send_ip(&mut self, ip: &[u8]) -> Result<(), String> {
+            self.tx.lock().unwrap().push_back(ip.to_vec()); Ok(())
+        }
+        fn pump(&mut self, _: Duration) -> Result<(), String> { Ok(()) }
+        fn take_inbound(&mut self) -> Option<Vec<u8>> { self.rx.lock().unwrap().pop_front() }
+    }
+    fn pair() -> (TunnelStack, TunnelStack) {
+        let (a, b) = (Packets::default(), Packets::default());
+        (TunnelStack::new(Pipe { addr: [10,0,0,1], rx: a.clone(), tx: b.clone() }).unwrap(),
+         TunnelStack::new(Pipe { addr: [10,0,0,2], rx: b, tx: a }).unwrap())
+    }
+
+    #[test]
+    fn slow_handshake_does_not_block_other_stream_or_its_eof() {
+        let (mut client, mut server) = pair();
+        let mut listener = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; 8192]), tcp::SocketBuffer::new(vec![0; 8192]));
+        listener.listen(443).unwrap();
+        let peer = server.sockets.add(listener);
+        let slow = client.tcp_start(Ipv4Addr::new(10,0,0,3), 443).unwrap();
+        let ready = client.tcp_start(Ipv4Addr::new(10,0,0,2), 443).unwrap();
+        for _ in 0..4 { client.keepalive().unwrap(); server.keepalive().unwrap(); }
+        assert!(!client.tcp_connected(slow).unwrap());
+        assert!(client.tcp_connected(ready).unwrap());
+        let mut buf = [0; 16];
+        assert_eq!(client.tcp_recv(ready, &mut buf).unwrap(), None);
+        assert_eq!(client.tcp_send(ready, b"hello").unwrap(), 5);
+        client.tcp_shutdown_write(ready).unwrap();
+        for _ in 0..4 { client.keepalive().unwrap(); server.keepalive().unwrap(); }
+        let sock = server.sockets.get_mut::<tcp::Socket>(peer);
+        assert_eq!(sock.recv_slice(&mut buf).unwrap(), 5);
+        assert_eq!(&buf[..5], b"hello");
+        assert!(!sock.may_recv());
+        sock.send_slice(b"world").unwrap();
+        sock.close();
+        for _ in 0..4 { server.keepalive().unwrap(); client.keepalive().unwrap(); }
+        assert_eq!(client.tcp_recv(ready, &mut buf).unwrap(), Some(5));
+        assert_eq!(&buf[..5], b"world");
+        assert_eq!(client.tcp_recv(ready, &mut buf).unwrap(), Some(0));
+        assert!(!client.tcp_connected(slow).unwrap());
+    }
+
+    #[test]
+    fn old_handle_never_aliases_a_reused_slot() {
+        let (mut old, mut rotated) = pair();
+        let ip = Ipv4Addr::new(10, 0, 0, 3);
+        let stale = old.tcp_start(ip, 443).unwrap();
+        old.tcp_close(stale);
+        old.keepalive().unwrap();
+        for stack in [&mut old, &mut rotated] {
+            let current = stack.tcp_start(ip, 443).unwrap();
+            stack.tcp_close(stale);
+            assert!(stack.tcp_connected(stale).is_err());
+            assert_eq!(stack.tcp_connected(current), Ok(false));
+        }
+    }
 }
 
 /// 터널 안에서 이 프로그램이 쓰는 주소
@@ -97,6 +166,11 @@ impl Device for QueueDevice {
     }
 }
 
+// smoltcp recycles slot indices, including immediately after a tunnel rotation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct ProxyHandle(u64);
+static NEXT_PROXY_HANDLE: AtomicU64 = AtomicU64::new(1);
+
 pub struct TunnelStack {
     tun: Box<dyn IpTunnel>,
     dev: QueueDevice,
@@ -107,7 +181,9 @@ pub struct TunnelStack {
     hosts: HashMap<String, Ipv4Addr>,
     dns: Vec<[u8; 4]>,
     /// Handles created for the browser proxy (invalidated on rotation).
-    proxy_handles: HashSet<SocketHandle>,
+    proxy_handles: HashMap<ProxyHandle, SocketHandle>,
+    retired: Vec<(SocketHandle, Instant)>,
+    next_port: u16,
 }
 
 /// DNS-over-TCP 질의 (2바이트 길이 + DNS 메시지, A 레코드)
@@ -224,25 +300,14 @@ impl TunnelStack {
             epoch: Instant::now(),
             hosts: HashMap::new(),
             dns: push.dns.clone(),
-            proxy_handles: HashSet::new(),
+            proxy_handles: HashMap::new(),
+            retired: Vec::new(),
+            next_port: 49152 + u16::from_le_bytes([seed[0], seed[1]]) % 16384,
         })
     }
 
-    /// Fast path: resolve with the OS resolver (milliseconds) before falling
-    /// back to the slow DoH-over-tunnel lookup. Cache the answer either way.
-    fn resolve_fast(&mut self, host: &str) -> Result<Ipv4Addr, String> {
-        if let Some(ip) = self.hosts.get(host) {
-            return Ok(*ip);
-        }
-        if let Ok(addrs) = (host, 0).to_socket_addrs() {
-            for addr in addrs {
-                if let std::net::IpAddr::V4(v4) = addr.ip() {
-                    self.hosts.insert(host.to_string(), v4);
-                    return Ok(v4);
-                }
-            }
-        }
-        self.resolve_in_tunnel(host)
+    pub fn cached_ip(&self, host: &str) -> Option<Ipv4Addr> {
+        self.hosts.get(host).copied()
     }
 
     /// `host` 의 주소를 터널 안에서(일본 쪽 DNS 로) 찾아 이후 요청에 씀.
@@ -324,79 +389,80 @@ impl TunnelStack {
         SmolInstant::from_millis(self.epoch.elapsed().as_millis() as i64)
     }
 
-    /// TCP/IP 스택 한 번 돌리기: 보낼 패킷을 터널로, 터널에서 온 패킷을 스택으로
-    /// Open a raw TCP socket through the tunnel; returns a handle. The caller
-    /// uses tcp_send/tcp_recv/tcp_close, locking only for each short operation
-    /// so the keepalive thread can run between them.
-    pub fn tcp_open(&mut self, host: &str, port: u16, timeout: Duration) -> Result<SocketHandle, String> {
-        let ip = self.resolve_fast(host)?.octets();
+    fn start_socket(&mut self, ip: Ipv4Addr, port: u16) -> Result<SocketHandle, String> {
+        let ip = ip.octets();
         let mut sock = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0u8; 65535]),
             tcp::SocketBuffer::new(vec![0u8; 65535]),
         );
-        let mut r = [0u8; 2];
-        getrandom::getrandom(&mut r).map_err(|e| e.to_string())?;
-        let local_port = 49152 + (u16::from_le_bytes(r) % 16000);
+        let local_port = (0..16384).find_map(|_| {
+            let p = self.next_port;
+            self.next_port = p.checked_add(1).unwrap_or(49152);
+            let used = self.sockets.iter().any(|(h, _)| self.sockets.get::<tcp::Socket>(h).local_endpoint().is_some_and(|ep| ep.port == p));
+            (!used).then_some(p)
+        }).ok_or("all tunnel TCP ports are in use")?;
         sock.connect(
             self.iface.context(),
             (IpAddress::v4(ip[0], ip[1], ip[2], ip[3]), port),
             local_port,
         )
         .map_err(|e| format!("TCP connect: {e:?}"))?;
-        let handle = self.sockets.add(sock);
-        self.proxy_handles.insert(handle);
-        let deadline = Instant::now() + timeout;
-        loop {
-            if Instant::now() >= deadline {
-                self.sockets.get_mut::<tcp::Socket>(handle).abort();
-                let _ = self.sockets.remove(handle);
-                self.proxy_handles.remove(&handle);
-                return Err("TCP connect timed out".to_string());
-            }
-            self.step()?;
-            if self.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Established {
-                return Ok(handle);
-            }
-            std::thread::sleep(Duration::from_millis(2));
+        Ok(self.sockets.add(sock))
+    }
+
+    /// Enqueue the handshake. Only the shared keepalive/poll loop performs I/O.
+    pub fn tcp_start(&mut self, ip: Ipv4Addr, port: u16) -> Result<ProxyHandle, String> {
+        let h = self.start_socket(ip, port)?;
+        let id = ProxyHandle(NEXT_PROXY_HANDLE.fetch_add(1, Ordering::Relaxed));
+        self.proxy_handles.insert(id, h);
+        Ok(id)
+    }
+
+    fn socket(&mut self, id: ProxyHandle) -> Result<&mut tcp::Socket<'static>, String> {
+        let h = *self.proxy_handles.get(&id).ok_or("connection reset after close or VPN rotation")?;
+        Ok(self.sockets.get_mut::<tcp::Socket>(h))
+    }
+
+    pub fn tcp_connected(&mut self, id: ProxyHandle) -> Result<bool, String> {
+        match self.socket(id)?.state() {
+            tcp::State::SynSent | tcp::State::SynReceived => Ok(false),
+            tcp::State::Established | tcp::State::CloseWait => Ok(true),
+            _ => Err("TCP connection refused or closed".into()),
         }
     }
 
-    fn live_socket(&mut self, handle: SocketHandle) -> bool {
-        // A handle from a previous (rotated) tunnel is not in this set.
-        self.proxy_handles.contains(&handle)
+    pub fn tcp_send(&mut self, id: ProxyHandle, data: &[u8]) -> Result<usize, String> {
+        self.socket(id)?.send_slice(data).map_err(|e| format!("TCP send: {e:?}"))
     }
 
-    pub fn tcp_send(&mut self, handle: SocketHandle, data: &[u8]) -> Result<usize, String> {
-        self.step()?;
-        if !self.live_socket(handle) {
-            return Err("connection reset after VPN rotation".to_string());
-        }
-        let sock = self.sockets.get_mut::<tcp::Socket>(handle);
-        if sock.can_send() {
-            sock.send_slice(data).map_err(|e| format!("{e:?}"))
-        } else {
-            Ok(0)
-        }
-    }
-
-    pub fn tcp_recv(&mut self, handle: SocketHandle, buf: &mut [u8]) -> Result<usize, String> {
-        self.step()?;
-        if !self.live_socket(handle) {
-            return Err("connection reset after VPN rotation".to_string());
-        }
-        let sock = self.sockets.get_mut::<tcp::Socket>(handle);
+    /// None means would-block; Some(0) means the remote has closed its write half.
+    pub fn tcp_recv(&mut self, id: ProxyHandle, buf: &mut [u8]) -> Result<Option<usize>, String> {
+        let sock = self.socket(id)?;
         if sock.can_recv() {
-            sock.recv_slice(buf).map_err(|e| format!("{e:?}"))
+            sock.recv_slice(buf).map(Some).map_err(|e| format!("TCP recv: {e:?}"))
+        } else if sock.may_recv() {
+            Ok(None)
         } else {
-            Ok(0)
+            Ok(Some(0))
         }
     }
 
-    pub fn tcp_close(&mut self, handle: SocketHandle) {
-        if self.live_socket(handle) {
-            self.sockets.get_mut::<tcp::Socket>(handle).abort();
-            let _ = self.sockets.remove(handle);
-            self.proxy_handles.remove(&handle);
+    pub fn tcp_shutdown_write(&mut self, id: ProxyHandle) -> Result<(), String> {
+        self.socket(id)?.close();
+        Ok(())
+    }
+
+    pub fn tcp_close(&mut self, id: ProxyHandle) {
+        if let Some(h) = self.proxy_handles.remove(&id) {
+            let sock = self.sockets.get_mut::<tcp::Socket>(h);
+            // A graceful half-close can still have unacknowledged data. Let it
+            // drain, but bound the lifetime of a socket abandoned by both ends.
+            if matches!(sock.state(), tcp::State::LastAck | tcp::State::Closing | tcp::State::TimeWait | tcp::State::FinWait1 | tcp::State::FinWait2) {
+                self.retired.push((h, Instant::now() + Duration::from_secs(30)));
+            } else {
+                sock.abort();
+                self.retired.push((h, Instant::now()));
+            }
         }
     }
 
@@ -406,10 +472,7 @@ impl TunnelStack {
 
     fn step(&mut self) -> Result<(), String> {
         let now = self.now();
-        self.iface.poll(now, &mut self.dev, &mut self.sockets);
-        while let Some(p) = self.dev.tx.pop_front() {
-            self.tun.send_ip(&p)?;
-        }
+        self.poll_and_flush()?;
         let delay = self
             .iface
             .poll_delay(now, &self.sockets)
@@ -419,6 +482,29 @@ impl TunnelStack {
             .pump(delay.clamp(Duration::from_millis(1), Duration::from_millis(4)))?;
         while let Some(p) = self.tun.take_inbound() {
             self.dev.rx.push_back(p);
+        }
+        if !self.dev.rx.is_empty() {
+            self.poll_and_flush()?;
+        }
+        Ok(())
+    }
+
+    fn poll_and_flush(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        for &(h, deadline) in &self.retired {
+            if now >= deadline {
+                self.sockets.get_mut::<tcp::Socket>(h).abort();
+            }
+        }
+        self.iface.poll(self.now(), &mut self.dev, &mut self.sockets);
+        self.retired.retain(|&(h, _)| {
+            if self.sockets.get::<tcp::Socket>(h).state() == tcp::State::Closed {
+                self.sockets.remove(h);
+                false
+            } else { true }
+        });
+        while let Some(p) = self.dev.tx.pop_front() {
+            self.tun.send_ip(&p)?;
         }
         Ok(())
     }
@@ -464,21 +550,7 @@ impl TunnelStack {
         timeout: Duration,
         complete: fn(&[u8]) -> bool,
     ) -> Result<Vec<u8>, String> {
-        let ip = ip.octets();
-        let mut sock = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0u8; 65535]),
-            tcp::SocketBuffer::new(vec![0u8; 65535]),
-        );
-        let mut r = [0u8; 2];
-        getrandom::getrandom(&mut r).map_err(|e| e.to_string())?;
-        let local_port = 49152 + (u16::from_le_bytes(r) % 16000);
-        sock.connect(
-            self.iface.context(),
-            (IpAddress::v4(ip[0], ip[1], ip[2], ip[3]), port),
-            local_port,
-        )
-        .map_err(|e| format!("TCP connect: {e:?}"))?;
-        let h = self.sockets.add(sock);
+        let h = self.start_socket(ip, port)?;
         let result = self.exchange(h, host, tls, req, timeout, complete);
         self.sockets.get_mut::<tcp::Socket>(h).abort();
         let _ = self.step();
@@ -599,5 +671,3 @@ impl TunnelStack {
         }
     }
 }
-
-

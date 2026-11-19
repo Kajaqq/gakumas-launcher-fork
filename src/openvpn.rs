@@ -1006,6 +1006,8 @@ pub struct Tunnel {
     key_material: Option<Vec<u8>>,
     data: Option<DataCipher>,
     data_pid: u32,
+    ping_interval: Option<Duration>,
+    last_data_send: Instant,
     compress: Compress,
     fragment: bool,
     frags: HashMap<u8, BTreeMap<u8, Vec<u8>>>,
@@ -1131,6 +1133,8 @@ impl Tunnel {
             key_material: None,
             data: None,
             data_pid: 1,
+            ping_interval: None,
+            last_data_send: Instant::now(),
             compress: cfg.compress,
             fragment: cfg.fragment.is_some(),
             frags: HashMap::new(),
@@ -1548,6 +1552,10 @@ impl Tunnel {
                     }
                 }
                 Some("peer-id") => peer_id = parts.get(1).and_then(|n| n.parse().ok()),
+                Some("ping") => {
+                    self.ping_interval = parts.get(1).and_then(|n| n.parse::<u32>().ok())
+                        .filter(|n| *n > 0).map(|n| Duration::from_secs(n.into()));
+                }
                 Some("dhcp-option") if parts.get(1) == Some(&"DNS") => {
                     if let Some(a) = parts.get(2).and_then(|s| parse_v4(s)) {
                         dns.push(a);
@@ -1782,12 +1790,19 @@ impl Tunnel {
                 [header, pidb.to_vec(), tag.as_ref().to_vec(), buf].concat()
             }
         };
-        self.link.send(&pkt)
+        self.link.send(&pkt)?;
+        self.last_data_send = Instant::now();
+        Ok(())
     }
 
     /// 서버에서 온 패킷을 최대 `wait` 동안 기다려 처리
     pub fn pump(&mut self, wait: Duration) -> Result<(), String> {
-        let mut deadline = Instant::now() + wait;
+        // Servers with --ping-restart expect client traffic even while the
+        // browser is idle (for example while the user completes login).
+        if self.ping_interval.is_some_and(|d| self.last_data_send.elapsed() >= d) {
+            self.send_ip(&PING_MAGIC)?;
+        }
+        let deadline = Instant::now() + wait;
         for _ in 0..256 {
             match self.link.recv_until(deadline)? {
                 Some(p) => {
@@ -1800,7 +1815,6 @@ impl Tunnel {
                 }
                 None => break,
             }
-            deadline = Instant::now() + Duration::from_millis(1);
         }
         Ok(())
     }

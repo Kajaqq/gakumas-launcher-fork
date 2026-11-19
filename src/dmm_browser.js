@@ -2,42 +2,11 @@
 // Adds an address bar with Back/Forward. Uses plain browser navigation so it
 // works on external pages (where Tauri IPC is not available).
 (function () {
-  if (window.__gakumasDmmBarInstalled) return;
+  if (window.top !== window || window.__gakumasDmmBarInstalled) return;
   window.__gakumasDmmBarInstalled = true;
 
-  // Show a friendly loading screen instead of a blank white window while the
-  // VPN tunnel connects and the page downloads through the proxy.
-  function installLoading() {
-    if (document.getElementById('__gakumas_loading')) return;
-    const box = document.createElement('div');
-    box.id = '__gakumas_loading';
-    box.style.cssText = [
-      'position:fixed', 'inset:0', 'z-index:2147483640', 'display:flex',
-      'flex-direction:column', 'align-items:center', 'justify-content:center',
-      'gap:14px', 'background:#f5f5f4', 'color:#4f4b4b',
-      'font:700 17px sans-serif', 'text-align:center'
-    ].join(';');
-    box.innerHTML = '<div style="font-size:22px">Gakumas Launcher</div>' +
-      '<div>Connecting to DMM through the VPN…</div>' +
-      '<div style="width:36px;height:36px;border:4px solid #ddd;border-top-color:#ff7b00;border-radius:50%;animation:gkspin 1s linear infinite"></div>' +
-      '<style>@keyframes gkspin{to{transform:rotate(360deg)}}</style>';
-    (document.body || document.documentElement).appendChild(box);
-    let tries = 0;
-    const timer = setInterval(function () {
-      tries++;
-      const real = document.location.href &&
-        document.location.href !== 'about:blank' &&
-        (document.body && (document.body.innerText || '').trim().length > 120 || document.querySelector('main,#root,header'));
-      if (real || tries > 60) {
-        clearInterval(timer);
-        box.remove();
-      }
-    }, 250);
-  }
-
   function install() {
-    installLoading();
-    if (!document.documentElement || document.getElementById('__gakumas_dmm_bar')) return;
+    if (!document.body || document.getElementById('__gakumas_dmm_bar')) return;
 
     const bar = document.createElement('div');
     bar.id = '__gakumas_dmm_bar';
@@ -81,7 +50,14 @@
     function go(url) {
       if (!url) return;
       if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(url)) url = 'https://' + url;
-      window.location.href = url;
+      try {
+        const target = new URL(url);
+        if (!['https:', 'http:'].includes(target.protocol)) throw new Error();
+        window.location.assign(target.href);
+      } catch (_) {
+        input.setCustomValidity('Enter a valid HTTP or HTTPS address');
+        input.reportValidity();
+      }
     }
 
     function navigate() {
@@ -89,27 +65,10 @@
       go(input.value);
     }
 
-    // Let normal same-window links work untouched. Only redirect links that
-    // target a new window (which Tauri blocks) into this window.
-    document.addEventListener('click', function (e) {
-      const a = e.target && e.target.closest ? e.target.closest('a') : null;
-      if (!a) return;
-      const href = a.href;
-      if (!href || !/^https?:/.test(href)) return;
-      if (a.target === '_blank' || a.target === '_new') {
-        e.preventDefault();
-        go(href);
-      }
-    }, true);
-
-    window.open = function (url) {
-      go(typeof url === 'string' ? url : '');
-      return null;
-    };
-
     back.addEventListener('click', function () { window.history.back(); });
     forward.addEventListener('click', function () { window.history.forward(); });
     goBtn.addEventListener('click', navigate);
+    input.addEventListener('input', () => input.setCustomValidity(''));
     input.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') { e.preventDefault(); navigate(); }
     });

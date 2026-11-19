@@ -1350,6 +1350,7 @@ dependencies = [
  "ctr",
  "getrandom 0.2.17",
  "hmac",
+ "httparse",
  "md-5",
  "native-tls",
  "ring",

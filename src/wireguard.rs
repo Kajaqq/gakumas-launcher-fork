@@ -143,6 +143,7 @@ pub struct WgTunnel {
     addr: TunnelAddr,
     last_timers: Instant,
     buf: Vec<u8>,
+    dgram: Vec<u8>,
 }
 
 impl WgTunnel {
@@ -184,6 +185,7 @@ impl WgTunnel {
             },
             last_timers: Instant::now(),
             buf: vec![0u8; BUF],
+            dgram: vec![0u8; BUF],
         };
         log(format!("UDP ready for {peer}"));
 
@@ -225,8 +227,7 @@ impl WgTunnel {
         self.sock
             .set_read_timeout(Some((deadline - now).max(Duration::from_millis(1))))
             .map_err(|e| e.to_string())?;
-        let mut dgram = vec![0u8; BUF];
-        let n = match self.sock.recv(&mut dgram) {
+        let n = match self.sock.recv(&mut self.dgram) {
             Ok(n) => n,
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
@@ -241,7 +242,7 @@ impl WgTunnel {
         let src: Option<IpAddr> = Some(self.peer.ip());
         let mut first = true;
         loop {
-            let input: &[u8] = if first { &dgram[..n] } else { &[] };
+            let input: &[u8] = if first { &self.dgram[..n] } else { &[] };
             match self.tunn.decapsulate(src, input, &mut self.buf) {
                 TunnResult::WriteToNetwork(p) => {
                     self.sock.send(p).map_err(|e| format!("VPN send: {e}"))?;
@@ -295,12 +296,11 @@ impl IpTunnel for WgTunnel {
 
     fn pump(&mut self, wait: Duration) -> Result<(), String> {
         self.tick_timers()?;
-        let mut deadline = Instant::now() + wait;
+        let deadline = Instant::now() + wait;
         for _ in 0..256 {
             if !self.recv_once(deadline)? {
                 break;
             }
-            deadline = Instant::now() + Duration::from_millis(1);
         }
         Ok(())
     }
