@@ -4,6 +4,7 @@
 //! 업데이트(바뀐 파일만, 일반 회선) → 게임 실행
 
 use std::collections::HashSet;
+use std::sync::{Arc, OnceLock};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -455,27 +456,68 @@ fn direct_get_json(url: &str) -> Result<Value, String> {
     serde_json::from_str(&text).map_err(|e| format!("Failed to parse the DMM response: {e}"))
 }
 
+/// One VPN tunnel shared by the launcher, My Games calls and the browser proxy.
+struct SharedTunnel {
+    mode: String,
+    stack: Arc<Mutex<TunnelStack>>,
+}
+static SHARED_TUNNEL: OnceLock<Mutex<Option<SharedTunnel>>> = OnceLock::new();
+
+pub fn shared_tunnel(
+    store: &Store,
+    mode: &str,
+    progress: ProgressFn,
+) -> Result<Arc<Mutex<TunnelStack>>, String> {
+    let cell = SHARED_TUNNEL.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().map_err(|e| e.to_string())?;
+    if let Some(shared) = guard.as_ref() {
+        if shared.mode == mode {
+            return Ok(Arc::clone(&shared.stack));
+        }
+        *guard = None;
+    }
+    if mode == MODE_DIRECT {
+        return Err("Direct mode does not use a launcher tunnel".to_string());
+    }
+    let stack = if mode == MODE_FILE {
+        open_vpn_file(store, progress)?
+    } else {
+        let (stack, _) = open_vpngate(store, progress, &mut HashSet::new())?;
+        stack
+    };
+    let stack = Arc::new(Mutex::new(stack));
+    *guard = Some(SharedTunnel {
+        mode: mode.to_string(),
+        stack: Arc::clone(&stack),
+    });
+    Ok(stack)
+}
+
+/// Discard the shared tunnel so the next call opens a fresh session.
+pub fn reset_shared_tunnel() {
+    if let Some(cell) = SHARED_TUNNEL.get() {
+        if let Ok(mut guard) = cell.lock() {
+            *guard = None;
+        }
+    }
+}
+
 /// 일본 IP 가 필요한 API 를 부르는 경로
 enum JapanLink {
-    /// 사용자가 직접 켠 VPN 등 (일반 회선 그대로)
     Direct,
-    /// 프로그램 안의 VPN Gate 터널
-    Tunnel(Box<TunnelStack>),
+    Tunnel(Arc<Mutex<TunnelStack>>),
 }
 
 impl JapanLink {
     fn post(&mut self, path: &str, body: &Value, token: &str) -> Result<Value, String> {
         match self {
             JapanLink::Direct => direct_post(path, body, Some(token)),
-            JapanLink::Tunnel(stack) => {
+            JapanLink::Tunnel(shared) => {
                 let req = http::dmm_post(path, &body.to_string(), Some(token));
-                let raw = stack.request(
-                    DMM_HOST,
-                    443,
-                    Some(http::dmm_tls_config()),
-                    &req,
-                    Duration::from_secs(30),
-                )?;
+                let raw = shared
+                    .lock()
+                    .map_err(|e| e.to_string())?
+                    .request(DMM_HOST, 443, Some(http::dmm_tls_config()), &req, Duration::from_secs(30))?;
                 let (status, b) = http::parse_response(&raw)?;
                 match serde_json::from_slice(&b) {
                     Ok(v) => Ok(v),
@@ -487,50 +529,43 @@ impl JapanLink {
     }
 }
 
-/// Open a raw user-space tunnel for the local browser proxy.
-pub fn open_tunnel_stack(store: &Store, mode: &str) -> Result<TunnelStack, String> {
-    let mut tried = HashSet::new();
-    let (link, _) = open_japan_link(store, mode, &|_, _| {}, &mut tried)?;
-    match link {
-        JapanLink::Tunnel(stack) => Ok(*stack),
-        JapanLink::Direct => Err("A VPN tunnel is required for the browser proxy".to_string()),
-    }
-}
-
-/// Whether the game is already in the account's My Games list.
-pub fn is_in_mygames(token: &str) -> Result<bool, String> {
-    let r = direct_post("/v5/mygames", &json!({ "user_os": "win" }), Some(token))?;
+/// Whether the game is already in the account's My Games list (through the shared VPN).
+pub fn is_in_mygames(store: &Store, mode: &str, token: &str) -> Result<bool, String> {
+    let shared = shared_tunnel(store, mode, &|_, _| {})?;
+    let req = http::dmm_post("/v5/mygames", "{\"user_os\":\"win\"}", Some(token));
+    let raw = shared
+        .lock()
+        .map_err(|e| e.to_string())?
+        .request(DMM_HOST, 443, Some(http::dmm_tls_config()), &req, Duration::from_secs(30))?;
+    let (_, body) = http::parse_response(&raw)?;
+    let r: Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
     Ok(r["data"]
         .as_array()
-        .map(|list| {
-            list.iter()
-                .any(|g| g["product_id"].as_str() == Some(PRODUCT_ID))
-        })
+        .map(|list| list.iter().any(|g| g["product_id"].as_str() == Some(PRODUCT_ID)))
         .unwrap_or(false))
 }
 
-/// Add the game to the account's My Games using DMM's own endpoint.
-/// Call this after profile registration (313) has been completed.
+/// Add the game to My Games through the shared VPN tunnel.
 pub fn add_to_mygames(store: &Store, mode: &str, token: &str) -> Result<String, String> {
-    let mut stack = open_tunnel_stack(store, mode)?;
+    if is_in_mygames(store, mode, token)? {
+        return Ok("Game is already in My Games".to_string());
+    }
+    let shared = shared_tunnel(store, mode, &|_, _| {})?;
     let req = http::dmm_post(
         "/v5/detail/mygame/add",
         &json!({ "product_id": PRODUCT_ID, "game_type": "cl", "game_os": "win" }).to_string(),
         Some(token),
     );
-    let raw = stack.request(
-        DMM_HOST,
-        443,
-        Some(http::dmm_tls_config()),
-        &req,
-        Duration::from_secs(30),
-    )?;
+    let raw = shared
+        .lock()
+        .map_err(|e| e.to_string())?
+        .request(DMM_HOST, 443, Some(http::dmm_tls_config()), &req, Duration::from_secs(30))?;
     let (status, body) = http::parse_response(&raw)?;
     let r: Value = serde_json::from_slice(&body)
         .map_err(|_| format!("DMM returned HTTP {status} for My Games add"))?;
     match r["result_code"].as_i64().unwrap_or(-1) {
         100 => Ok("Game added to My Games".to_string()),
-        313 => Err("DMM GAMES profile registration is required first (click Setup).".to_string()),
+        313 => Err("DMM GAMES profile registration is required first.".to_string()),
         c => Err(format!("Failed to add game to My Games (result_code {c}, {})", r["error"])),
     }
 }
@@ -540,17 +575,11 @@ fn open_japan_link(
     store: &Store,
     mode: &str,
     progress: ProgressFn,
-    tried: &mut HashSet<String>,
-) -> Result<(JapanLink, Option<String>), String> {
+) -> Result<JapanLink, String> {
     if mode == MODE_DIRECT {
-        return Ok((JapanLink::Direct, None));
+        return Ok(JapanLink::Direct);
     }
-    if mode == MODE_FILE {
-        let stack = open_vpn_file(store, progress)?;
-        return Ok((JapanLink::Tunnel(Box::new(stack)), None));
-    }
-    let (stack, host) = open_vpngate(store, progress, tried)?;
-    Ok((JapanLink::Tunnel(Box::new(stack)), Some(host)))
+    Ok(JapanLink::Tunnel(shared_tunnel(store, mode, progress)?))
 }
 
 fn try_servers(
@@ -853,13 +882,12 @@ pub fn start_game(
     let mut relogged = false;
     let mut agreed = false;
     let mut added_mygame = false;
-    let mut tried: HashSet<String> = HashSet::new();
     let mut attempts = 0;
     let data = loop {
         attempts += 1;
         // VPN Gate 서버가 DMM 에 거부당하거나 연결이 끊기면 다른 서버로 다시 시도
         let can_retry = settings.mode == MODE_VPNGATE && attempts < VPNGATE_LAUNCH_ATTEMPTS;
-        let (mut link, host) = open_japan_link(store, &settings.mode, progress, &mut tried)?;
+        let mut link = open_japan_link(store, &settings.mode, progress)?;
         progress("Preparing to launch", None);
         let result = if agreed {
             // 308 = game terms not accepted. Confirm, then retry the launch.
@@ -882,6 +910,7 @@ pub fn start_game(
             Ok(r) => r,
             Err(e) if can_retry => {
                 progress(&format!("{e} · trying another server"), None);
+                reset_shared_tunnel();
                 continue;
             }
             Err(e) => return Err(e),
@@ -893,12 +922,10 @@ pub fn start_game(
                 store.clear_token()?;
                 token = login(store, get_code, progress)?;
                 relogged = true;
-                if let Some(h) = host {
-                    tried.remove(&h); // 서버 문제는 아니었으므로 다시 써도 됨
-                }
             }
             801 | 803 if can_retry => {
                 progress("DMM rejected the VPN server; trying another server", None);
+                reset_shared_tunnel();
             }
             801 | 803 => return Err(region_error(&settings.mode)),
             308 if !agreed => {
@@ -908,9 +935,9 @@ pub fn start_game(
             313 if !added_mygame => {
                 // New account: register the title to My Games through DMM's
                 // own endpoint, then retry the launch once.
-                progress("New account: adding game to My Games...", None);
-                if let Err(e) = add_to_mygames(store, &settings.mode, &token) {
-                    return Err(e);
+                let message = add_to_mygames(store, &settings.mode, &token)?;
+                if !message.contains("already") {
+                    progress(&message, None);
                 }
                 added_mygame = true;
             }

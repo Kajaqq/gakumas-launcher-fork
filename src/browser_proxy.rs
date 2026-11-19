@@ -21,7 +21,7 @@ impl BrowserProxy {
 }
 
 pub fn start(store: &launcher::Store, mode: &str) -> Result<BrowserProxy, String> {
-    let stack = Arc::new(Mutex::new(launcher::open_tunnel_stack(store, mode)?));
+    let stack = launcher::shared_tunnel(store, mode, &|_, _| {})?;
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
 

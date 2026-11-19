@@ -578,6 +578,11 @@ fn open_dmm_browser(app: AppHandle, url: Option<String>) -> Result<String, Strin
     let proxy_url: Option<tauri::Url> = {
         let state = app.state::<AppState>();
         let mode = state.store.settings().mode;
+        // Direct mode assumes the user already has a system VPN; the browser
+        // uses the system network and needs no launcher proxy.
+        if mode == gakumas_launcher::launcher::MODE_DIRECT {
+            None
+        } else {
         let mut guard = state.browser_proxy.lock().unwrap();
         if guard.is_none() {
             *guard = Some(
@@ -586,6 +591,7 @@ fn open_dmm_browser(app: AppHandle, url: Option<String>) -> Result<String, Strin
             );
         }
         guard.as_ref().and_then(|p| p.url().parse().ok())
+        }
     };
 
     let mut builder = WebviewWindowBuilder::new(&app, DMM_BROWSER_LABEL, WebviewUrl::External(url))
@@ -651,6 +657,13 @@ fn main() {
         .on_window_event(|window, event| {
             // 업데이트 등이 진행 중이면 바로 닫지 않고 화면에서 확인을 받음
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // The browser window can get stuck on a pending proxied
+                // navigation; tear it down immediately instead of waiting.
+                if window.label() == DMM_BROWSER_LABEL {
+                    api.prevent_close();
+                    let _ = window.destroy();
+                    return;
+                }
                 if window.label() == "main" {
                     if let Some(state) = window.try_state::<AppState>() {
                         if *state.busy.lock().unwrap() && !state.force_close.load(Ordering::SeqCst)
