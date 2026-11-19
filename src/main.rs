@@ -299,9 +299,8 @@ async fn pick_game_folder(app: AppHandle, window: tauri::Window) -> Result<Statu
         return Ok(state.store.status());
     };
     let path: PathBuf = picked.into_path().map_err(|e| e.to_string())?;
-    if !path.join("gakumas.exe").is_file() {
-        return Err("gakumas.exe was not found in this folder".into());
-    }
+    // An empty folder is valid: the launcher downloads the game files on
+    // first start, so no executable needs to exist here yet.
     let mut s = state.store.settings();
     let path = path.to_string_lossy().into_owned();
     if s.game_path.as_deref() != Some(path.as_str()) {

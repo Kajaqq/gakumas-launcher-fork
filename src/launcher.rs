@@ -347,24 +347,13 @@ impl Store {
     pub fn status(&self) -> Status {
         let s = self.settings();
         let vpn = self.vpn_file();
-        let game_found = match s.game_exe_override.as_deref() {
-            Some(exe) if !exe.trim().is_empty() => {
-                let p = Path::new(exe);
-                if p.is_absolute() {
-                    p.is_file()
-                } else {
-                    s.game_path
-                        .as_ref()
-                        .map(|dir| Path::new(dir).join(p).is_file())
-                        .unwrap_or(false)
-                }
-            }
-            _ => s
-                .game_path
-                .as_ref()
-                .map(|p| Path::new(p).join("gakumas.exe").is_file())
-                .unwrap_or(false),
-        };
+        // An empty folder is valid: the game files are downloaded on first
+        // start. The executable is checked again right before launch.
+        let game_found = s
+            .game_path
+            .as_ref()
+            .map(|p| Path::new(p).is_dir())
+            .unwrap_or(false);
         Status {
             logged_in: self.token().is_some(),
             vpn_file: vpn.as_ref().map(|v| v.name.clone()),
