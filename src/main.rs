@@ -6,6 +6,9 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod profile_setup;
+
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
@@ -113,6 +116,9 @@ struct AppState {
     /// Serialize open/reuse with changes to the route. UI-thread commands must
     /// only try_lock: WebView2 creation on a worker needs a responsive UI thread.
     browser_gate: Mutex<()>,
+    registration_gate: Mutex<()>,
+    registration_closed: Mutex<Option<tauri::async_runtime::Sender<()>>>,
+    profile_session: Mutex<Option<profile_setup::Session>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -137,7 +143,8 @@ const LOGIN_SUCCESS_HOST: &str = "webdgp-gameplayer.games.dmm.com";
 
 /// 로그인 창을 띄워 로그인 완료 주소의 code 를 받아 옴.
 /// 저장된 로그인 상태로 바로 지나가면 창을 보이지 않은 채로 끝남
-fn login_window(app: &AppHandle, url: &str) -> Result<String, String> {
+fn login_window(app: &AppHandle, url: &str, cookies: &RefCell<Option<cookie_store::CookieStore>>) -> Result<String, String> {
+    cookies.replace(None);
     let target: tauri::Url = url.parse().map_err(|e| format!("Invalid login URL: {e}"))?;
     let (tx, rx) = mpsc::channel::<Option<String>>();
     let tx_nav = tx.clone();
@@ -149,7 +156,7 @@ fn login_window(app: &AppHandle, url: &str) -> Result<String, String> {
         .visible(false)
         .initialization_script(include_str!("keep_login.js"))
         .on_navigation(move |u| {
-            if u.host_str() == Some(LOGIN_SUCCESS_HOST) && u.path().starts_with("/login/success") {
+            if u.scheme() == "https" && u.host_str() == Some(LOGIN_SUCCESS_HOST) && u.path().starts_with("/login/success") {
                 let code = u
                     .query_pairs()
                     .find(|(k, _)| k == "code")
@@ -180,6 +187,13 @@ fn login_window(app: &AppHandle, url: &str) -> Result<String, String> {
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => None,
     };
+    if code.is_some() {
+        // This is already a blocking worker, not the WebView event thread.
+        match profile_setup::capture(&win) {
+            Ok(captured) => { cookies.replace(Some(captured)); }
+            Err(e) => launcher::netlog(&format!("[profile] {e}")),
+        }
+    }
     let _ = win.close();
     code.ok_or_else(|| "Login was cancelled".to_string())
 }
@@ -407,20 +421,23 @@ fn set_vpn_auth(
 async fn start_game(app: AppHandle) -> Result<String, String> {
     let result = run_busy(app.clone(), |app, store| {
         let progress = |m: &str, p: Option<f32>| emit_progress(app, m, p);
-        let get_code = |url: &str| login_window(app, url);
-        launcher::start_game(store, &get_code, &progress, true)
+        let captured = RefCell::new(None);
+        let get_code = |url: &str| login_window(app, url, &captured);
+        let apply_profile = |mode: &str, token: &str| {
+            let state = app.state::<AppState>();
+            let mut session = state.profile_session.lock().map_err(|_| "DMM profile session state unavailable")?;
+            if let Some(jar) = captured.take() {
+                *session = Some(profile_setup::Session::new(token, jar));
+            }
+            let jar = session.as_ref().and_then(|s| s.for_token(token))
+                .ok_or("no matching web session; sign in through the launcher in this run")?;
+            drop(session);
+            progress("Trying DMM GAMES profile setup in the background…", None);
+            profile_setup::visit(store, mode, jar)
+        };
+        launcher::start_game_with_profile_setup(store, &get_code, &progress, true, Some(&apply_profile))
     })
     .await;
-    // New accounts (result_code 313) need a one-time DMM GAMES profile
-    // registration on the website. Open it automatically so the user only
-    // has to finish it in the browser, then press Start again.
-    if let Err(e) = &result {
-        if e.contains("profile registration is required") {
-            if let Err(reason) = open_dmm_browser(app.clone(), Some(DMM_SETUP_URL.to_string())).await {
-                return Err(format!("{e}. Could not open the setup browser: {reason}"));
-            }
-        }
-    }
     // 게임이 실행됐고 '게임 실행 후 런처 종료'가 켜져 있으면 런처를 닫음
     if result.is_ok() && app.state::<AppState>().store.settings().close_after_launch {
         app.exit(0);
@@ -432,8 +449,12 @@ async fn start_game(app: AppHandle) -> Result<String, String> {
 async fn login(app: AppHandle) -> Result<String, String> {
     run_busy(app, |app, store| {
         let progress = |m: &str, p: Option<f32>| emit_progress(app, m, p);
-        let get_code = |url: &str| login_window(app, url);
-        launcher::login(store, &get_code, &progress).map(|_| "Logged in".to_string())
+        let captured = RefCell::new(None);
+        let get_code = |url: &str| login_window(app, url, &captured);
+        let token = launcher::login(store, &get_code, &progress)?;
+        *app.state::<AppState>().profile_session.lock().unwrap() = captured.into_inner()
+            .map(|jar| profile_setup::Session::new(&token, jar));
+        Ok("Logged in".into())
     })
     .await
 }
@@ -445,6 +466,7 @@ fn logout(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<Status, S
     }
     let _gate = browser_settings_guard(&app, &state)?;
     state.store.clear_token()?;
+    *state.profile_session.lock().unwrap() = None;
     if let Some(w) = app.get_webview_window("main") {
         // 로그인 창과 같은 저장소를 쓰므로 DMM 로그인 상태와 저장된 비밀번호도 함께 지워짐
         w.clear_all_browsing_data()
@@ -565,9 +587,9 @@ async fn proton_install_dw(app: AppHandle) -> Result<String, String> {
 }
 
 const DMM_BROWSER_LABEL: &str = "dmm_browser";
+const DMM_REGISTER_LABEL: &str = "dmm_register";
+const DMM_REGISTER_URL: &str = "https://accounts.dmm.com/welcome/signup/email";
 const DMM_TOP_URL: &str = "https://www.dmm.com/";
-/// Official new-account setup URL (profile registration -> game installer).
-const DMM_SETUP_URL: &str = "https://accounts.dmm.com/service/login/password?channel=games&path=https%3A%2F%2Fpersonal.games.dmm.com%2Fprofile%2Fregist%2Fskip%3Fback_url%3Dhttps%253A%252F%252Fsite-gameplayer.dmm.com%252Fgameplayer%252Fgame%252Finstaller%252Fwin%252Fx86%252Fgakumas%252Fcl%252Fgeneral";
 fn browser_settings_guard<'a>(app: &AppHandle, state: &'a AppState) -> Result<std::sync::MutexGuard<'a, ()>, String> {
     let gate = state.browser_gate.try_lock().map_err(|_| "The DMM browser is being opened; try again after closing it")?;
     if app.get_webview_window(DMM_BROWSER_LABEL).is_some() {
@@ -590,15 +612,45 @@ fn is_browser_url(url: &tauri::Url) -> bool {
 
 #[tauri::command]
 async fn open_dmm_browser(app: AppHandle, url: Option<String>) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || open_browser_window(app, url))
+    tauri::async_runtime::spawn_blocking(move || open_browser_window(app, url, false))
         .await.map_err(|e| e.to_string())?
 }
 
-fn open_browser_window(app: AppHandle, url: Option<String>) -> Result<String, String> {
+#[tauri::command]
+async fn open_dmm_registration(app: AppHandle) -> Result<String, String> {
+    let (closed, mut wait) = tauri::async_runtime::channel(1);
+    let state = app.state::<AppState>();
+    {
+        let mut slot = state.registration_closed.lock().map_err(|_| "Registration state unavailable")?;
+        if slot.is_some() {
+            return Err("DMM registration is already open".into());
+        }
+        *slot = Some(closed);
+    }
+    let worker = app.clone();
+    let opened = tauri::async_runtime::spawn_blocking(move || {
+        open_browser_window(worker, Some(DMM_REGISTER_URL.into()), true)
+    }).await.map_err(|e| e.to_string()).and_then(|result| result);
+    if let Err(error) = opened {
+        state.registration_closed.lock().ok().and_then(|mut slot| slot.take());
+        return Err(error);
+    }
+    wait.recv().await.ok_or("Could not observe the DMM registration window closing")?;
+    // Use the same direct login flow as the menu's Login button, including
+    // capture of the session needed by windowless profile setup later on.
+    if state.store.token().is_none() {
+        return login(app.clone()).await;
+    }
+    Ok("Registration window closed; kept the current launcher login".into())
+}
+
+fn open_browser_window(app: AppHandle, url: Option<String>, registration: bool) -> Result<String, String> {
+    let label = if registration { DMM_REGISTER_LABEL } else { DMM_BROWSER_LABEL };
     let target = url.as_deref().map(browser_url).transpose()?;
     let state = app.state::<AppState>();
-    let _gate = state.browser_gate.lock().map_err(|_| "Browser state unavailable")?;
-    if let Some(win) = app.get_webview_window(DMM_BROWSER_LABEL) {
+    let gate = if registration { &state.registration_gate } else { &state.browser_gate };
+    let _gate = gate.lock().map_err(|_| "Browser state unavailable")?;
+    if let Some(win) = app.get_webview_window(label) {
         if let Some(target) = target {
             win.navigate(target).map_err(|e| e.to_string())?;
         }
@@ -607,7 +659,7 @@ fn open_browser_window(app: AppHandle, url: Option<String>) -> Result<String, St
     }
     let url = target.unwrap_or_else(|| DMM_TOP_URL.parse().unwrap());
     let mode = state.store.settings().mode;
-    let proxy = if mode == launcher::MODE_DIRECT {
+    let proxy = if registration || mode == launcher::MODE_DIRECT {
         None // Use the same system network and login cookies as the normal login window.
     } else {
         emit_progress(&app, "Connecting the DMM browser to the VPN…", None);
@@ -617,17 +669,18 @@ fn open_browser_window(app: AppHandle, url: Option<String>) -> Result<String, St
     let endpoint = proxy.as_ref().map(|p| p.url().parse::<tauri::Url>()).transpose()
         .map_err(|e| format!("Invalid browser proxy endpoint: {e}"))?;
     let profile = app.path().app_local_data_dir().map_err(|e| e.to_string())?.join("DmmProxyWebView");
-    launcher::netlog(&format!("[browser] opening {} via {mode}", url.host_str().unwrap_or("?")));
+    let route = if registration { launcher::MODE_DIRECT } else { &mode };
+    launcher::netlog(&format!("[browser] opening {} via {route}", url.host_str().unwrap_or("?")));
     let build = || {
         let popup_app = app.clone();
-        let mut builder = WebviewWindowBuilder::new(&app, DMM_BROWSER_LABEL, WebviewUrl::External(url.clone()))
+        let mut builder = WebviewWindowBuilder::new(&app, label, WebviewUrl::External(url.clone()))
         .title("DMM Browser — loading…")
         .inner_size(1100.0, 800.0)
         .center()
         .on_navigation(is_browser_url)
         .on_new_window(move |url, _| {
             if is_browser_url(&url) {
-                if let Some(win) = popup_app.get_webview_window(DMM_BROWSER_LABEL) {
+                if let Some(win) = popup_app.get_webview_window(label) {
                     // Leave the native popup callback before starting navigation.
                     tauri::async_runtime::spawn_blocking(move || win.navigate(url));
                 }
@@ -716,6 +769,13 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .on_window_event(|window, event| {
+            if window.label() == DMM_REGISTER_LABEL && matches!(event, tauri::WindowEvent::Destroyed) {
+                if let Some(state) = window.try_state::<AppState>() {
+                    if let Some(closed) = state.registration_closed.lock().ok().and_then(|mut slot| slot.take()) {
+                        let _ = closed.try_send(());
+                    }
+                }
+            }
             // 업데이트 등이 진행 중이면 바로 닫지 않고 화면에서 확인을 받음
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
@@ -746,6 +806,9 @@ fn main() {
                 auto_start_pending: Mutex::new(settings.auto_start),
                 force_close: AtomicBool::new(false),
                 browser_gate: Mutex::new(()),
+                registration_gate: Mutex::new(()),
+                registration_closed: Mutex::new(None),
+                profile_session: Mutex::new(None),
             });
             // 시작하자마자 VPN Gate 서버 목록을 새로 받아 둠 (게임 시작은 받는 동안에도 쓰쿠바대 서버로 먼저 시도)
             if vpngate_mode {
@@ -782,6 +845,7 @@ fn main() {
             proton_install_dw,
             localify_install,
             open_dmm_browser,
+            open_dmm_registration,
             dmm_browser_navigate
         ])
         .run(tauri::generate_context!())

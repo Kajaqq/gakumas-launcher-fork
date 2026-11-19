@@ -20,7 +20,7 @@ Download `GakumasLauncher.exe` from [Releases](../../releases) and run it. DMM G
 
 VPN Gate and VPN file do not change Windows network settings; only the launcher's traffic goes through the VPN.
 
-**Browser** and **Register** open an in-app browser. In VPN modes, its HTTPS traffic goes through the selected launcher VPN in a separate private session. In Direct mode it uses your system connection. Close the browser before changing VPN settings. If a public VPN Gate server disconnects, reload the page after the launcher reconnects; a stable Japanese VPN file is preferable for long sessions.
+**Login** and **Register** use your system connection, even when a launcher VPN is selected. **Browser** routes HTTPS through the selected launcher VPN in a separate private session, or uses your system connection in Direct mode. Close the browser before changing VPN settings. If a VPN Gate connection drops, reload the page after the launcher reconnects.
 
 ### How to use a VPN file
 

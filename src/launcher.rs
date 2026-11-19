@@ -34,6 +34,7 @@ const VPNGATE_LAUNCH_ATTEMPTS: usize = 4;
 pub type ProgressFn<'a> = &'a dyn Fn(&str, Option<f32>);
 /// 로그인 주소를 받아 로그인 완료 후의 code 를 돌려주는 함수 (UI 가 로그인 창으로 구현)
 pub type CodeFn<'a> = &'a dyn Fn(&str) -> Result<String, String>;
+pub type ProfileSetupFn<'a> = &'a dyn Fn(&str, &str) -> Result<(), String>;
 
 pub const MODE_VPNGATE: &str = "vpngate";
 pub const MODE_DIRECT: &str = "direct";
@@ -654,7 +655,7 @@ impl JapanLink {
     }
 }
 
-const PROFILE_REGISTRATION_REQUIRED: &str = "DMM GAMES profile registration is required. Open the Browser and register this account, then try again.";
+pub const PROFILE_REGISTRATION_REQUIRED: &str = "DMM GAMES profile registration is required. Open the Browser and register this account, then try again.";
 
 fn require_dmm_success(response: &Value, operation: &str) -> Result<(), String> {
     match response["result_code"].as_i64() {
@@ -992,6 +993,16 @@ pub fn start_game(
     progress: ProgressFn,
     launch: bool,
 ) -> Result<String, String> {
+    start_game_with_profile_setup(store, get_code, progress, launch, None)
+}
+
+pub fn start_game_with_profile_setup(
+    store: &Store,
+    get_code: CodeFn,
+    progress: ProgressFn,
+    launch: bool,
+    profile_setup: Option<ProfileSetupFn>,
+) -> Result<String, String> {
     let mut settings = store.settings();
     let game_dir = PathBuf::from(
         settings
@@ -1029,6 +1040,8 @@ pub fn start_game(
     let mut relogged = false;
     let mut tried_terms_confirmation = false;
     let mut added_mygame = false;
+    let mut tried_profile_setup = false;
+    let mut profile_launch_retries = 0;
     let mut attempts = 0;
     let data = loop {
         attempts += 1;
@@ -1047,7 +1060,12 @@ pub fn start_game(
             Err(e) => return Err(e),
         };
         match r["result_code"].as_i64().unwrap_or(-1) {
-            100 => break r["data"].clone(),
+            100 => {
+                if tried_profile_setup {
+                    netlog("[profile] DMM accepted launch after windowless setup");
+                }
+                break r["data"].clone();
+            }
             203 if !relogged => {
                 progress("A new login is required", None);
                 store.clear_token()?;
@@ -1069,14 +1087,41 @@ pub fn start_game(
                     )
                 })?;
             }
-            313 if !added_mygame => {
-                // New account: register the title to My Games through DMM's
-                // own endpoint, then retry the launch once.
-                let message = link.add_to_mygames(&token)?;
-                progress(&message, None);
-                added_mygame = true;
+            313 => {
+                if !added_mygame {
+                    match link.add_to_mygames(&token) {
+                        Ok(message) => {
+                            progress(&message, None);
+                            added_mygame = true;
+                            continue;
+                        }
+                        Err(e) if e == PROFILE_REGISTRATION_REQUIRED => (),
+                        Err(e) => return Err(e),
+                    }
+                }
+                if let Some(setup) = profile_setup.filter(|_| launch && !tried_profile_setup) {
+                    tried_profile_setup = true;
+                    if let Err(e) = setup(&settings.mode, &token) {
+                        netlog(&format!("[profile] background setup unavailable: {e}"));
+                        return Err(format!("Windowless DMM profile setup failed: {e}"));
+                    }
+                    // The launch endpoint is authoritative for 313. A separate
+                    // userinfo response may omit the flag or lag behind setup.
+                    profile_launch_retries = 2;
+                    progress("Checking DMM GAMES profile registration…", None);
+                    continue;
+                }
+                if profile_launch_retries > 0 {
+                    profile_launch_retries -= 1;
+                    netlog("[profile] launch still returned 313; waiting before retry");
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+                if tried_profile_setup {
+                    return Err("DMM still reports profile registration required (313) after windowless setup. No setup window was opened.".into());
+                }
+                return Err(PROFILE_REGISTRATION_REQUIRED.into());
             }
-            313 => return Err(PROFILE_REGISTRATION_REQUIRED.into()),
             c => return Err(format!("Failed to prepare launch (result_code {c}, {})", r["error"])),
         }
     };

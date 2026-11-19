@@ -142,6 +142,7 @@ struct Flow {
     peer: Ready, handle: ProxyHandle, connected: bool,
     up: Pending, down: Pending, client_fin: bool, remote_fin: bool,
     started: Instant, progress: Instant, sent: usize, received: usize,
+    established: Option<Instant>, first_down: Option<Duration>,
 }
 
 fn nonblocking(r: io::Result<usize>) -> Result<Option<usize>, String> {
@@ -152,7 +153,7 @@ impl Flow {
     fn new(mut peer: Ready, handle: ProxyHandle) -> Self {
         let early = std::mem::take(&mut peer.request.early);
         let now = Instant::now();
-        Self { peer, handle, connected:false, up: Pending { bytes: early, offset: 0 }, down: Pending::default(), client_fin:false,remote_fin:false, started:now,progress:now,sent:0,received:0 }
+        Self { peer, handle, connected:false, up: Pending { bytes: early, offset: 0 }, down: Pending::default(), client_fin:false,remote_fin:false, started:now,progress:now,sent:0,received:0, established: None, first_down: None }
     }
 
     /// At most one chunk in each direction per turn. A slow reader can't hold
@@ -163,6 +164,7 @@ impl Flow {
             if self.peer.client_gone() { return Err("browser canceled CONNECT".into()); }
             if !stack.tcp_connected(self.handle)? { return Ok(false); }
             self.connected = true;
+            self.established = Some(Instant::now());
             self.down.bytes.extend_from_slice(ESTABLISHED);
             log(&format!("connected {}:{} in {} ms", self.peer.request.host, self.peer.request.port, self.started.elapsed().as_millis()));
         }
@@ -181,7 +183,12 @@ impl Flow {
         if self.down.remaining().is_empty() && !self.remote_fin {
             match stack.tcp_recv(self.handle,scratch)? {
                 Some(0) => { self.remote_fin = true; client.shutdown(Shutdown::Write).map_err(|e| format!("browser socket shutdown: {e}"))?; }
-                Some(n) => { self.down.bytes.extend_from_slice(&scratch[..n]); self.received += n; }, None => (),
+                Some(n) => {
+                    if self.first_down.is_none() { self.first_down = self.established.map(|at| at.elapsed()); }
+                    self.down.bytes.extend_from_slice(&scratch[..n]);
+                    self.received += n;
+                }
+                None => (),
             }
         }
         if !self.down.remaining().is_empty() {
@@ -195,7 +202,8 @@ impl Flow {
     fn finish(&mut self, stack: &mut TunnelStack, reason: &str) {
         stack.tcp_close(self.handle);
         if !self.connected { reject(&mut self.peer.client, if reason == TIMEOUT {TIMEOUT} else {GATEWAY}); }
-        log(&format!("{}:{} closed: {reason}; up={} down={} elapsed={} ms",self.peer.request.host,self.peer.request.port,self.sent,self.received,self.started.elapsed().as_millis()));
+        let first_down = self.first_down.map_or("n/a".into(), |d| format!("{} ms", d.as_millis()));
+        log(&format!("{}:{} closed: {reason}; up={} down={} first_tunnel_byte={first_down} idle_at_close={} ms lifetime={} ms", self.peer.request.host, self.peer.request.port, self.sent, self.received, self.progress.elapsed().as_millis(), self.started.elapsed().as_millis()));
     }
 
     // Never move a flow after committing its CONNECT response. It may have
@@ -236,6 +244,7 @@ fn run(listener: TcpListener, route: launcher::TunnelRoute, mut stack: Stack, st
     let mut reconnect: Option<mpsc::Receiver<Result<(), String>>> = None;
     let mut retry_at = Instant::now();
     while !stop.load(Ordering::Acquire) {
+        let mut moved_data = false;
         let Some(current) = route.stack() else { break };
         if !Arc::ptr_eq(&stack, &current) {
             if let Ok(mut s) = stack.lock() {
@@ -299,8 +308,14 @@ fn run(listener: TcpListener, route: launcher::TunnelRoute, mut stack: Stack, st
                 }
             }
             let err = if !flows.is_empty() || pumped.is_none_or(|at: Instant| at.elapsed() >= Duration::from_millis(500)) {
-                pumped = Some(Instant::now());
-                s.keepalive().err()
+                let start = Instant::now();
+                pumped = Some(start);
+                let result = s.keepalive().err();
+                let elapsed = start.elapsed();
+                if elapsed >= Duration::from_millis(100) {
+                    log(&format!("slow tunnel pump: {} ms ({} browser flows)", elapsed.as_millis(), flows.len()));
+                }
+                result
             } else { None };
             if let Some(e) = err {
                 log(&format!("VPN transport failed: {e}; reconnecting"));
@@ -311,7 +326,10 @@ fn run(listener: TcpListener, route: launcher::TunnelRoute, mut stack: Stack, st
                 retry_at = Instant::now();
             } else {
                 flows.retain_mut(|flow| {
-                    match flow.tick(&mut s, &mut scratch) {
+                    let before = flow.progress;
+                    let result = flow.tick(&mut s, &mut scratch);
+                    moved_data |= before != flow.progress;
+                    match result {
                         Ok(false) => return true,
                         Ok(true) => flow.finish(&mut s, "finished"),
                         Err(e) => flow.finish(&mut s, &e),
@@ -321,7 +339,11 @@ fn run(listener: TcpListener, route: launcher::TunnelRoute, mut stack: Stack, st
             }
         }
         // The transport pump already waits briefly for packets.
-        if flows.is_empty() { thread::sleep(Duration::from_millis(8)); } else { thread::sleep(Duration::from_millis(1)); }
+        if flows.is_empty() {
+            thread::sleep(Duration::from_millis(8));
+        } else if !moved_data {
+            thread::sleep(Duration::from_millis(1));
+        }
     }
     close_flows(&stack, &mut flows, "proxy stopped");
     log("stopped");

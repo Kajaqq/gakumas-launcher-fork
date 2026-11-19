@@ -10,9 +10,9 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aes::{Aes128, Aes192, Aes256};
@@ -598,9 +598,59 @@ fn build_tls_config(
 // 전송 (TCP: 2바이트 길이 + 패킷 / UDP: 데이터그램 하나 = 패킷 하나)
 // ---------------------------------------------------------------------------
 
+struct TcpWriter {
+    packets: mpsc::SyncSender<Vec<u8>>,
+    failure: mpsc::Receiver<String>,
+}
+
+impl TcpWriter {
+    fn start(mut socket: TcpStream) -> io::Result<Self> {
+        let (packets, rx) = mpsc::sync_channel::<Vec<u8>>(1024);
+        let (error, failure) = mpsc::channel();
+        std::thread::Builder::new().name("openvpn-tcp-writer".into()).spawn(move || {
+            let mut batch = Vec::with_capacity(32 * 1024);
+            while let Ok(packet) = rx.recv() {
+                batch.clear();
+                append_frame(&mut batch, &packet);
+                while batch.len() < 16 * 1024 {
+                    let Ok(packet) = rx.try_recv() else { break };
+                    append_frame(&mut batch, &packet);
+                }
+                if let Err(e) = socket.write_all(&batch) {
+                    let _ = error.send(format!("VPN TCP write: {e}"));
+                    let _ = socket.shutdown(Shutdown::Both);
+                    break;
+                }
+            }
+        })?;
+        Ok(Self { packets, failure })
+    }
+
+    fn send(&self, packet: &[u8]) -> Result<(), String> {
+        if packet.len() > u16::MAX as usize { return Err("VPN TCP packet too large".into()); }
+        match self.packets.try_send(packet.to_vec()) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err("VPN TCP write backlog is full".into()),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(self.failure.try_recv()
+                .unwrap_or_else(|_| "VPN TCP writer stopped".into())),
+        }
+    }
+}
+
+fn append_frame(batch: &mut Vec<u8>, packet: &[u8]) {
+    batch.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+    batch.extend_from_slice(packet);
+}
+
 enum Link {
-    Tcp { s: TcpStream, rbuf: Vec<u8> },
+    Tcp { s: TcpStream, rbuf: Vec<u8>, writer: TcpWriter },
     Udp(UdpSocket),
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        if let Link::Tcp { s, .. } = self { let _ = s.shutdown(Shutdown::Both); }
+    }
 }
 
 impl Link {
@@ -619,9 +669,12 @@ impl Link {
                 .map_err(|e| format!("TCP connect: {e}"))?;
             s.set_nodelay(true).ok();
             s.set_write_timeout(Some(Duration::from_secs(10))).ok();
+            let writer = s.try_clone().and_then(TcpWriter::start)
+                .map_err(|e| format!("VPN TCP writer: {e}"))?;
             Ok(Link::Tcp {
                 s,
                 rbuf: Vec::new(),
+                writer,
             })
         }
     }
@@ -632,12 +685,7 @@ impl Link {
 
     fn send(&mut self, pkt: &[u8]) -> Result<(), String> {
         match self {
-            Link::Tcp { s, .. } => {
-                let mut f = Vec::with_capacity(pkt.len() + 2);
-                f.extend_from_slice(&(pkt.len() as u16).to_be_bytes());
-                f.extend_from_slice(pkt);
-                s.write_all(&f).map_err(|e| format!("VPN send: {e}"))
-            }
+            Link::Tcp { writer, .. } => writer.send(pkt),
             Link::Udp(s) => s
                 .send(pkt)
                 .map(|_| ())
@@ -650,7 +698,7 @@ impl Link {
             e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut
         };
         match self {
-            Link::Tcp { s, rbuf } => loop {
+            Link::Tcp { s, rbuf, writer } => loop {
                 if rbuf.len() >= 2 {
                     let n = u16::from_be_bytes([rbuf[0], rbuf[1]]) as usize;
                     if rbuf.len() >= 2 + n {
@@ -667,7 +715,7 @@ impl Link {
                     .map_err(|e| e.to_string())?;
                 let mut tmp = [0u8; 16384];
                 match s.read(&mut tmp) {
-                    Ok(0) => return Err("VPN server closed the connection".into()),
+                    Ok(0) => return Err(writer.failure.try_recv().unwrap_or_else(|_| "VPN server closed the connection".into())),
                     Ok(n) => rbuf.extend_from_slice(&tmp[..n]),
                     Err(e) if timed_out(&e) => return Ok(None),
                     Err(e) => return Err(format!("VPN connection: {e}")),
@@ -1850,6 +1898,30 @@ impl IpTunnel for Tunnel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_writer_preserves_packet_boundaries() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let writer = TcpWriter::start(client).unwrap();
+        writer.send(b"abc").unwrap();
+        writer.send(b"de").unwrap();
+        let mut frames = [0; 9];
+        peer.read_exact(&mut frames).unwrap();
+        assert_eq!(&frames, b"\0\x03abc\0\x02de");
+    }
+
+    #[test]
+    fn tcp_writer_reports_backpressure_without_waiting_for_the_socket() {
+        let (packets, rx) = mpsc::sync_channel(1);
+        let (_error, failure) = mpsc::channel();
+        let writer = TcpWriter { packets, failure };
+        writer.send(b"first").unwrap();
+        assert_eq!(writer.send(b"second").unwrap_err(), "VPN TCP write backlog is full");
+        assert_eq!(rx.try_recv().unwrap(), b"first");
+    }
 
     #[test]
     fn wrap_roundtrip_tls_crypt() {
