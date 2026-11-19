@@ -16,11 +16,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # UI (WebView2). The login window is an in-app WebView2 window, not an external browser.
 tauri = { version = "2", features = [] }
-# Windows' own folder picker for the game folder.
+# Native folder picker for the game folder.
 tauri-plugin-dialog = "2"
-# Same versions Tauri/wry use; only for switching on WebView2's own password save in the login window.
-webview2-com = "0.39"
-windows-core = "0.62"
+tauri-plugin-opener = "2"
 # TLS: OpenVPN control channel and HTTPS to DMM. ring backend builds with MSVC alone (no NASM/CMake).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
@@ -39,8 +37,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Plain HTTPS (login API, file list, game file downloads) over the normal connection.
 ureq = { version = "2", default-features = false, features = ["tls", "native-tls"] }
-# Windows TLS (schannel) for www.vpngate.net, which only offers TLS 1.2 CBC suites that rustls does not support.
+# TLS for www.vpngate.net, which only offers TLS 1.2 CBC suites that rustls does not support.
+# Uses schannel on Windows and OpenSSL on Linux.
 native-tls = "0.2"
+boringtun = "0.7.1"
+ring = "0.17"
+ctr = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+# Same versions Tauri/wry use; only for switching on WebView2's own password save in the login window.
+webview2-com = "0.39"
+windows-core = "0.62"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
@@ -50,9 +57,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-boringtun = "0.7.1"
-ring = "0.17"
-ctr = "0.9"
 
 [profile.release]
 opt-level = "s"

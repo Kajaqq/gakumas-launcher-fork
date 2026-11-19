@@ -12,7 +12,16 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: GakumasLauncher-windows
+          - os: ubuntu-latest
+            artifact: GakumasLauncher-linux
+    runs-on: ${{ matrix.os }}
+
     steps:
       - uses: actions/checkout@v7
 
@@ -20,19 +29,37 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
       - name: Build
         run: cargo build --release --locked --bins
 
-      - name: Collect
+      - name: Collect (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/GakumasLauncher.exe dist/
 
+      - name: Collect (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          cp target/release/GakumasLauncher dist/
+
       - uses: actions/upload-artifact@v7
         with:
-          name: GakumasLauncher
-          path: dist/GakumasLauncher.exe
+          name: ${{ matrix.artifact }}
+          path: dist/*
           if-no-files-found: error
 
   release:
@@ -44,10 +71,13 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: GakumasLauncher
+          pattern: GakumasLauncher-*
           path: dist
+          merge-multiple: true
 
       - uses: softprops/action-gh-release@v3
         with:
-          files: dist/GakumasLauncher.exe
+          files: |
+            dist/GakumasLauncher.exe
+            dist/GakumasLauncher
           generate_release_notes: true

@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use gakumas_launcher::{dpapi, launcher};
+use gakumas_launcher::{launcher, platform};
 
 fn main() {
     let mut data_dir: Option<PathBuf> = None;
@@ -36,15 +36,15 @@ fn main() {
     let store = launcher::Store::new(data_dir.expect("--data-dir is required")).expect("store");
     if let Some(p) = import {
         let text = std::fs::read_to_string(&p).expect("read token file");
-        let token = dpapi::unprotect_powershell_secure_string(&text).expect("decrypt token");
+        let token = platform::unprotect_powershell_secure_string(&text).expect("decrypt token");
         store.save_token(&token).expect("save token");
-        println!("로그인 토큰을 가져왔습니다 (값은 표시하지 않음)");
+        println!("Imported the login token (value not shown)");
     }
     if let Some(p) = vpn_file {
         match store.import_vpn_file(&p) {
-            Ok(f) => println!("VPN 파일을 가져왔습니다: {} ({})", f.name, f.kind),
+            Ok(f) => println!("Imported VPN file: {} ({})", f.name, f.kind),
             Err(e) => {
-                println!("VPN 파일 오류: {e}");
+                println!("VPN file error: {e}");
                 std::process::exit(1);
             }
         }
@@ -62,7 +62,7 @@ fn main() {
         s.mode = m;
         store.save_settings(&s).expect("save settings");
     }
-    println!("상태: {:?}", store.status());
+    println!("Status: {:?}", store.status());
     if status_only {
         return;
     }
@@ -72,12 +72,12 @@ fn main() {
         None => println!("{:>6} ms  {m}", t0.elapsed().as_millis()),
     };
     let no_login = |_: &str| -> Result<String, String> {
-        Err("이 시험 프로그램은 로그인 창을 띄울 수 없습니다".into())
+        Err("This test program cannot open a login window".into())
     };
     match launcher::start_game(&store, &no_login, &progress, launch) {
-        Ok(m) => println!("\n결과: {m}"),
+        Ok(m) => println!("\nResult: {m}"),
         Err(e) => {
-            println!("\n오류: {e}");
+            println!("\nError: {e}");
             std::process::exit(1);
         }
     }

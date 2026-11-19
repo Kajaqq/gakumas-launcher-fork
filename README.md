@@ -1,33 +1,64 @@
-# 학원 아이돌마스터 런처
+# Gakuen Idolmaster Launcher
 
-DMM GAME PLAYER와 VPN 없이 학원 아이돌마스터(DMM판)를 실행하는 Windows 런처입니다.
+A Windows and Linux launcher that runs Gakuen Idolmaster (DMM version) without DMM GAME PLAYER or a VPN. The built-in VPN engines are user space, so no OS-level VPN or network configuration is needed.
 
-[Releases](../../releases)에서 `GakumasLauncher.exe`를 받아 실행하세요. 게임은 DMM GAME PLAYER로 한 번 설치되어 있어야 합니다.
+Download `GakumasLauncher.exe` from [Releases](../../releases) and run it. The game must have been installed at least once through DMM GAME PLAYER.
 
-## 일본 연결 방식
+## This fork's features
 
-| 방식 | 설명 |
+- English localization of the launcher
+- Proton configuration features, including the anti-debug driver fix
+- Localify installer
+
+## Japan connection methods
+
+| Method | Description |
 |---|---|
-| VPN Gate | 기본값. 쓰쿠바대 VPN Gate 공개 서버에 런처 안에서만 연결합니다. 따로 설정할 것이 없습니다. |
-| VPN 파일 | 사용 중인 VPN 서비스의 설정 파일로 런처 안에서 연결합니다. OpenVPN(`.ovpn`)과 WireGuard(`.conf`)를 지원합니다. |
-| 일반 연결 | VPN 없이 PC 인터넷을 그대로 씁니다. 일본 밖이라면 VPN 앱으로 일본에 먼저 연결하세요. |
+| VPN Gate | Default. Connects to the University of Tsukuba's VPN Gate public server only from within the launcher. No additional setup required. |
+| VPN file | Connects from within the launcher using a configuration file from your VPN service. Supports OpenVPN (`.ovpn`) and WireGuard (`.conf`). |
+| Direct connection | Uses this PC's internet connection as-is, without a VPN. If you are outside Japan, connect to Japan with a VPN app first. |
 
-VPN Gate와 VPN 파일은 Windows 네트워크 설정을 바꾸지 않고, 런처의 통신만 VPN을 거칩니다.
+VPN Gate and VPN file do not change Windows network settings; only the launcher's traffic goes through the VPN.
 
-### VPN 파일 사용법
+### How to use a VPN file
 
-1. VPN 서비스의 계정 페이지에서 **일본 서버**의 수동 설정 파일(OpenVPN 또는 WireGuard)을 받습니다.
-2. 런처에서 **VPN 파일** → **파일 선택**으로 받은 파일을 고릅니다.
-3. 아이디와 비밀번호가 필요한 OpenVPN 파일이면 **계정**에 입력합니다. 서비스 로그인 비밀번호가 아니라 수동 설정용(OpenVPN) 계정인 경우가 많습니다.
+1. Download the manual configuration file (OpenVPN or WireGuard) for a **Japanese server** from your VPN service's account page.
+2. In the launcher, choose **VPN File** → **Choose File** and select the file you downloaded.
+3. If the OpenVPN file requires a username and password, enter them in **Account**. This is often a manual-setup (OpenVPN) account rather than your service login password.
 
-설정 파일과 계정은 이 PC의 Windows 계정에서만 풀 수 있게 암호화해 저장합니다.
+The configuration file and account are stored encrypted so that they can only be decrypted by this PC's Windows account.
 
-## 빌드
+## Custom game executable
+
+If the game executable has been patched (for example, a Proton-tuned build with protection checks disabled), use **Settings → Executable override → Choose** to select it. The chosen path is used instead of the executable name returned by DMM. Relative paths are resolved inside the game folder; absolute paths are used as-is. **Reset** returns to the default. The game folder must still be set.
+
+## Linux / Proton
+
+The Linux build runs the Windows game through a user-selected Proton version.
+
+1. In the **Proton (Linux)** panel, click **Install DW-Proton** to download and extract the latest DW-Proton release into Steam's `compatibilitytools.d`, or select an already installed Proton from the list. DW-Proton is required for the original executable (it handles the CrackProof anti-debug driver); a pre-unpacked executable works with other Proton builds too.
+2. Click **Create prefix & install dependencies**. This creates the prefix with `wineboot` and installs `corefonts`, `powershell`, `webview2` and `vcrun2022`. It uses the `winetricks` from your `PATH` and the Proton you selected (no Heroic or protontricks needed); WebView2 is installed from Microsoft's bootstrapper if your winetricks lacks that verb.
+3. Use **Game folder → Change** to point at the folder containing `gakumas.exe` (auto-detection from DMM GAME PLAYER only works on Windows). Use **Executable override** to choose a different executable.
+4. Log in and start the game as usual.
+
+The **Localization (Localify)** panel downloads the latest `DMM_GakumasLocalify_v*.zip` from [gakuen-imas-localify](https://github.com/chinosk6/gakuen-imas-localify) and extracts it into the game folder, placing `version.dll` next to `gakumas.exe`.
+
+Before launching, the launcher downloads and verifies the anti-debug driver (`usrdrv017764.sys`), installs it into the prefix, and registers/starts its service in the **same Wine session** as the game via a generated CMD script. Wine's `NtLoadDriver` is a stub, so doing this beforehand is what lets the original executable run. `WINE_SERVICES_SESSION0=1` and `version.dll=n,b` (native then builtin, for localization mods) are set automatically.
+
+The Proton version and prefix are remembered in the launcher's settings.
+
+The Linux driver-fix approach is based on [0nikod/gakumas-proton](https://github.com/0nikod/gakumas-proton), which documents preloading the `usrdrv017764.sys` anti-debug driver service in the same Wine session so the original executable can start.
+
+## Build
+
+On Linux, Tauri needs the GTK 3 / WebKit2GTK 4.1 development packages installed first.
 
 ```
 cargo build --release --bin GakumasLauncher
 ```
 
-## 주의
+The binary is written to `target/release/GakumasLauncher`.
 
-DMM은 일본 외 지역 이용을 지원하지 않습니다. 사용에 따른 책임은 사용자에게 있습니다.
+## Note
+
+DMM does not support use from outside Japan. You are responsible for any consequences of using this launcher.

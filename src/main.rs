@@ -13,8 +13,95 @@ use std::time::Duration;
 
 use gakumas_launcher::launcher::{self, Status, Store};
 use serde::Serialize;
+use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::DialogExt;
+
+/// Register a desktop entry and icon so Wayland compositors show the app icon
+/// instead of a generic one. The GTK app id comes from `enableGTKAppId` in
+/// tauri.conf.json and must match this desktop file's name/StartupWMClass.
+#[cfg(not(windows))]
+fn install_desktop_entry() {
+    const APP_ID: &str = "local.gakumas.launcher";
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let home = PathBuf::from(home);
+    let applications = home.join(".local/share/applications");
+    let icons_root = home.join(".local/share/icons/hicolor");
+    if std::fs::create_dir_all(&applications).is_err()
+        || std::fs::create_dir_all(&icons_root).is_err()
+    {
+        return;
+    }
+    let mut changed = false;
+
+    // A user-level hicolor tree needs its own index.theme to be discoverable.
+    let index = icons_root.join("index.theme");
+    if !index.exists() {
+        changed = true;
+        let _ = std::fs::write(
+            &index,
+            "[Icon Theme]\nName=Hicolor\nComment=Fallback icon theme\nDirectories=16x16/apps,32x32/apps,48x48/apps,64x64/apps,128x128/apps,256x256/apps,512x512/apps\n\n[16x16/apps]\nSize=16\nType=Application\n\n[32x32/apps]\nSize=32\nType=Application\n\n[48x48/apps]\nSize=48\nType=Application\n\n[64x64/apps]\nSize=64\nType=Application\n\n[128x128/apps]\nSize=128\nType=Application\n\n[256x256/apps]\nSize=256\nType=Application\n\n[512x512/apps]\nSize=512\nType=Application\n",
+        );
+    }
+
+    // Taskbars request small icons; a single 512px entry can fall back to the
+    // generic icon, so install the standard sizes from the embedded PNG.
+    for size in [16, 32, 48, 64, 128, 256, 512] {
+        let dir = icons_root.join(format!("{size}x{size}/apps"));
+        if std::fs::create_dir_all(&dir).is_err() {
+            continue;
+        }
+        let path = dir.join(format!("{APP_ID}.png"));
+        if path.exists() {
+            continue;
+        }
+        // GTK scales the source image to the size declared in index.theme.
+        let _ = std::fs::write(&path, include_bytes!("../icons/icon.png"));
+    }
+
+    let desktop = applications.join(format!("{APP_ID}.desktop"));
+    if let Ok(exe) = std::env::current_exe() {
+        let exec = exe.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        let contents = format!(
+            "[Desktop Entry]\nType=Application\nName=Gakumas Launcher\nExec=\"{exec}\"\nIcon={APP_ID}\nStartupWMClass={APP_ID}\nTerminal=false\nCategories=Game;\n"
+        );
+        let same = std::fs::read_to_string(&desktop)
+            .map(|s| s == contents)
+            .unwrap_or(false);
+        if !same {
+            changed = true;
+            let _ = std::fs::write(&desktop, contents);
+        }
+    }
+
+    if changed {
+        let _ = std::process::Command::new("gtk-update-icon-cache")
+            .arg("-f")
+            .arg("-t")
+            .arg(&icons_root)
+            .status();
+        let _ = std::process::Command::new("update-desktop-database")
+            .arg(&applications)
+            .status();
+    }
+}
+
+#[cfg(windows)]
+fn install_desktop_entry() {}
+
+/// Status returned on platforms without Proton support, with the same keys.
+fn proton_unavailable() -> Value {
+    json!({
+        "available": false,
+        "proton": "",
+        "prefix": "",
+        "prefix_exists": false,
+        "deps_installed": false,
+        "candidates": [],
+    })
+}
 
 struct AppState {
     store: Store,
@@ -48,12 +135,12 @@ const LOGIN_SUCCESS_HOST: &str = "webdgp-gameplayer.games.dmm.com";
 /// 로그인 창을 띄워 로그인 완료 주소의 code 를 받아 옴.
 /// 저장된 로그인 상태로 바로 지나가면 창을 보이지 않은 채로 끝남
 fn login_window(app: &AppHandle, url: &str) -> Result<String, String> {
-    let target: tauri::Url = url.parse().map_err(|e| format!("로그인 주소 오류: {e}"))?;
+    let target: tauri::Url = url.parse().map_err(|e| format!("Invalid login URL: {e}"))?;
     let (tx, rx) = mpsc::channel::<Option<String>>();
     let tx_nav = tx.clone();
     let label = format!("login{}", LOGIN_SEQ.fetch_add(1, Ordering::SeqCst));
     let win = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(target))
-        .title("DMM 로그인")
+        .title("DMM Login")
         .inner_size(480.0, 760.0)
         .center()
         .visible(false)
@@ -70,7 +157,7 @@ fn login_window(app: &AppHandle, url: &str) -> Result<String, String> {
             true
         })
         .build()
-        .map_err(|e| format!("로그인 창을 열지 못했습니다: {e}"))?;
+        .map_err(|e| format!("Failed to open the login window: {e}"))?;
     enable_password_autosave(&win);
     let tx_close = tx.clone();
     win.on_window_event(move |e| {
@@ -83,7 +170,7 @@ fn login_window(app: &AppHandle, url: &str) -> Result<String, String> {
     let code = match rx.recv_timeout(Duration::from_secs(6)) {
         Ok(c) => c,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            emit_progress(app, "로그인 창에서 로그인하세요", None);
+            emit_progress(app, "Please sign in in the login window", None);
             let _ = win.show();
             let _ = win.set_focus();
             rx.recv_timeout(Duration::from_secs(900)).ok().flatten()
@@ -91,11 +178,12 @@ fn login_window(app: &AppHandle, url: &str) -> Result<String, String> {
         Err(mpsc::RecvTimeoutError::Disconnected) => None,
     };
     let _ = win.close();
-    code.ok_or_else(|| "로그인이 취소되었습니다".to_string())
+    code.ok_or_else(|| "Login was cancelled".to_string())
 }
 
-/// 로그인 창에서 브라우저 기본 비밀번호 저장/자동 채우기를 켬 (WebView2 기본값은 꺼짐).
-/// 저장 여부는 사용자가 WebView2 의 저장 안내에서 고름
+/// Enable the browser's own password save / autofill in the login window (WebView2 default is off).
+/// On Linux WebView2 is not used, so this is a no-op.
+#[cfg(windows)]
 fn enable_password_autosave(win: &tauri::WebviewWindow) {
     use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings4;
     use windows_core::Interface;
@@ -113,6 +201,9 @@ fn enable_password_autosave(win: &tauri::WebviewWindow) {
     });
 }
 
+#[cfg(not(windows))]
+fn enable_password_autosave(_win: &tauri::WebviewWindow) {}
+
 async fn run_busy<F>(app: AppHandle, f: F) -> Result<String, String>
 where
     F: FnOnce(&AppHandle, &Store) -> Result<String, String> + Send + 'static,
@@ -121,7 +212,7 @@ where
         let state = app.state::<AppState>();
         let mut busy = state.busy.lock().unwrap();
         if *busy {
-            return Err("이미 진행 중입니다".into());
+            return Err("An operation is already in progress".into());
         }
         *busy = true;
     }
@@ -151,7 +242,7 @@ fn set_mode(state: tauri::State<'_, AppState>, mode: String) -> Result<Status, S
     ]
     .contains(&mode.as_str())
     {
-        return Err("알 수 없는 연결 방식입니다".into());
+        return Err("Unknown connection mode".into());
     }
     let mut s = state.store.settings();
     s.mode = mode;
@@ -193,7 +284,7 @@ async fn pick_game_folder(app: AppHandle, window: tauri::Window) -> Result<Statu
         let mut d = dialog_app
             .dialog()
             .file()
-            .set_title("게임 폴더 선택")
+            .set_title("Select game folder")
             .set_parent(&window);
         if let Some(p) = current {
             d = d.set_directory(p);
@@ -209,7 +300,7 @@ async fn pick_game_folder(app: AppHandle, window: tauri::Window) -> Result<Statu
     };
     let path: PathBuf = picked.into_path().map_err(|e| e.to_string())?;
     if !path.join("gakumas.exe").is_file() {
-        return Err("이 폴더에 gakumas.exe 가 없습니다".into());
+        return Err("gakumas.exe was not found in this folder".into());
     }
     let mut s = state.store.settings();
     let path = path.to_string_lossy().into_owned();
@@ -221,6 +312,50 @@ async fn pick_game_folder(app: AppHandle, window: tauri::Window) -> Result<Statu
     Ok(state.store.status())
 }
 
+/// Choose a replacement game executable (e.g. a Proton-tuned build).
+#[tauri::command]
+async fn pick_game_exe(app: AppHandle, window: tauri::Window) -> Result<Status, String> {
+    let current = app.state::<AppState>().store.settings().game_exe_override;
+    let dialog_app = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        let mut d = dialog_app
+            .dialog()
+            .file()
+            .set_title("Select game executable")
+            .set_parent(&window);
+        if let Some(p) = current {
+            if let Some(parent) = PathBuf::from(&p).parent() {
+                d = d.set_directory(parent);
+            }
+        }
+        d.blocking_pick_file()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let state = app.state::<AppState>();
+    let Some(picked) = picked else {
+        return Ok(state.store.status());
+    };
+    let path: PathBuf = picked.into_path().map_err(|e| e.to_string())?;
+    if !path.is_file() {
+        return Err(format!("File not found: {}", path.display()));
+    }
+    let mut s = state.store.settings();
+    s.game_exe_override = Some(path.to_string_lossy().into_owned());
+    state.store.save_settings(&s)?;
+    Ok(state.store.status())
+}
+
+/// Go back to the executable named in the DMM launch response.
+#[tauri::command]
+fn clear_game_exe(state: tauri::State<'_, AppState>) -> Result<Status, String> {
+    let mut s = state.store.settings();
+    s.game_exe_override = None;
+    state.store.save_settings(&s)?;
+    Ok(state.store.status())
+}
+
 /// VPN 설정 파일(.ovpn / WireGuard .conf) 선택
 #[tauri::command]
 async fn pick_vpn_file(app: AppHandle, window: tauri::Window) -> Result<Status, String> {
@@ -229,8 +364,8 @@ async fn pick_vpn_file(app: AppHandle, window: tauri::Window) -> Result<Status, 
         dialog_app
             .dialog()
             .file()
-            .set_title("VPN 설정 파일 선택")
-            .add_filter("VPN 설정 파일", &["ovpn", "conf"])
+            .set_title("Select VPN config file")
+            .add_filter("VPN config files", &["ovpn", "conf"])
             .set_parent(&window)
             .blocking_pick_file()
     })
@@ -253,7 +388,7 @@ fn set_vpn_auth(
     password: String,
 ) -> Result<Status, String> {
     if username.trim().is_empty() || password.is_empty() {
-        return Err("아이디와 비밀번호를 모두 입력하세요".into());
+        return Err("Please enter both a username and password".into());
     }
     state.store.save_vpn_auth(username.trim(), &password)?;
     Ok(state.store.status())
@@ -279,7 +414,7 @@ async fn login(app: AppHandle) -> Result<String, String> {
     run_busy(app, |app, store| {
         let progress = |m: &str, p: Option<f32>| emit_progress(app, m, p);
         let get_code = |url: &str| login_window(app, url);
-        launcher::login(store, &get_code, &progress).map(|_| "로그인했습니다".to_string())
+        launcher::login(store, &get_code, &progress).map(|_| "Logged in".to_string())
     })
     .await
 }
@@ -287,13 +422,13 @@ async fn login(app: AppHandle) -> Result<String, String> {
 #[tauri::command]
 fn logout(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<Status, String> {
     if *state.busy.lock().unwrap() {
-        return Err("진행 중에는 로그아웃할 수 없습니다".into());
+        return Err("Cannot log out while an operation is in progress".into());
     }
     state.store.clear_token()?;
     if let Some(w) = app.get_webview_window("main") {
         // 로그인 창과 같은 저장소를 쓰므로 DMM 로그인 상태와 저장된 비밀번호도 함께 지워짐
         w.clear_all_browsing_data()
-            .map_err(|e| format!("로그인 정보를 지우지 못했습니다: {e}"))?;
+            .map_err(|e| format!("Failed to clear the login data: {e}"))?;
     }
     Ok(state.store.status())
 }
@@ -321,6 +456,112 @@ fn force_close(app: AppHandle, state: tauri::State<'_, AppState>) {
     app.exit(0);
 }
 
+// ---------------------------------------------------------------------------
+// Proton (Linux only). The commands exist on every platform so the UI can call
+// them unconditionally; Windows returns an "unavailable" status / a clear error.
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn get_proton_status(app: AppHandle) -> Value {
+    #[cfg(not(windows))]
+    {
+        match app.path().app_local_data_dir() {
+            Ok(base) => gakumas_launcher::proton::status(&base),
+            Err(_) => proton_unavailable(),
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = app;
+        proton_unavailable()
+    }
+}
+
+#[tauri::command]
+fn set_proton_path(app: AppHandle, path: String) -> Result<Value, String> {
+    #[cfg(not(windows))]
+    {
+        let base = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+        let state = app.state::<AppState>();
+        gakumas_launcher::proton::set_path(&base, &state.store, &path)
+    }
+    #[cfg(windows)]
+    {
+        let _ = (app, path);
+        Err("Proton settings are only available on Linux".into())
+    }
+}
+
+#[tauri::command]
+fn set_proton_prefix(app: AppHandle, path: String) -> Result<Value, String> {
+    #[cfg(not(windows))]
+    {
+        let base = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+        let state = app.state::<AppState>();
+        gakumas_launcher::proton::set_prefix(&base, &state.store, &path)
+    }
+    #[cfg(windows)]
+    {
+        let _ = (app, path);
+        Err("Proton settings are only available on Linux".into())
+    }
+}
+
+#[tauri::command]
+async fn proton_setup(app: AppHandle) -> Result<String, String> {
+    #[cfg(not(windows))]
+    {
+        run_busy(app.clone(), |app, store| {
+            let base = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+            let progress = |m: &str, p: Option<f32>| emit_progress(app, m, p);
+            gakumas_launcher::proton::setup(&base, store, &progress)
+        })
+        .await
+    }
+    #[cfg(windows)]
+    {
+        let _ = app;
+        Err("Proton setup is only available on Linux".into())
+    }
+}
+
+#[tauri::command]
+async fn proton_install_dw(app: AppHandle) -> Result<String, String> {
+    #[cfg(not(windows))]
+    {
+        run_busy(app.clone(), |app, store| {
+            let base = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+            let progress = |m: &str, p: Option<f32>| emit_progress(app, m, p);
+            gakumas_launcher::proton::install_dw_proton(&base, store, &progress)
+                .map(|v| v.to_string())
+        })
+        .await
+    }
+    #[cfg(windows)]
+    {
+        let _ = app;
+        Err("Proton settings are only available on Linux".into())
+    }
+}
+
+#[tauri::command]
+async fn localify_install(app: AppHandle) -> Result<String, String> {
+    #[cfg(not(windows))]
+    {
+        run_busy(app.clone(), |app, store| {
+            let base = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+            let progress = |m: &str, p: Option<f32>| emit_progress(app, m, p);
+            gakumas_launcher::proton::install_localify(&base, store, &progress)
+        })
+        .await
+    }
+    #[cfg(windows)]
+    {
+        let _ = app;
+        Err("Localify install is only available on Linux".into())
+    }
+}
+
 /// 화면(작업 표시줄 제외)보다 창이 크면 높이를 줄여 화면 안에 들어오게 함.
 /// 이때만 내용이 길면 스크롤이 생기고, 보통 화면에서는 기본 높이(스크롤 없음)를 그대로 씀
 fn fit_to_screen(win: &tauri::WebviewWindow) {
@@ -342,6 +583,7 @@ fn fit_to_screen(win: &tauri::WebviewWindow) {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .on_window_event(|window, event| {
             // 업데이트 등이 진행 중이면 바로 닫지 않고 화면에서 확인을 받음
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -357,10 +599,13 @@ fn main() {
             }
         })
         .setup(|app| {
+            install_desktop_entry();
             if let Some(win) = app.get_webview_window("main") {
                 fit_to_screen(&win);
             }
             let dir = app.path().app_local_data_dir()?;
+            // Share the real data dir with the platform layer, which has no AppHandle.
+            std::env::set_var("GAKUMAS_BASE_DIR", &dir);
             let store = Store::new(dir.join("data"))?;
             let settings = store.settings();
             let vpngate_mode = settings.mode == launcher::MODE_VPNGATE;
@@ -389,13 +634,21 @@ fn main() {
             set_close_after_launch,
             take_auto_start,
             pick_game_folder,
+            pick_game_exe,
+            clear_game_exe,
             pick_vpn_file,
             set_vpn_auth,
             start_game,
             login,
             logout,
             verify_login,
-            force_close
+            force_close,
+            get_proton_status,
+            set_proton_path,
+            set_proton_prefix,
+            proton_setup,
+            proton_install_dw,
+            localify_install
         ])
         .run(tauri::generate_context!())
         .expect("error while running application");

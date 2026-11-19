@@ -18,7 +18,7 @@ use crate::http::{self, CLIENT_VERSION, DMM_HOST};
 use crate::netstack::{IpTunnel, TunnelStack};
 use crate::openvpn::{self, ConnectOptions, OvpnConfig, Tunnel};
 use crate::wireguard::{WgConfig, WgTunnel};
-use crate::{dpapi, vpngate, winutil};
+use crate::{platform, vpngate};
 
 pub const PRODUCT_ID: &str = "gakumas";
 const USER_AGENT: &str = "DMMGamePlayer5-Win/5.5.22 Electron/34.3.0";
@@ -57,6 +57,15 @@ pub struct Settings {
     /// 게임을 실행하고 나면 런처를 닫음
     #[serde(default)]
     pub close_after_launch: bool,
+    /// Linux: selected Proton installation (script or directory)
+    #[serde(default)]
+    pub proton_path: Option<String>,
+    /// Linux: Wine prefix used by Proton
+    #[serde(default)]
+    pub proton_prefix: Option<String>,
+    /// Optional replacement game executable (e.g. a Proton-tuned build)
+    #[serde(default)]
+    pub game_exe_override: Option<String>,
 }
 
 fn default_mode() -> String {
@@ -72,6 +81,9 @@ impl Default for Settings {
             installed_version: None,
             auto_start: false,
             close_after_launch: false,
+            proton_path: None,
+            proton_prefix: None,
+            game_exe_override: None,
         }
     }
 }
@@ -90,6 +102,7 @@ pub struct Status {
     pub mode: String,
     pub auto_start: bool,
     pub close_after_launch: bool,
+    pub game_exe_override: Option<String>,
 }
 
 pub const VPN_OPENVPN: &str = "openvpn";
@@ -116,9 +129,29 @@ fn file_age(p: &Path) -> Option<Duration> {
     fs::metadata(p).ok()?.modified().ok()?.elapsed().ok()
 }
 
+/// Write protected data with owner-only permissions where supported.
+#[cfg(unix)]
+fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    f.write_all(data)
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
+    fs::write(path, data).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
 impl Store {
     pub fn new(dir: PathBuf) -> Result<Self, String> {
-        fs::create_dir_all(&dir).map_err(|e| format!("데이터 폴더를 만들지 못했습니다: {e}"))?;
+        fs::create_dir_all(&dir).map_err(|e| format!("Failed to create the data folder: {e}"))?;
         Ok(Self {
             dir,
             vpngate_lock: Mutex::new(()),
@@ -141,7 +174,7 @@ impl Store {
             }
         }
         let body = vpngate::fetch_server_list_raw()
-            .map_err(|e| format!("VPN Gate 서버 목록을 받지 못했습니다: {e}"))?;
+            .map_err(|e| format!("Failed to fetch the VPN Gate server list: {e}"))?;
         let tmp = self.file("vpngate.csv.tmp");
         fs::write(&tmp, &body).map_err(|e| e.to_string())?;
         fs::rename(&tmp, &cache).map_err(|e| e.to_string())?;
@@ -184,33 +217,33 @@ impl Store {
     pub fn save_settings(&self, s: &Settings) -> Result<(), String> {
         let text = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
         let tmp = self.file("settings.json.tmp");
-        fs::write(&tmp, text).map_err(|e| format!("설정 저장 실패: {e}"))?;
-        fs::rename(&tmp, self.file("settings.json")).map_err(|e| format!("설정 저장 실패: {e}"))
+        fs::write(&tmp, text).map_err(|e| format!("Failed to save settings: {e}"))?;
+        fs::rename(&tmp, self.file("settings.json")).map_err(|e| format!("Failed to save settings: {e}"))
     }
 
     pub fn token(&self) -> Option<String> {
         let blob = fs::read(self.file("login.dat")).ok()?;
-        String::from_utf8(dpapi::unprotect(&blob).ok()?).ok()
+        String::from_utf8(platform::unprotect(&blob).ok()?).ok()
     }
 
     pub fn save_token(&self, token: &str) -> Result<(), String> {
-        let blob = dpapi::protect(token.as_bytes())?;
-        fs::write(self.file("login.dat"), blob).map_err(|e| format!("로그인 토큰 저장 실패: {e}"))
+        let blob = platform::protect(token.as_bytes())?;
+        write_private(&self.file("login.dat"), &blob)
     }
 
     /// 가져온 VPN 설정 파일 (개인 키가 들어 있어 DPAPI 로 암호화해 둠)
     pub fn vpn_file(&self) -> Option<VpnFile> {
         let blob = fs::read(self.file("vpn_file.dat")).ok()?;
-        serde_json::from_slice(&dpapi::unprotect(&blob).ok()?).ok()
+        serde_json::from_slice(&platform::unprotect(&blob).ok()?).ok()
     }
 
     /// VPN 설정 파일을 읽어 확인하고 저장. 같은 폴더의 인증서·키 파일을 가리키면 내용을 넣어 하나로 만듦
     pub fn import_vpn_file(&self, path: &Path) -> Result<VpnFile, String> {
-        let meta = fs::metadata(path).map_err(|e| format!("파일을 읽지 못했습니다: {e}"))?;
+        let meta = fs::metadata(path).map_err(|e| format!("Failed to read the file: {e}"))?;
         if meta.len() > 1024 * 1024 {
-            return Err("VPN 설정 파일이 너무 큽니다".into());
+            return Err("The VPN config file is too large".into());
         }
-        let text = fs::read_to_string(path).map_err(|e| format!("파일을 읽지 못했습니다: {e}"))?;
+        let text = fs::read_to_string(path).map_err(|e| format!("Failed to read the file: {e}"))?;
         let text = text.trim_start_matches('\u{feff}');
         let name = path
             .file_name()
@@ -239,15 +272,14 @@ impl Store {
             }
         };
         let json = serde_json::to_vec(&file).map_err(|e| e.to_string())?;
-        fs::write(self.file("vpn_file.dat"), dpapi::protect(&json)?)
-            .map_err(|e| format!("VPN 설정 저장 실패: {e}"))?;
+        write_private(&self.file("vpn_file.dat"), &platform::protect(&json)?)?;
         Ok(file)
     }
 
     /// VPN 아이디·비밀번호 (OpenVPN auth-user-pass)
     pub fn vpn_auth(&self) -> Option<(String, String)> {
         let blob = fs::read(self.file("vpn_auth.dat")).ok()?;
-        let v: Value = serde_json::from_slice(&dpapi::unprotect(&blob).ok()?).ok()?;
+        let v: Value = serde_json::from_slice(&platform::unprotect(&blob).ok()?).ok()?;
         Some((
             v["username"].as_str()?.to_string(),
             v["password"].as_str()?.to_string(),
@@ -256,8 +288,7 @@ impl Store {
 
     pub fn save_vpn_auth(&self, username: &str, password: &str) -> Result<(), String> {
         let json = json!({ "username": username, "password": password }).to_string();
-        fs::write(self.file("vpn_auth.dat"), dpapi::protect(json.as_bytes())?)
-            .map_err(|e| format!("VPN 계정 저장 실패: {e}"))
+        write_private(&self.file("vpn_auth.dat"), &platform::protect(json.as_bytes())?)
     }
 
     /// 저장된 토큰이 아직 `token` 일 때만 삭제 (그사이 새로 로그인했으면 그대로 둠)
@@ -285,7 +316,7 @@ impl Store {
             return Ok(());
         }
         Err(format!(
-            "로그인 정보를 지우지 못했습니다: {}",
+            "Failed to clear the login data: {}",
             last.map(|e| e.to_string()).unwrap_or_default()
         ))
     }
@@ -316,11 +347,24 @@ impl Store {
     pub fn status(&self) -> Status {
         let s = self.settings();
         let vpn = self.vpn_file();
-        let game_found = s
-            .game_path
-            .as_ref()
-            .map(|p| Path::new(p).join("gakumas.exe").is_file())
-            .unwrap_or(false);
+        let game_found = match s.game_exe_override.as_deref() {
+            Some(exe) if !exe.trim().is_empty() => {
+                let p = Path::new(exe);
+                if p.is_absolute() {
+                    p.is_file()
+                } else {
+                    s.game_path
+                        .as_ref()
+                        .map(|dir| Path::new(dir).join(p).is_file())
+                        .unwrap_or(false)
+                }
+            }
+            _ => s
+                .game_path
+                .as_ref()
+                .map(|p| Path::new(p).join("gakumas.exe").is_file())
+                .unwrap_or(false),
+        };
         Status {
             logged_in: self.token().is_some(),
             vpn_file: vpn.as_ref().map(|v| v.name.clone()),
@@ -332,13 +376,14 @@ impl Store {
             mode: s.mode,
             auto_start: s.auto_start,
             close_after_launch: s.close_after_launch,
+            game_exe_override: s.game_exe_override,
         }
     }
 }
 
 /// DMM 플레이어 설정 파일에서 게임 설치 정보 (경로, 버전, 종류)
 fn dmm_player_install() -> Option<(String, Option<String>, Option<String>)> {
-    let p = PathBuf::from(std::env::var("APPDATA").ok()?)
+    let p = platform::appdata_dir()?
         .join("dmmgameplayer5")
         .join("dmmgame.cnf");
     let text = fs::read_to_string(p).ok()?;
@@ -400,11 +445,11 @@ fn direct_post(path: &str, body: &Value, token: Option<&str>) -> Result<Value, S
     }
     let resp = req
         .send_string(&body.to_string())
-        .map_err(|e| format!("DMM 서버 연결 실패 ({})", describe(&e)))?;
+        .map_err(|e| format!("Failed to connect to the DMM server ({})", describe(&e)))?;
     let text = resp
         .into_string()
-        .map_err(|e| format!("DMM 응답 수신 실패: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("DMM 응답 해석 실패: {e}"))
+        .map_err(|e| format!("Failed to receive the DMM response: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("Failed to parse the DMM response: {e}"))
 }
 
 fn direct_get_json(url: &str) -> Result<Value, String> {
@@ -414,11 +459,11 @@ fn direct_get_json(url: &str) -> Result<Value, String> {
         .set("Client-App", "DMMGamePlayer5")
         .set("Client-version", CLIENT_VERSION)
         .call()
-        .map_err(|e| format!("DMM 서버 연결 실패 ({})", describe(&e)))?;
+        .map_err(|e| format!("Failed to connect to the DMM server ({})", describe(&e)))?;
     let text = resp
         .into_string()
-        .map_err(|e| format!("DMM 응답 수신 실패: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("DMM 응답 해석 실패: {e}"))
+        .map_err(|e| format!("Failed to receive the DMM response: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("Failed to parse the DMM response: {e}"))
 }
 
 /// 일본 IP 가 필요한 API 를 부르는 경로
@@ -445,8 +490,8 @@ impl JapanLink {
                 let (status, b) = http::parse_response(&raw)?;
                 match serde_json::from_slice(&b) {
                     Ok(v) => Ok(v),
-                    Err(_) if status != 200 => Err(format!("DMM 서버 응답 오류 (HTTP {status})")),
-                    Err(e) => Err(format!("DMM 응답 해석 실패: {e}")),
+                    Err(_) if status != 200 => Err(format!("DMM server error (HTTP {status})")),
+                    Err(e) => Err(format!("Failed to parse the DMM response: {e}")),
                 }
             }
         }
@@ -480,10 +525,10 @@ fn try_servers(
         if !tried.insert(server.host_name.clone()) {
             continue;
         }
-        progress(&format!("VPN 연결 중 · {}", server.host_name), None);
+        progress(&format!("Connecting to VPN · {}", server.host_name), None);
         match connect_tunnel(cfg, &server.tls_name(), progress) {
             Ok(stack) => return Some((stack, server.host_name.clone())),
-            Err(e) => progress(&format!("{} 연결 실패: {e}", server.host_name), None),
+            Err(e) => progress(&format!("{} connection failed: {e}", server.host_name), None),
         }
     }
     None
@@ -507,17 +552,17 @@ fn stack_with_japan_dns<T: IpTunnel + 'static>(
 ) -> Result<TunnelStack, String> {
     let mut stack = TunnelStack::new(tun)?;
     if let Err(e) = stack.resolve_in_tunnel(DMM_HOST) {
-        progress(&format!("일본 DNS 조회 실패, 기본 DNS 사용 ({e})"), None);
+        progress(&format!("Japan DNS lookup failed, using the default DNS ({e})"), None);
     }
     Ok(stack)
 }
 
 /// 사용자가 가져온 VPN 설정 파일로 연결
 fn open_vpn_file(store: &Store, progress: ProgressFn) -> Result<TunnelStack, String> {
-    let file = store.vpn_file().ok_or("VPN 설정 파일을 선택하세요")?;
+    let file = store.vpn_file().ok_or("Please select a VPN config file")?;
     if file.kind == VPN_WIREGUARD {
         let cfg = WgConfig::parse(&file.text)?;
-        progress(&format!("VPN 연결 중 · {}", file.name), None);
+        progress(&format!("Connecting to VPN · {}", file.name), None);
         let tun = WgTunnel::connect(&cfg, &mut |_| {})?;
         return stack_with_japan_dns(tun, progress);
     }
@@ -526,14 +571,14 @@ fn open_vpn_file(store: &Store, progress: ProgressFn) -> Result<TunnelStack, Str
         Some(
             store
                 .vpn_auth()
-                .ok_or("VPN 아이디와 비밀번호를 입력하세요")?,
+                .ok_or("Please enter the VPN username and password")?,
         )
     } else {
         None
     };
-    let mut last = String::from("VPN 서버에 연결하지 못했습니다");
+    let mut last = String::from("Failed to connect to the VPN server");
     for remote in cfg.remote_order().iter().take(VPN_FILE_TRIES) {
-        progress(&format!("VPN 연결 중 · {}", remote.host), None);
+        progress(&format!("Connecting to VPN · {}", remote.host), None);
         let opts = ConnectOptions {
             remote,
             tls_name: &remote.host,
@@ -543,11 +588,11 @@ fn open_vpn_file(store: &Store, progress: ProgressFn) -> Result<TunnelStack, Str
         match Tunnel::connect_with(&cfg, &opts, &mut |_| {}) {
             Ok(tun) => return stack_with_japan_dns(tun, progress),
             Err(e) if e.contains("AUTH_FAILED") => {
-                return Err("VPN 아이디 또는 비밀번호가 맞지 않습니다".into())
+                return Err("The VPN username or password is incorrect".into())
             }
             Err(e) => {
-                progress(&format!("{} 연결 실패: {e}", remote.host), None);
-                last = format!("VPN 서버에 연결하지 못했습니다 ({e})");
+                progress(&format!("{} connection failed: {e}", remote.host), None);
+                last = format!("Failed to connect to the VPN server ({e})");
             }
         }
     }
@@ -566,7 +611,7 @@ fn try_builtin(tried: &mut HashSet<String>, progress: ProgressFn) -> Option<(Tun
             continue;
         }
         count += 1;
-        progress(&format!("VPN 연결 중 · {}", server.host_name), None);
+        progress(&format!("Connecting to VPN · {}", server.host_name), None);
         let connect = |cfg: &vpngate::OvpnConfig| connect_tunnel(cfg, &server.tls_name(), progress);
         let mut result = connect(&cfg);
         if result.is_err() {
@@ -578,7 +623,7 @@ fn try_builtin(tried: &mut HashSet<String>, progress: ProgressFn) -> Option<(Tun
         }
         match result {
             Ok(stack) => return Some((stack, server.host_name)),
-            Err(e) => progress(&format!("{} 연결 실패: {e}", server.host_name), None),
+            Err(e) => progress(&format!("{} connection failed: {e}", server.host_name), None),
         }
     }
     None
@@ -613,7 +658,7 @@ fn open_vpngate(
             return Ok(found);
         }
     }
-    progress("서버 목록 갱신 중", None);
+    progress("Refreshing the server list", None);
     let list_ok = match store.refresh_vpngate_list(VPNGATE_RECENT) {
         Ok(body) => {
             let all = untried(&body, tried, false, VPNGATE_MORE_TRIES);
@@ -637,10 +682,10 @@ fn open_vpngate(
         return Ok(found);
     }
     Err(if list_ok {
-        "VPN Gate 서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.".to_string()
+        "Failed to connect to a VPN Gate server. Please try again in a moment.".to_string()
     } else {
-        "VPN Gate 에 연결하지 못했습니다. 이 네트워크에서 VPN Gate 가 차단된 것 같습니다. \
-         일본 VPN 을 직접 켜고 연결 방식을 '일반 연결' 로 바꿔 주세요."
+        "Failed to connect to VPN Gate. It may be blocked on this network. \
+         Please enable a Japanese VPN yourself and switch the connection mode to 'Direct'."
             .to_string()
     })
 }
@@ -651,13 +696,13 @@ fn open_vpngate(
 
 /// DMM 로그인. 로그인 창은 `get_code` 가 담당 (비밀번호는 이 코드가 다루지 않음)
 pub fn login(store: &Store, get_code: CodeFn, progress: ProgressFn) -> Result<String, String> {
-    progress("로그인 확인 중", None);
+    progress("Checking login", None);
     let r = direct_post("/v5/auth/login/url", &json!({ "prompt": "" }), None)?;
     let url = r["data"]["url"]
         .as_str()
         .ok_or_else(|| {
             format!(
-                "로그인 주소를 받지 못했습니다 (result_code {})",
+                "Failed to get the login URL (result_code {})",
                 r["result_code"]
             )
         })?
@@ -666,16 +711,16 @@ pub fn login(store: &Store, get_code: CodeFn, progress: ProgressFn) -> Result<St
     let r = direct_post("/v5/auth/accesstoken/issue", &json!({ "code": code }), None)?;
     if r["result_code"] != 100 {
         return Err(format!(
-            "로그인 토큰 발급 실패 (result_code {})",
+            "Failed to issue the login token (result_code {})",
             r["result_code"]
         ));
     }
     let token = r["data"]["access_token"]
         .as_str()
-        .ok_or("로그인 토큰이 응답에 없습니다")?
+        .ok_or("No login token in the response")?
         .to_string();
     store.save_token(&token)?;
-    progress("로그인했습니다", None);
+    progress("Logged in", None);
     Ok(token)
 }
 
@@ -718,12 +763,12 @@ pub fn verify_saved_token(store: &Store) -> Result<TokenCheck, String> {
 
 fn region_error(mode: &str) -> String {
     if mode == MODE_DIRECT {
-        "일본 VPN 이 연결되어 있지 않습니다".into()
+        "No Japanese VPN is connected".into()
     } else if mode == MODE_FILE {
-        "DMM 이 이 VPN 서버를 거부했습니다. 일본 서버의 설정 파일인지 확인하거나 다른 서버 파일을 써 보세요."
+        "DMM rejected this VPN server. Check that the config is for a Japanese server, or try a different server file."
             .into()
     } else {
-        "DMM 이 VPN 서버를 거부했습니다. 잠시 후 다시 시도해 주세요.".into()
+        "DMM rejected the VPN server. Please try again in a moment.".into()
     }
 }
 
@@ -739,22 +784,22 @@ pub fn start_game(
         settings
             .game_path
             .clone()
-            .ok_or("게임 폴더를 지정해 주세요")?,
+            .ok_or("Please select the game folder")?,
     );
     if !game_dir.is_dir() {
         return Err(format!(
-            "게임 폴더를 찾을 수 없습니다: {}",
+            "Game folder not found: {}",
             game_dir.display()
         ));
     }
     let game_type = settings.game_type.clone().unwrap_or_else(|| "GCL".into());
 
     // 저장된 토큰이 유효하면 그대로 쓰고, 만료됐으면 VPN 을 열기 전에 다시 로그인
-    progress("로그인 확인 중", None);
+    progress("Checking login", None);
     let mut token = match store.token() {
         Some(t) if check_token(&t) != TokenCheck::Expired => t,
         Some(t) => {
-            progress("로그인이 만료되어 다시 로그인합니다", None);
+            progress("Login expired, signing in again", None);
             store.clear_token_if(&t)?;
             login(store, get_code, progress)?
         }
@@ -776,13 +821,13 @@ pub fn start_game(
         // VPN Gate 서버가 DMM 에 거부당하거나 연결이 끊기면 다른 서버로 다시 시도
         let can_retry = settings.mode == MODE_VPNGATE && attempts < VPNGATE_LAUNCH_ATTEMPTS;
         let (mut link, host) = open_japan_link(store, &settings.mode, progress, &mut tried)?;
-        progress("실행 준비 중", None);
+        progress("Preparing to launch", None);
         let result = link.post("/v5/r2/launch/cl", &body, &token);
         drop(link); // 일본 IP 는 여기까지만 필요
         let r = match result {
             Ok(r) => r,
             Err(e) if can_retry => {
-                progress(&format!("{e} · 다른 서버로 다시 시도"), None);
+                progress(&format!("{e} · trying another server"), None);
                 continue;
             }
             Err(e) => return Err(e),
@@ -790,7 +835,7 @@ pub fn start_game(
         match r["result_code"].as_i64().unwrap_or(-1) {
             100 => break r["data"].clone(),
             203 if !relogged => {
-                progress("다시 로그인이 필요합니다", None);
+                progress("A new login is required", None);
                 store.clear_token()?;
                 token = login(store, get_code, progress)?;
                 relogged = true;
@@ -799,10 +844,10 @@ pub fn start_game(
                 }
             }
             801 | 803 if can_retry => {
-                progress("DMM 이 VPN 서버를 거부해 다른 서버로 다시 시도", None);
+                progress("DMM rejected the VPN server; trying another server", None);
             }
             801 | 803 => return Err(region_error(&settings.mode)),
-            c => return Err(format!("실행 준비 실패 (result_code {c}, {})", r["error"])),
+            c => return Err(format!("Failed to prepare launch (result_code {c}, {})", r["error"])),
         }
     };
 
@@ -817,46 +862,74 @@ pub fn start_game(
 
     // DMM 플레이어와 같이, DRM 인증 정보가 오면 정해진 위치에 저장
     if let (Some(drm), true) = (data["drm_auth_token"].as_str(), launch) {
-        let dir = PathBuf::from(std::env::var("USERPROFILE").map_err(|e| e.to_string())?)
-            .join(".DMMGamePlayer");
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        use base64::Engine;
-        let name = base64::engine::general_purpose::STANDARD.encode(PRODUCT_ID);
-        fs::write(dir.join(name), drm).map_err(|e| e.to_string())?;
+        // On Linux the profile is inside the Proton prefix. If no prefix is
+        // configured there is nowhere to write, so skip it instead of failing.
+        if let Some(profile) = platform::user_profile_dir() {
+            let dir = profile.join(".DMMGamePlayer");
+            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            use base64::Engine;
+            let name = base64::engine::general_purpose::STANDARD.encode(PRODUCT_ID);
+            fs::write(dir.join(name), drm).map_err(|e| e.to_string())?;
+        }
     }
 
     let exe_name = data["exec_file_name"]
         .as_str()
-        .ok_or("응답에 실행 파일 이름이 없습니다")?;
-    let exe = game_dir.join(exe_name);
+        .ok_or("No executable name in the response")?;
+    // Optional user-supplied executable (e.g. a Proton-tuned build with
+    // protection checks disabled). Relative paths are resolved inside the
+    // game folder; absolute paths are used as-is.
+    let exe = match settings.game_exe_override.as_deref() {
+        Some(path) if !path.trim().is_empty() => {
+            let override_path = Path::new(path.trim());
+            let resolved = if override_path.is_absolute() {
+                override_path.to_path_buf()
+            } else {
+                game_dir.join(override_path)
+            };
+            progress(
+                &format!("Using custom executable: {}", resolved.display()),
+                None,
+            );
+            resolved
+        }
+        _ => game_dir.join(exe_name),
+    };
     if !exe.is_file() {
         return Err(format!(
-            "게임 실행 파일을 찾지 못했습니다: {}",
+            "Game executable not found: {}",
             exe.display()
         ));
     }
     let args = data["execute_args"]
         .as_str()
-        .ok_or("응답에 실행 인자가 없습니다")?;
+        .ok_or("No launch arguments in the response")?;
     if !launch {
         return Ok(format!(
-            "[모의 실행] 실행 직전까지 확인했습니다 ({})",
+            "[Dry run] Checked up to just before launch ({})",
             exe.display()
         ));
     }
     let elevated = data["is_administrator"].as_bool().unwrap_or(true);
-    progress("게임 실행 중", None);
-    winutil::launch(&exe, args, &game_dir, elevated, Duration::from_secs(8))?;
-    Ok("게임을 실행했습니다".into())
+    progress("Launching the game", None);
+    platform::launch(&exe, args, &game_dir, elevated, Duration::from_secs(8))?;
+    Ok("Game launched".into())
 }
 
 // ---------------------------------------------------------------------------
 // 업데이트 (DMM 플레이어와 같은 방식: 파일 목록의 MD5 와 다른 파일만 받음)
 // ---------------------------------------------------------------------------
 
-/// 파일 목록 경로를 게임 폴더 안의 경로로. 폴더 밖을 가리키면 None
+/// DMM's file list uses Windows separators. On Linux those backslashes are
+/// ordinary filename characters, so split on both separators and rebuild the
+/// path with native components instead of replacing '/' with '\\'.
 fn resolve_game_path(game_dir: &Path, local_path: &str) -> Option<PathBuf> {
-    let rel = PathBuf::from(local_path.replace('/', "\\").trim_start_matches('\\'));
+    let mut rel = PathBuf::new();
+    for part in local_path.split(['/', '\\']) {
+        if !part.is_empty() {
+            rel.push(part);
+        }
+    }
     if rel.as_os_str().is_empty() || rel.components().any(|c| !matches!(c, Component::Normal(_))) {
         return None;
     }
@@ -921,15 +994,15 @@ fn update_game(
 ) -> Result<(), String> {
     let list_url = data["file_list_url"]
         .as_str()
-        .ok_or("응답에 업데이트 정보가 없습니다")?;
+        .ok_or("No update information in the response")?;
     let sign = data["sign"]
         .as_str()
-        .ok_or("응답에 다운로드 서명이 없습니다")?;
-    progress("업데이트 확인 중", None);
+        .ok_or("No download signature in the response")?;
+    progress("Checking files for updates", None);
     let first = direct_get_json(&format!("https://{DMM_HOST}{list_url}"))?;
     let domain = first["data"]["domain"]
         .as_str()
-        .ok_or("파일 목록에 서버 주소가 없습니다")?
+        .ok_or("No server address in the file list")?
         .to_string();
     let mut files: Vec<Value> = first["data"]["file_list"]
         .as_array()
@@ -951,7 +1024,7 @@ fn update_game(
     for (i, f) in files.iter().enumerate() {
         if i % 10 == 0 {
             progress(
-                &format!("파일 검사 중 {}/{}", i, files.len()),
+                &format!("Checking files {}/{}", i, files.len()),
                 Some(i as f32 * 100.0 / files.len().max(1) as f32),
             );
         }
@@ -977,14 +1050,14 @@ fn update_game(
         }
     }
     if todo.is_empty() && delete.is_empty() {
-        progress("최신 버전입니다", Some(100.0));
+        progress("Updating: already up to date", Some(100.0));
         return Ok(());
     }
     if todo
         .iter()
         .any(|(f, _)| f["protected_flg"].as_bool() == Some(true))
     {
-        return Err("보호된 파일이 포함된 업데이트라 이 런처로는 받을 수 없습니다. DMM GAME PLAYER 로 업데이트해 주세요.".into());
+        return Err("This update contains protected files that this launcher cannot download. Please update with DMM GAME PLAYER.".into());
     }
     let total: u64 = todo
         .iter()
@@ -992,7 +1065,7 @@ fn update_game(
         .sum();
     progress(
         &format!(
-            "업데이트 · 파일 {}개, {:.0} MB",
+            "Updating: {} files, {:.0} MB",
             todo.len(),
             total as f64 / 1_048_576.0
         ),
@@ -1001,7 +1074,7 @@ fn update_game(
     if dry_run {
         for (f, _) in &todo {
             progress(
-                &format!("  받을 파일: {}", f["local_path"].as_str().unwrap_or("")),
+                &format!("Updating: file to download: {}", f["local_path"].as_str().unwrap_or("")),
                 None,
             );
         }
@@ -1055,14 +1128,14 @@ fn update_game(
                 .get(&url)
                 .set("User-Agent", USER_AGENT)
                 .call()
-                .map_err(|e| format!("{local} 다운로드 실패 ({})", describe(&e)))?;
+                .map_err(|e| format!("Failed to download {local} ({})", describe(&e)))?;
             let mut reader = resp.into_reader();
             let mut out = fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
             let mut last_report = 0u64;
             loop {
                 let k = reader
                     .read(&mut buf)
-                    .map_err(|e| redact(format!("{local} 다운로드 실패: {e}")))?;
+                    .map_err(|e| redact(format!("Failed to download {local}: {e}")))?;
                 if k == 0 {
                     break;
                 }
@@ -1072,7 +1145,7 @@ fn update_game(
                 if done - last_report >= 2 * 1_048_576 {
                     last_report = done;
                     progress(
-                        &format!("업데이트 중 {}/{}", n + 1, todo.len()),
+                        &format!("Updating {}/{}", n + 1, todo.len()),
                         Some(done as f32 * 100.0 / total.max(1) as f32),
                     );
                 }
@@ -1081,23 +1154,45 @@ fn update_game(
             if f["check_hash_flg"].as_bool() == Some(true)
                 && md5_file(&tmp)? != f["hash"].as_str().unwrap_or("").to_ascii_lowercase()
             {
-                return Err(format!("{local}: 받은 파일의 검증값이 맞지 않습니다"));
+                return Err(format!("{local}: downloaded file hash mismatch"));
             }
             fs::rename(&tmp, full)
-                .map_err(|e| format!("{local} 교체 실패 (게임이 실행 중인가요?): {e}"))
+                .map_err(|e| format!("{local}: failed to replace the file (is the game running?): {e}"))
         };
         if let Err(e) = fetch() {
             let _ = fs::remove_file(&tmp); // 받다 만 파일을 남기지 않음
             return Err(e);
         }
         progress(
-            &format!("업데이트 중 {}/{}", n + 1, todo.len()),
+            &format!("Updating {}/{}", n + 1, todo.len()),
             Some(done as f32 * 100.0 / total.max(1) as f32),
         );
     }
     for d in &delete {
         fs::remove_file(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
-    progress("업데이트 완료", Some(100.0));
+    progress("Updating: complete", Some(100.0));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_windows_style_paths_into_nested_paths() {
+        let root = Path::new("/gameras");
+        let p = resolve_game_path(root, r"gakumas_Data\Octo\1\4131323131").unwrap();
+        assert_eq!(
+            p,
+            root.join("gakumas_Data").join("Octo").join("1").join("4131323131")
+        );
+        // Forward slashes and leading separators work too.
+        assert_eq!(
+            resolve_game_path(root, "/gakumas_Data/Octo/file.bin").unwrap(),
+            root.join("gakumas_Data").join("Octo").join("file.bin")
+        );
+        // Parent-directory escapes are still rejected.
+        assert!(resolve_game_path(root, r"..\outside").is_none());
+    }
 }

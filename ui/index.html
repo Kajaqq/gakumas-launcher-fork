@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="ko">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>학원 아이돌마스터</title>
+<title>Gakumas Launcher</title>
 <style>
   /* 글꼴: 나눔스퀘어 라운드 (NAVER, SIL OFL 1.1 - fonts/FONT-LICENSE.txt) */
   @font-face { font-family: "NanumSquareRound"; src: url("fonts/NanumSquareRoundR.woff2") format("woff2"); font-weight: 400; }
@@ -61,10 +61,16 @@
   .win-buttons .close:hover { color: var(--red); }
   .win-buttons button:active { transform: translateY(1px); box-shadow: 0 1px 3px rgba(70, 50, 40, 0.16); }
 
-  main { padding: 16px 0 140px; }
+  main { padding: 0 0 140px; }
 
-  /* ---------- 머리 줄: 제목 알약 + 창 버튼 (빈 곳을 잡고 창을 끔) ---------- */
-  .header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 24px 20px 0; }
+  /* ---------- 머리 줄: 제목 알약 + 창 버튼 (스크롤해도 고정) ---------- */
+  .header {
+    position: sticky; top: 0; z-index: 30;
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 16px 24px 12px 0; margin: 0;
+    background: var(--page);
+    box-shadow: 0 6px 10px -10px rgba(70, 50, 40, 0.35);
+  }
   .title-pill {
     display: flex; align-items: center; gap: 10px; height: 48px; padding: 0 32px 0 20px;
     border-radius: 0 999px 999px 0; background: rgba(255, 255, 255, 0.9);
@@ -93,6 +99,10 @@
     background: #fff; border-radius: 0 0 0 28px; padding: 18px 18px 20px;
     box-shadow: 0 4px 14px rgba(70, 40, 20, 0.05);
   }
+  .panel[hidden] { display: none; }
+  .proton-note { margin: 16px 2px 0; font-size: 12.5px; line-height: 1.6; font-weight: 700; color: var(--text-sub); }
+  .proton-note a { color: #ff7b00; text-decoration: underline; cursor: pointer; }
+  .proton-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 
   /* 선택 타일 (라디오) */
   .tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -254,50 +264,90 @@
   <div class="header" data-tauri-drag-region>
     <div class="title-pill" data-tauri-drag-region>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><circle cx="12" cy="12" r="9.5"/><path d="M10 8.2v7.6l6-3.8z" fill="currentColor"/></svg>
-      런처
+      Launcher
     </div>
     <div class="win-buttons">
-      <button class="minimize" id="winMin" aria-label="최소화"><svg viewBox="0 0 14 14"><path d="M2.5 7h9" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg></button>
-      <button class="close" id="winClose" aria-label="닫기"><svg viewBox="0 0 14 14"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg></button>
+      <button class="minimize" id="winMin" aria-label="Minimize"><svg viewBox="0 0 14 14"><path d="M2.5 7h9" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg></button>
+      <button class="close" id="winClose" aria-label="Close"><svg viewBox="0 0 14 14"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg></button>
     </div>
   </div>
 
   <section class="panel">
-    <div class="panel-head"><svg class="star-l" viewBox="0 0 24 24"><path fill="currentColor" d="M12 0c1 7 5 11 12 12-7 1-11 5-12 12-1-7-5-11-12-12C7 11 11 7 12 0z"/></svg><span>일본 연결</span><svg class="star-r" viewBox="0 0 32 32"><path fill="#ffb92e" d="M13 2c.8 6.2 3.8 9.2 10 10-6.2.8-9.2 3.8-10 10-.8-6.2-3.8-9.2-10-10 6.2-.8 9.2-3.8 10-10z"/><path fill="#ffffff" opacity=".9" d="M25 18c.4 3.2 1.8 4.6 5 5-3.2.4-4.6 1.8-5 5-.4-3.2-1.8-4.6-5-5 3.2-.4 4.6-1.8 5-5z"/></svg></div>
+    <div class="panel-head"><svg class="star-l" viewBox="0 0 24 24"><path fill="currentColor" d="M12 0c1 7 5 11 12 12-7 1-11 5-12 12-1-7-5-11-12-12C7 11 11 7 12 0z"/></svg><span>Japan Connection</span><svg class="star-r" viewBox="0 0 32 32"><path fill="#ffb92e" d="M13 2c.8 6.2 3.8 9.2 10 10-6.2.8-9.2 3.8-10 10-.8-6.2-3.8-9.2-10-10 6.2-.8 9.2-3.8 10-10z"/><path fill="#ffffff" opacity=".9" d="M25 18c.4 3.2 1.8 4.6 5 5-3.2.4-4.6 1.8-5 5-.4-3.2-1.8-4.6-5-5 3.2-.4 4.6-1.8 5-5z"/></svg></div>
     <div class="panel-body">
-      <div class="tiles three" id="mode" role="radiogroup" aria-label="일본 연결">
+      <div class="tiles three" id="mode" role="radiogroup" aria-label="Japan Connection">
         <button class="tile" role="radio" aria-checked="false" data-mode="vpngate"><span class="radio"></span>VPN Gate</button>
-        <button class="tile" role="radio" aria-checked="false" data-mode="file"><span class="radio"></span>VPN 파일</button>
-        <button class="tile" role="radio" aria-checked="false" data-mode="direct"><span class="radio"></span>일반 연결</button>
+        <button class="tile" role="radio" aria-checked="false" data-mode="file"><span class="radio"></span>VPN File</button>
+        <button class="tile" role="radio" aria-checked="false" data-mode="direct"><span class="radio"></span>Direct Connection</button>
       </div>
       <div class="item vpn-file" id="vpnRow" hidden>
-        <div class="item-main"><div class="item-title">VPN 파일</div><div class="item-sub path" id="vpnName">-</div></div>
-        <div class="item-actions"><button class="pill" id="vpnAuth" hidden>계정</button><button class="pill" id="vpnPick">파일 선택</button></div>
+        <div class="item-main"><div class="item-title">VPN File</div><div class="item-sub path" id="vpnName">-</div></div>
+        <div class="item-actions"><button class="pill" id="vpnAuth" hidden>Account</button><button class="pill" id="vpnPick">Choose File</button></div>
       </div>
-      <p class="mode-warn" id="directWarn" hidden>런처가 VPN 없이 PC 인터넷을 그대로 씁니다.
-일본 밖이라면 VPN 앱으로 일본에 먼저 연결하세요.</p>
+      <p class="mode-warn" id="directWarn" hidden>The launcher will use your PC's internet connection directly, without a VPN.
+If you're outside Japan, connect to Japan with a VPN app first.</p>
     </div>
   </section>
 
   <section class="panel">
-    <div class="panel-head"><svg class="star-l" viewBox="0 0 24 24"><path fill="currentColor" d="M12 0c1 7 5 11 12 12-7 1-11 5-12 12-1-7-5-11-12-12C7 11 11 7 12 0z"/></svg><span>설정</span><svg class="star-r" viewBox="0 0 32 32"><path fill="#ffb92e" d="M13 2c.8 6.2 3.8 9.2 10 10-6.2.8-9.2 3.8-10 10-.8-6.2-3.8-9.2-10-10 6.2-.8 9.2-3.8 10-10z"/><path fill="#ffffff" opacity=".9" d="M25 18c.4 3.2 1.8 4.6 5 5-3.2.4-4.6 1.8-5 5-.4-3.2-1.8-4.6-5-5 3.2-.4 4.6-1.8 5-5z"/></svg></div>
+    <div class="panel-head"><svg class="star-l" viewBox="0 0 24 24"><path fill="currentColor" d="M12 0c1 7 5 11 12 12-7 1-11 5-12 12-1-7-5-11-12-12C7 11 11 7 12 0z"/></svg><span>Settings</span><svg class="star-r" viewBox="0 0 32 32"><path fill="#ffb92e" d="M13 2c.8 6.2 3.8 9.2 10 10-6.2.8-9.2 3.8-10 10-.8-6.2-3.8-9.2-10-10 6.2-.8 9.2-3.8 10-10z"/><path fill="#ffffff" opacity=".9" d="M25 18c.4 3.2 1.8 4.6 5 5-3.2.4-4.6 1.8-5 5-.4-3.2-1.8-4.6-5-5 3.2-.4 4.6-1.8 5-5z"/></svg></div>
     <div class="panel-body">
       <div class="item">
-        <div class="item-main"><div class="item-title" id="autoLabel">실행 시 자동 시작</div></div>
+        <div class="item-main"><div class="item-title" id="autoLabel">Start automatically on launch</div></div>
         <button class="toggle" id="auto" role="switch" aria-checked="false" aria-labelledby="autoLabel"><span class="word on">ON</span><span class="word off">OFF</span><span class="knob"></span></button>
       </div>
       <div class="item">
-        <div class="item-main"><div class="item-title" id="closeLabel">게임 실행 후 런처 종료</div></div>
+        <div class="item-main"><div class="item-title" id="closeLabel">Exit launcher after starting the game</div></div>
         <button class="toggle" id="closeAfter" role="switch" aria-checked="false" aria-labelledby="closeLabel"><span class="word on">ON</span><span class="word off">OFF</span><span class="knob"></span></button>
       </div>
       <div class="item">
-        <div class="item-main"><div class="item-title">게임 폴더</div><div class="item-sub path" id="path">-</div></div>
-        <div class="item-actions"><button class="pill" id="folder">변경</button></div>
+        <div class="item-main"><div class="item-title">Game Folder</div><div class="item-sub path" id="path">-</div></div>
+        <div class="item-actions"><button class="pill" id="folder">Change</button></div>
       </div>
       <div class="item">
-        <div class="item-main"><div class="item-title">DMM 계정</div><div class="item-sub account"><span class="dot" id="accountDot"></span><span id="accountText">-</span></div></div>
-        <div class="item-actions"><button class="pill" id="accountBtn">로그인</button></div>
+        <div class="item-main"><div class="item-title">Executable override</div><div class="item-sub path" id="exeName">Default</div></div>
+        <div class="item-actions"><button class="pill" id="exePick">Choose</button><button class="pill danger" id="exeClear" hidden>Reset</button></div>
       </div>
+      <div class="item">
+        <div class="item-main"><div class="item-title">DMM Account</div><div class="item-sub account"><span class="dot" id="accountDot"></span><span id="accountText">-</span></div></div>
+        <div class="item-actions"><button class="pill" id="accountBtn">Login</button></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="protonPanel" hidden>
+    <div class="panel-head"><svg class="star-l" viewBox="0 0 24 24"><path fill="currentColor" d="M12 0c1 7 5 11 12 12-7 1-11 5-12 12-1-7-5-11-12-12C7 11 11 7 12 0z"/></svg><span>Proton (Linux)</span><svg class="star-r" viewBox="0 0 32 32"><path fill="#ffb92e" d="M13 2c.8 6.2 3.8 9.2 10 10-6.2.8-9.2 3.8-10 10-.8-6.2-3.8-9.2-10-10 6.2-.8 9.2-3.8 10-10z"/><path fill="#ffffff" opacity=".9" d="M25 18c.4 3.2 1.8 4.6 5 5-3.2.4-4.6 1.8-5 5-.4-3.2-1.8-4.6-5-5 3.2-.4 4.6-1.8 5-5z"/></svg></div>
+    <div class="panel-body">
+      <select class="field" id="protonSelect" aria-label="Select Proton"><option value="">Select a Proton…</option></select>
+      <input class="field" id="protonPath" type="text" placeholder="Custom Proton directory (optional)" autocomplete="off" spellcheck="false">
+      <input class="field" id="prefixPath" type="text" placeholder="Wine prefix directory" autocomplete="off" spellcheck="false">
+      <div class="item">
+        <div class="item-main"><div class="item-title">Selected Proton</div><div class="item-sub path" id="protonCurrent">-</div></div>
+        <div class="item-actions"><button class="pill" id="protonRefresh">Refresh</button></div>
+      </div>
+      <div class="item">
+        <div class="item-main"><div class="item-title">Wine prefix</div><div class="item-sub path" id="prefixCurrent">-</div></div>
+      </div>
+      <div class="item">
+        <div class="item-main"><div class="item-title">Prefix exists</div><div class="item-sub account"><span class="dot" id="prefixExistsDot"></span><span id="prefixExistsText">-</span></div></div>
+      </div>
+      <div class="item">
+        <div class="item-main"><div class="item-title">Dependencies installed</div><div class="item-sub account"><span class="dot" id="depsInstalledDot"></span><span id="depsInstalledText">-</span></div></div>
+      </div>
+      <p class="proton-note">Proton (DW-Proton is required for the anticheat to work!) lets you play the Windows build on Linux. "Create prefix &amp; install dependencies" creates the Wine prefix and installs corefonts, powershell, webview2 and vcrun2022 into it.</p>
+      <div class="proton-actions">
+        <button class="pill" id="protonInstallDw">Install DW-Proton</button>
+        <button class="pill" id="protonApply">Apply</button>
+        <button class="pill" id="protonSetup">Create prefix &amp; install dependencies</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><svg class="star-l" viewBox="0 0 24 24"><path fill="currentColor" d="M12 0c1 7 5 11 12 12-7 1-11 5-12 12-1-7-5-11-12-12C7 11 11 7 12 0z"/></svg><span>Localization (Localify)</span><svg class="star-r" viewBox="0 0 32 32"><path fill="#ffb92e" d="M13 2c.8 6.2 3.8 9.2 10 10-6.2.8-9.2 3.8-10 10-.8-6.2-3.8-9.2-10-10 6.2-.8 9.2-3.8 10-10z"/><path fill="#ffffff" opacity=".9" d="M25 18c.4 3.2 1.8 4.6 5 5-3.2.4-4.6 1.8-5 5-.4-3.2-1.8-4.6-5-5 3.2-.4 4.6-1.8 5-5z"/></svg></div>
+    <div class="panel-body">
+      <p class="proton-note">Installs the latest Localify release into the game folder. <code>version.dll</code> is placed next to <code>gakumas.exe</code> so the translation mod loads under Proton. See the <a href="https://gakumas.natsume.io/localify/dmm-games" id="localifyGuide">Localify guide</a>.</p>
+      <div class="proton-actions"><button class="pill" id="localifyInstall">Install / update Localify</button></div>
     </div>
   </section>
 </main>
@@ -306,8 +356,8 @@
   <div class="meter" id="meter"><div id="bar"></div></div>
   <div class="status" id="status"></div>
   <div class="bottom-row">
-    <button class="round" id="logBtn" aria-label="기록"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M8 7h11M8 12h11M8 17h11"/><circle cx="4.2" cy="7" r="1.1" fill="currentColor" stroke="none"/><circle cx="4.2" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="4.2" cy="17" r="1.1" fill="currentColor" stroke="none"/></svg></button>
-    <button class="btn primary" id="start"><span class="icon" id="startIcon"></span><span id="startLabel">게임 시작</span></button>
+    <button class="round" id="logBtn" aria-label="Log"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M8 7h11M8 12h11M8 17h11"/><circle cx="4.2" cy="7" r="1.1" fill="currentColor" stroke="none"/><circle cx="4.2" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="4.2" cy="17" r="1.1" fill="currentColor" stroke="none"/></svg></button>
+    <button class="btn primary" id="start"><span class="icon" id="startIcon"></span><span id="startLabel">Start Game</span></button>
   </div>
 </div>
 
@@ -354,7 +404,7 @@
   const logLines = [];
 
   function log(msg) {
-    const t = new Date().toLocaleTimeString('ko-KR', { hour12: false });
+    const t = new Date().toLocaleTimeString('en-US', { hour12: false });
     logLines.push(`${t}  ${msg}`);
     const pre = document.querySelector('.modal-log');
     if (pre) { pre.textContent = logLines.join('\n'); pre.scrollTop = pre.scrollHeight; }
@@ -374,12 +424,12 @@
   function updateStart() {
     const b = $('start');
     $('startIcon').innerHTML = busy ? '<span class="spinner"></span>' : ICON.play;
-    $('startLabel').textContent = busy ? '실행 중' : '게임 시작';
+    $('startLabel').textContent = busy ? 'Running...' : 'Start Game';
     b.disabled = busy || !gameFound || !vpnReady;
   }
   function setBusy(b) {
     busy = b;
-    for (const id of ['folder', 'accountBtn', 'auto', 'closeAfter', 'vpnPick', 'vpnAuth']) $(id).disabled = b;
+    for (const id of ['folder', 'exePick', 'exeClear', 'accountBtn', 'auto', 'closeAfter', 'vpnPick', 'vpnAuth', 'protonApply', 'protonSetup', 'protonInstallDw', 'protonRefresh', 'localifyInstall']) $(id).disabled = b;
     $('mode').querySelectorAll('button').forEach((x) => (x.disabled = b));
     if (!b) setMeter(null);
     updateStart();
@@ -388,12 +438,16 @@
   let loggedIn = false;
   function render(s) {
     loggedIn = s.logged_in;
-    $('accountText').textContent = loggedIn ? '로그인됨' : '로그인 필요';
+    $('accountText').textContent = loggedIn ? 'Logged in' : 'Login required';
     $('accountDot').classList.toggle('on', loggedIn);
-    $('accountBtn').textContent = loggedIn ? '로그아웃' : '로그인';
+    $('accountBtn').textContent = loggedIn ? 'Logout' : 'Login';
     $('accountBtn').classList.toggle('danger', loggedIn);
-    $('path').textContent = s.game_path || '선택 안 됨';
+    $('path').textContent = s.game_path || 'Not selected';
     $('path').title = s.game_path || '';
+    const exeOverride = s.game_exe_override || '';
+    $('exeName').textContent = exeOverride || 'Default (from DMM)';
+    $('exeName').title = exeOverride || '';
+    $('exeClear').hidden = !exeOverride;
     $('mode').querySelectorAll('button').forEach((x) => x.setAttribute('aria-checked', String(x.dataset.mode === s.mode)));
     $('auto').setAttribute('aria-checked', String(s.auto_start));
     $('closeAfter').setAttribute('aria-checked', String(s.close_after_launch));
@@ -401,15 +455,15 @@
     const fileMode = s.mode === 'file';
     $('vpnRow').hidden = !fileMode;
     $('directWarn').hidden = s.mode !== 'direct';
-    $('vpnName').textContent = s.vpn_file || '선택 안 됨';
+    $('vpnName').textContent = s.vpn_file || 'Not selected';
     $('vpnName').title = s.vpn_file || '';
     $('vpnAuth').hidden = !s.vpn_needs_auth;
     vpnReady = !fileMode || !!s.vpn_file;
     gameFound = s.game_found;
     updateStart();
-    if (!gameFound && !busy) setStatus('게임 폴더를 선택하세요', true);
-    else if (!vpnReady && !busy) setStatus('VPN 파일을 선택하세요', true);
-    else if ($('status').textContent === 'VPN 파일을 선택하세요') setStatus('');
+    if (!gameFound && !busy) setStatus('Please select a game folder', true);
+    else if (!vpnReady && !busy) setStatus('Please select a VPN file', true);
+    else if ($('status').textContent === 'Please select a VPN file') setStatus('');
   }
   let vpnState = {};
 
@@ -421,13 +475,13 @@
     note.textContent = vpnState.vpn_file || '';
     const user = document.createElement('input');
     user.className = 'field';
-    user.placeholder = '아이디';
+    user.placeholder = 'Username';
     user.autocomplete = 'off';
     user.spellcheck = false;
     const pass = document.createElement('input');
     pass.className = 'field';
     pass.type = 'password';
-    pass.placeholder = '비밀번호';
+    pass.placeholder = 'Password';
     pass.autocomplete = 'off';
     body.append(note, user, pass);
     for (const el of [user, pass]) {
@@ -436,18 +490,18 @@
       });
     }
     const shown = openModal({
-      title: 'VPN 계정',
+      title: 'VPN Account',
       body,
       buttons: [
-        { label: '취소', kind: 'secondary', icon: 'cross', value: false },
-        { label: '결정', kind: 'primary', icon: 'check', value: true },
+        { label: 'Cancel', kind: 'secondary', icon: 'cross', value: false },
+        { label: 'OK', kind: 'primary', icon: 'check', value: true },
       ],
     });
     setTimeout(() => user.focus(), 50);
     if (!(await shown)) return false;
     try {
       render(await invoke('set_vpn_auth', { username: user.value, password: pass.value }));
-      setStatus('VPN 계정을 저장했습니다');
+      setStatus('VPN account saved');
       return true;
     } catch (e) {
       setStatus(String(e), true);
@@ -490,7 +544,7 @@
     const { message, percent } = e.payload;
     setStatus(message);
     setMeter(percent);
-    if (!/^(파일 검사 중|업데이트 중)/.test(message)) log(message);
+    if (!/^(Checking files|Updating)/.test(message)) log(message);
   });
 
   async function run(cmd) {
@@ -502,7 +556,7 @@
       log(r);
     } catch (e) {
       setStatus(String(e), true);
-      log('오류: ' + e);
+      log('Error: ' + e);
     } finally {
       setBusy(false);
       refresh();
@@ -529,43 +583,54 @@
   $('accountBtn').onclick = async () => {
     if (!loggedIn) return run('login');
     const ok = await openModal({
-      title: '로그아웃',
-      body: textBody('로그아웃할까요?\n저장된 로그인 정보가 삭제됩니다.'),
+      title: 'Logout',
+      body: textBody('Log out?\nYour saved login information will be deleted.'),
       buttons: [
-        { label: '취소', kind: 'secondary', icon: 'cross', value: false },
-        { label: '결정', kind: 'primary', icon: 'check', value: true },
+        { label: 'Cancel', kind: 'secondary', icon: 'cross', value: false },
+        { label: 'OK', kind: 'primary', icon: 'check', value: true },
       ],
     });
     if (!ok) return;
     try {
       render(await invoke('logout'));
-      setStatus('로그아웃했습니다');
-      log('로그아웃했습니다');
+      setStatus('Logged out');
+      log('Logged out');
     } catch (e) {
       setStatus(String(e), true);
-      log('오류: ' + e);
+      log('Error: ' + e);
       refresh();
     }
   };
   $('logBtn').onclick = async () => {
     const pre = document.createElement('pre');
     pre.className = 'modal-log';
-    pre.textContent = logLines.length ? logLines.join('\n') : '기록이 없습니다';
+    pre.textContent = logLines.length ? logLines.join('\n') : 'No log entries';
     const shown = openModal({
-      title: '기록',
+      title: 'Log',
       body: pre,
       buttons: [
-        { label: '닫기', kind: 'secondary', icon: 'cross', value: null },
-        { label: '복사', kind: 'primary', icon: 'copy', value: 'copy' },
+        { label: 'Close', kind: 'secondary', icon: 'cross', value: null },
+        { label: 'Copy', kind: 'primary', icon: 'copy', value: 'copy' },
       ],
     });
     requestAnimationFrame(() => (pre.scrollTop = pre.scrollHeight));
     if ((await shown) !== 'copy') return;
-    if (!logLines.length) return setStatus('복사할 기록이 없습니다');
-    setStatus((await copyText(logLines.join('\n'))) ? '기록을 복사했습니다' : '복사하지 못했습니다', false);
+    if (!logLines.length) return setStatus('No log to copy');
+    setStatus((await copyText(logLines.join('\n'))) ? 'Log copied' : 'Could not copy', false);
   };
   $('folder').onclick = async () => {
     try { render(await invoke('pick_game_folder')); if (gameFound) setStatus(''); } catch (e) { setStatus(String(e), true); }
+  };
+  $('exePick').onclick = async () => {
+    try {
+      const s = await invoke('pick_game_exe');
+      render(s);
+      if (s.game_exe_override) setStatus('Custom executable selected');
+    } catch (e) { setStatus(String(e), true); }
+  };
+  $('exeClear').onclick = async () => {
+    try { render(await invoke('clear_game_exe')); setStatus('Using the default executable'); }
+    catch (e) { setStatus(String(e), true); }
   };
   function bindToggle(id, cmd) {
     $(id).onclick = async () => {
@@ -582,14 +647,98 @@
     };
   });
 
+  // ---------- Proton (Linux) ----------
+  function renderProton(p) {
+    $('protonPanel').hidden = !p.available;
+    if (!p.available) return;
+    const sel = $('protonSelect');
+    sel.replaceChildren();
+    const first = document.createElement('option');
+    first.value = '';
+    first.textContent = 'Select a Proton…';
+    sel.appendChild(first);
+    for (const c of p.candidates || []) {
+      const o = document.createElement('option');
+      o.value = c.path;
+      o.textContent = c.name;
+      sel.appendChild(o);
+    }
+    sel.value = (p.candidates || []).some((c) => c.path === p.proton) ? p.proton : '';
+    $('protonPath').value = p.proton || '';
+    $('prefixPath').value = p.prefix || '';
+    $('protonCurrent').textContent = p.proton || '-';
+    $('protonCurrent').title = p.proton || '';
+    $('prefixCurrent').textContent = p.prefix || '-';
+    $('prefixCurrent').title = p.prefix || '';
+    $('prefixExistsDot').classList.toggle('on', !!p.prefix_exists);
+    $('prefixExistsText').textContent = p.prefix_exists ? 'Yes' : 'No';
+    $('depsInstalledDot').classList.toggle('on', !!p.deps_installed);
+    $('depsInstalledText').textContent = p.deps_installed ? 'Yes' : 'No';
+  }
+  async function refreshProton() {
+    try { renderProton(await invoke('get_proton_status')); } catch (e) { setStatus(String(e), true); }
+  }
+  $('protonSelect').onchange = async () => {
+    const path = $('protonSelect').value;
+    if (!path) return;
+    $('protonPath').value = path;
+    try {
+      renderProton(await invoke('set_proton_path', { path }));
+      setStatus('Proton selected');
+    } catch (e) {
+      setStatus(String(e), true);
+    }
+  };
+  $('protonRefresh').onclick = refreshProton;
+  $('protonApply').onclick = async () => {
+    try {
+      const path = $('protonPath').value.trim() || $('protonSelect').value;
+      const prefix = $('prefixPath').value.trim();
+      await invoke('set_proton_path', { path });
+      await invoke('set_proton_prefix', { path: prefix });
+      renderProton(await invoke('get_proton_status'));
+      setStatus('Proton settings applied');
+    } catch (e) {
+      setStatus(String(e), true);
+    }
+  };
+  $('protonSetup').onclick = async () => {
+    await run('proton_setup');
+    refreshProton();
+  };
+  $('localifyGuide').onclick = async (e) => {
+    e.preventDefault();
+    try {
+      await window.__TAURI__.opener.openUrl('https://gakumas.natsume.io/localify/dmm-games');
+    } catch {
+      window.open('https://gakumas.natsume.io/localify/dmm-games', '_blank');
+    }
+  };
+  $('localifyInstall').onclick = async () => {
+    await run('localify_install');
+  };
+  $('protonInstallDw').onclick = async () => {
+    setBusy(true);
+    setStatus('');
+    try {
+      const s = JSON.parse(await invoke('proton_install_dw'));
+      renderProton(s);
+      setStatus(s.message || 'DW-Proton installed');
+    } catch (e) {
+      setStatus(String(e), true);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   $('winClose').onclick = () => appWindow.close();
   listen('close-blocked', async () => {
     const ok = await openModal({
-      title: '종료',
-      body: textBody('진행 중인 작업이 있습니다.\n지금 닫을까요?'),
+      title: 'Exit',
+      body: textBody('A task is still in progress.\nClose now?'),
       buttons: [
-        { label: '취소', kind: 'secondary', icon: 'cross', value: false },
-        { label: '닫기', kind: 'primary', icon: 'check', value: true },
+        { label: 'Cancel', kind: 'secondary', icon: 'cross', value: false },
+        { label: 'Close', kind: 'primary', icon: 'check', value: true },
       ],
     });
     if (ok) invoke('force_close');
@@ -599,7 +748,8 @@
   (async () => {
     updateStart();
     await refresh();
-    if (gameFound && (await invoke('take_auto_start'))) return run('start_game'); // 게임 시작에서 로그인도 확인
+    await refreshProton();
+    if (gameFound && (await invoke('take_auto_start'))) return run('start_game'); // start_game also verifies login
     if (loggedIn) {
       try { const s = await invoke('verify_login'); if (!busy) render(s); } catch {}
     }
