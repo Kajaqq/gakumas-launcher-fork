@@ -761,13 +761,14 @@ fn main() {
                 profile_session: Mutex::new(None),
             });
             // 시작하자마자 VPN Gate 서버 목록을 새로 받아 둠 (게임 시작은 받는 동안에도 쓰쿠바대 서버로 먼저 시도)
+            // A list saved within the last ten minutes is still fresh, so a quick restart downloads nothing.
             if vpngate_mode {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
                     let _ = handle
                         .state::<AppState>()
                         .store
-                        .refresh_vpngate_list(Duration::ZERO);
+                        .refresh_vpngate_list(launcher::VPNGATE_RECENT);
                 });
             }
             Ok(())
