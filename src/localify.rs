@@ -1,21 +1,30 @@
-//! Install Localify's DLL, seed the default translation config if missing,
-//! and track the installed release so the launcher can report updates.
+//! Install Localify and track the installed release so the launcher can
+//! report updates.
+//!
+//! A first install (no `gakumas-local` folder yet) extracts the release's
+//! `gakumas-local` folder. Outside Chinese systems it leaves out the bundled
+//! Chinese `local-files` and points the config at the English translation
+//! data. An update replaces only `version.dll`.
 
 use std::fs;
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use crate::{http, launcher::Store};
+use crate::{http, launcher::Store, platform};
 
 const RELEASES_API: &str = "https://api.github.com/repos/chinosk6/gakuen-imas-localify/releases";
 const DLL_NAME: &str = "version.dll";
 const MAX_DLL_SIZE: u64 = 64 * 1024 * 1024;
-const DEFAULT_CONFIG: &[u8] = include_bytes!("localify-config.json");
 const ARCHIVE_PREFIX: &str = "DMM_GakumasLocalify_";
+const LOCAL_DIR: &str = "gakumas-local";
+const LOCAL_FILES: &str = "local-files";
+const ENGLISH_ASSETS_URL: &str = "https://api.github.com/repos/NatsumeLS/Gakumas-Translation-Data-EN/releases/latest";
+/// Upper bound for any single file extracted from the archive.
+const MAX_ENTRY_SIZE: u64 = 64 * 1024 * 1024;
 /// The automatic update check on launch runs at most this often.
 pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -61,7 +70,8 @@ pub fn install(
     progress("Installing the Localify DLL...", None);
     let zip =
         fs::File::open(&archive).map_err(|e| format!("Could not open Localify archive: {e}"))?;
-    let dll_sha256 = install_dll(zip, &game_dir)?;
+    let english = !platform::system_language_is_chinese();
+    let (dll_sha256, first_install) = install_from_archive(zip, &game_dir, english)?;
     let checked_at = now_secs();
     let saved = store.update_localify(|r| {
         r.tag = Some(version.clone());
@@ -70,9 +80,28 @@ pub fn install(
         r.latest_tag = Some(version.clone());
         r.checked_at = Some(checked_at);
     });
+    let done = match (first_install, english) {
+        (true, true) => format!("Localify {version} installed with the English translation settings."),
+        (true, false) => format!("Localify {version} installed."),
+        (false, _) => format!("Localify updated to {version} (only version.dll was replaced)."),
+    };
     match saved {
-        Ok(_) => Ok(format!("Localify {version} installed.")),
-        Err(e) => Ok(format!("Localify {version} installed, but its version could not be recorded: {e}")),
+        Ok(_) => Ok(done),
+        Err(e) => Ok(format!("{done} Its version could not be recorded: {e}")),
+    }
+}
+
+/// Install from a verified archive. Returns the DLL's SHA-256 and whether this
+/// was a first install (the game folder had no `gakumas-local` folder).
+fn install_from_archive(
+    reader: impl Read + Seek,
+    game_dir: &Path,
+    english: bool,
+) -> Result<(String, bool), String> {
+    if game_dir.join(LOCAL_DIR).exists() {
+        Ok((install_dll(reader, game_dir)?, false))
+    } else {
+        Ok((install_fresh(reader, game_dir, english)?, true))
     }
 }
 
@@ -266,48 +295,129 @@ fn validate_archive(reader: impl Read + Seek) -> Result<(), String> {
     localify_dll(&mut archive).map(|_| ())
 }
 
-/// Install the DLL and return its SHA-256.
+/// Extract the DLL next to the game, without touching anything else. Returns its SHA-256.
 fn install_dll(reader: impl Read + Seek, game_dir: &Path) -> Result<String, String> {
     let mut archive = open_archive(reader)?;
-    let dll = localify_dll(&mut archive)?;
+    let (staged, sha256) = stage_dll(&mut archive, game_dir)?;
+    staged.persist(game_dir.join(DLL_NAME)).map_err(|e| format!("Could not install {DLL_NAME}: {e}"))?;
+    Ok(sha256)
+}
+
+/// Copy the DLL into a temporary file in `game_dir` and hash it.
+fn stage_dll<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    game_dir: &Path,
+) -> Result<(tempfile::NamedTempFile, String), String> {
+    let dll = localify_dll(archive)?;
     let expected = dll.size();
     let mut staged = tempfile::NamedTempFile::new_in(game_dir).map_err(|e| format!("Could not stage {DLL_NAME}: {e}"))?;
-    let copied = std::io::copy(&mut dll.take(MAX_DLL_SIZE + 1), &mut staged)
+    let copied = io::copy(&mut dll.take(MAX_DLL_SIZE + 1), &mut staged)
         .map_err(|e| format!("Could not extract {DLL_NAME}: {e}"))?;
     if copied != expected {
         return Err(format!("Unexpected size for {DLL_NAME} in Localify archive"));
     }
     staged.as_file_mut().rewind().map_err(|e| format!("Could not read {DLL_NAME}: {e}"))?;
     let sha256 = sha256_hex(staged.as_file_mut()).map_err(|e| format!("Could not read {DLL_NAME}: {e}"))?;
-    let local = game_dir.join("gakumas-local");
-    fs::create_dir_all(&local)
-        .map_err(|e| format!("Could not create gakumas-local: {e}"))?;
-    install_default_config(&local)
-        .map_err(|e| format!("Could not create gakumas-local/config.json: {e}"))?;
-    staged.persist(game_dir.join(DLL_NAME)).map_err(|e| format!("Could not install {DLL_NAME}: {e}"))?;
+    Ok((staged, sha256))
+}
+
+/// First install: extract the DLL and the archive's `gakumas-local` folder.
+/// With `english`, leave out `local-files` and switch the config to the
+/// English translation data. Returns the DLL's SHA-256.
+fn install_fresh(reader: impl Read + Seek, game_dir: &Path, english: bool) -> Result<String, String> {
+    let mut archive = open_archive(reader)?;
+    // Build the folder beside the game first so a failure leaves nothing half-extracted.
+    let staging = tempfile::Builder::new()
+        .prefix(".localify-")
+        .tempdir_in(game_dir)
+        .map_err(|e| format!("Could not stage {LOCAL_DIR}: {e}"))?;
+    let local = staging.path().join(LOCAL_DIR);
+    fs::create_dir_all(&local).map_err(|e| format!("Could not stage {LOCAL_DIR}: {e}"))?;
+    extract_local_dir(&mut archive, staging.path(), english)?;
+    if english {
+        patch_json(
+            &local.join("config.json"),
+            &[
+                ("useAPIAssets", json!(true)),
+                ("useAPIAssetsURL", json!(ENGLISH_ASSETS_URL)),
+                ("useAPITextureAssets", json!(false)),
+            ],
+        )?;
+        patch_json(&local.join("localizationConfig.json"), &[("replaceFont", json!(false))])?;
+    }
+    let (dll, sha256) = stage_dll(&mut archive, game_dir)?;
+    // The DLL goes in first: if moving the folder then fails, the next
+    // install still sees no gakumas-local and runs as a first install again.
+    dll.persist(game_dir.join(DLL_NAME)).map_err(|e| format!("Could not install {DLL_NAME}: {e}"))?;
+    fs::rename(&local, game_dir.join(LOCAL_DIR)).map_err(|e| format!("Could not install {LOCAL_DIR}: {e}"))?;
     Ok(sha256)
 }
 
-fn install_default_config(local: &Path) -> io::Result<()> {
-    let path = local.join("config.json");
-    if path.is_file() {
-        return Ok(());
+/// Extract the entries under `gakumas-local/` into `dest`, skipping
+/// `gakumas-local/local-files/` when `skip_local_files` is set. Entries
+/// outside that folder or with unsafe paths are ignored.
+fn extract_local_dir<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    dest: &Path,
+    skip_local_files: bool,
+) -> Result<(), String> {
+    let failed = |e: &dyn std::fmt::Display| format!("Could not extract {LOCAL_DIR}: {e}");
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| failed(&e))?;
+        let Some(path) = entry.enclosed_name() else { continue };
+        let Ok(inner) = path.strip_prefix(LOCAL_DIR) else { continue };
+        if skip_local_files && inner.starts_with(LOCAL_FILES) {
+            continue;
+        }
+        let target = dest.join(&path);
+        if entry.is_dir() {
+            fs::create_dir_all(&target).map_err(|e| failed(&e))?;
+            continue;
+        }
+        let size = entry.size();
+        if size > MAX_ENTRY_SIZE {
+            return Err(failed(&format!("{} is too large", path.display())));
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| failed(&e))?;
+        }
+        let mut out = fs::File::create(&target).map_err(|e| failed(&e))?;
+        let copied = io::copy(&mut Read::by_ref(&mut entry).take(size + 1), &mut out).map_err(|e| failed(&e))?;
+        if copied != size {
+            return Err(failed(&format!("unexpected size for {}", path.display())));
+        }
     }
-    let mut config = tempfile::NamedTempFile::new_in(local)?;
-    config.write_all(DEFAULT_CONFIG)?;
-    match config.persist_noclobber(&path) {
-        Ok(_) => Ok(()),
-        Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists && path.is_file() => Ok(()),
-        Err(e) => Err(e.error),
+    Ok(())
+}
+
+/// Set top-level keys in a JSON config, keeping every other setting. A missing
+/// file is created with just these keys. Written with Localify's four-space indent.
+fn patch_json(path: &Path, values: &[(&str, Value)]) -> Result<(), String> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let mut doc = match fs::read(path) {
+        Ok(bytes) => {
+            let text = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+            serde_json::from_slice(text).map_err(|e| format!("Could not parse {name}: {e}"))?
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => json!({}),
+        Err(e) => return Err(format!("Could not read {name}: {e}")),
+    };
+    let object = doc.as_object_mut().ok_or_else(|| format!("{name} is not a JSON object"))?;
+    for (key, value) in values {
+        object.insert(key.to_string(), value.clone());
     }
+    let mut out = Vec::new();
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+    doc.serialize(&mut serde_json::Serializer::with_formatter(&mut out, formatter))
+        .map_err(|e| format!("Could not write {name}: {e}"))?;
+    fs::write(path, out).map_err(|e| format!("Could not write {name}: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::launcher::Settings;
-    use serde_json::json;
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
     use zip::write::SimpleFileOptions;
 
     fn archive(entries: &[(&str, &[u8])]) -> Cursor<Vec<u8>> {
@@ -344,28 +454,103 @@ mod tests {
         json!({ "tag_name": tag, "assets": [asset] })
     }
 
-    #[test]
-    fn installs_only_the_dll_and_default_config() {
-        let game = tempfile::tempdir().unwrap();
-        let zip = archive(&[(DLL_NAME, b"dll"), ("gakumas-local/config.json", b"bundled"), ("extra.dll", b"skip")]);
-        assert_eq!(install_dll(zip, game.path()).unwrap(), sha(b"dll"));
-        assert_eq!(fs::read(game.path().join(DLL_NAME)).unwrap(), b"dll");
-        let local = game.path().join("gakumas-local");
-        assert_eq!(fs::read(local.join("config.json")).unwrap(), DEFAULT_CONFIG);
-        assert_eq!(local.read_dir().unwrap().count(), 1);
-        assert_eq!(game.path().read_dir().unwrap().count(), 2);
+    const CONFIG: &[u8] = br#"{
+    "transRemoteZipUrl": "https://example.invalid/zh.zip",
+    "useAPIAssets": false,
+    "useAPIAssetsURL": "https://example.invalid/zh",
+    "useAPITextureAssets": true
+}"#;
+    const LOCALIZATION_CONFIG: &[u8] = br#"{"enabled": true, "renderScale": 0.7699999809265137, "replaceFont": true}"#;
+
+    /// The layout of a real DMM_GakumasLocalify release.
+    fn release_archive(dll: &[u8]) -> Cursor<Vec<u8>> {
+        archive(&[
+            ("gakumas-local/config.json", CONFIG),
+            ("gakumas-local/localizationConfig.json", LOCALIZATION_CONFIG),
+            ("gakumas-local/version.txt", b"3.5.0"),
+            ("gakumas-local/local-files/genericTrans.json", b"{}"),
+            ("gakumas-local/local-files/sub/font.ttf", b"font"),
+            (DLL_NAME, dll),
+        ])
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        names
     }
 
     #[test]
-    fn update_preserves_existing_localization_files() {
+    fn first_install_outside_china_uses_english_settings() {
         let game = tempfile::tempdir().unwrap();
-        let local = game.path().join("gakumas-local");
-        fs::create_dir(&local).unwrap();
+        let (dll_sha, first) = install_from_archive(release_archive(b"dll"), game.path(), true).unwrap();
+        assert!(first);
+        assert_eq!(dll_sha, sha(b"dll"));
+        assert_eq!(fs::read(game.path().join(DLL_NAME)).unwrap(), b"dll");
+        assert_eq!(names(game.path()), [LOCAL_DIR, DLL_NAME]);
+
+        let local = game.path().join(LOCAL_DIR);
+        assert_eq!(names(&local), ["config.json", "localizationConfig.json", "version.txt"]);
+        let config = read_json(&local.join("config.json"));
+        assert_eq!(config["useAPITextureAssets"], json!(false));
+        assert_eq!(config["useAPIAssetsURL"], json!(ENGLISH_ASSETS_URL));
+        assert_eq!(config["useAPIAssets"], json!(true));
+        // Everything else is left as the release ships it.
+        assert_eq!(config["transRemoteZipUrl"], json!("https://example.invalid/zh.zip"));
+        let localization = read_json(&local.join("localizationConfig.json"));
+        assert_eq!(localization["replaceFont"], json!(false));
+        assert_eq!(localization["enabled"], json!(true));
+        assert_eq!(localization["renderScale"], json!(0.7699999809265137));
+        assert!(String::from_utf8(fs::read(local.join("config.json")).unwrap()).unwrap().contains("\n    \"useAPIAssets\""));
+    }
+
+    #[test]
+    fn first_install_on_chinese_system_keeps_the_release_files() {
+        let game = tempfile::tempdir().unwrap();
+        let (_, first) = install_from_archive(release_archive(b"dll"), game.path(), false).unwrap();
+        assert!(first);
+        let local = game.path().join(LOCAL_DIR);
+        assert_eq!(fs::read(local.join("config.json")).unwrap(), CONFIG);
+        assert_eq!(fs::read(local.join("localizationConfig.json")).unwrap(), LOCALIZATION_CONFIG);
+        assert_eq!(fs::read(local.join("local-files/sub/font.ttf")).unwrap(), b"font");
+    }
+
+    #[test]
+    fn update_replaces_only_the_dll() {
+        let game = tempfile::tempdir().unwrap();
+        let local = game.path().join(LOCAL_DIR);
+        fs::create_dir_all(local.join("local-files")).unwrap();
         fs::write(local.join("config.json"), b"custom").unwrap();
         fs::write(game.path().join(DLL_NAME), b"old").unwrap();
-        install_dll(archive(&[(DLL_NAME, b"new"), ("gakumas-local/config.json", b"bundled")]), game.path()).unwrap();
+        let (dll_sha, first) = install_from_archive(release_archive(b"new"), game.path(), true).unwrap();
+        assert!(!first);
+        assert_eq!(dll_sha, sha(b"new"));
         assert_eq!(fs::read(game.path().join(DLL_NAME)).unwrap(), b"new");
         assert_eq!(fs::read(local.join("config.json")).unwrap(), b"custom");
+        assert_eq!(names(&local), ["config.json", "local-files"]);
+        assert!(fs::read_dir(local.join("local-files")).unwrap().next().is_none());
+        assert_eq!(names(game.path()), [LOCAL_DIR, DLL_NAME]);
+    }
+
+    #[test]
+    fn first_install_ignores_entries_outside_gakumas_local() {
+        let game = tempfile::tempdir().unwrap();
+        let zip = archive(&[
+            ("../escape.txt", b"x"),
+            ("other/file.txt", b"x"),
+            ("gakumas-local/../../escape2.txt", b"x"),
+            ("gakumas-local/config.json", b"{}"),
+            (DLL_NAME, b"dll"),
+        ]);
+        install_from_archive(zip, game.path(), true).unwrap();
+        assert_eq!(names(game.path()), [LOCAL_DIR, DLL_NAME]);
+        assert!(!game.path().parent().unwrap().join("escape.txt").exists());
+        // localizationConfig.json was missing, so it is created with just the patched key.
+        assert_eq!(read_json(&game.path().join(LOCAL_DIR).join("localizationConfig.json")), json!({ "replaceFont": false }));
     }
 
     #[test]
