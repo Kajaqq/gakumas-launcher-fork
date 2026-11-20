@@ -352,6 +352,13 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
   <section class="panel">
     <div class="panel-head"><svg class="star-l" viewBox="0 0 24 24"><path fill="currentColor" d="M12 0c1 7 5 11 12 12-7 1-11 5-12 12-1-7-5-11-12-12C7 11 11 7 12 0z"/></svg><span>Localization (Localify)</span><svg class="star-r" viewBox="0 0 32 32"><path fill="#ffb92e" d="M13 2c.8 6.2 3.8 9.2 10 10-6.2.8-9.2 3.8-10 10-.8-6.2-3.8-9.2-10-10 6.2-.8 9.2-3.8 10-10z"/><path fill="#ffffff" opacity=".9" d="M25 18c.4 3.2 1.8 4.6 5 5-3.2.4-4.6 1.8-5 5-.4-3.2-1.8-4.6-5-5 3.2-.4 4.6-1.8 5-5z"/></svg></div>
     <div class="panel-body">
+      <div class="item">
+        <div class="item-main"><div class="item-title">Installed</div><div class="item-sub account"><span class="dot" id="localifyDot"></span><span id="localifyText">Checking…</span></div></div>
+      </div>
+      <div class="item">
+        <div class="item-main"><div class="item-title">Latest release</div><div class="item-sub" id="localifyLatest">Not checked yet</div></div>
+        <div class="item-actions"><button class="pill" id="localifyCheck">Check for updates</button></div>
+      </div>
       <p class="proton-note">See the <a href="https://gakumas.natsume.io/localify/dmm-games" id="localifyGuide">Localify guide</a>.</p>
       <div class="proton-actions"><button class="pill" id="localifyInstall">Install / update Localify</button></div>
     </div>
@@ -437,6 +444,7 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
     busy = b;
     for (const id of ['folder', 'exePick', 'exeClear', 'accountBtn', 'dmmBrowserBtn', 'registerBtn', 'auto', 'closeAfter', 'vpnPick', 'vpnAuth', 'protonApply', 'protonSetup', 'protonInstallDw', 'protonRefresh', 'localifyInstall']) $(id).disabled = b;
     $('mode').querySelectorAll('button').forEach((x) => (x.disabled = b));
+    $('localifyCheck').disabled = b || localifyChecking;
     if (!b) setMeter(null);
     updateStart();
   }
@@ -645,6 +653,7 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
   };
   $('folder').onclick = async () => {
     try { render(await invoke('pick_game_folder')); if (gameFound) setStatus(''); } catch (e) { setStatus(String(e), true); }
+    refreshLocalify();
   };
   $('exePick').onclick = async () => {
     try {
@@ -739,8 +748,54 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
       window.open('https://gakumas.natsume.io/localify/dmm-games', '_blank');
     }
   };
+  // ---------- Localify ----------
+  let localifyChecking = false;
+  function renderLocalify(l) {
+    $('localifyDot').classList.toggle('on', l.installed);
+    $('localifyText').textContent = !l.installed ? 'Not installed'
+      : l.version ? `Installed (${l.version})` : 'Installed (unknown version)';
+    let latest = 'Not checked yet';
+    if (l.latest) {
+      latest = l.latest;
+      if (l.update_available) latest += ' (update available)';
+      else if (l.version === l.latest) latest += ' (up to date)';
+    }
+    $('localifyLatest').textContent = latest;
+    $('localifyLatest').title = l.checked_at ? 'Checked ' + new Date(l.checked_at * 1000).toLocaleString() : '';
+    $('localifyInstall').textContent = !l.installed ? 'Install Localify'
+      : l.update_available ? `Update Localify to ${l.latest}` : 'Reinstall Localify';
+  }
+  async function refreshLocalify() {
+    try { renderLocalify(await invoke('localify_status')); } catch (e) { log('Localify status: ' + e); }
+  }
+  // force: the button. Otherwise the launcher checks at most once every 24 hours, and only when Localify is installed.
+  async function checkLocalify(force) {
+    if (localifyChecking) return;
+    localifyChecking = true;
+    $('localifyCheck').disabled = true;
+    try {
+      const l = await invoke('localify_check', { force });
+      renderLocalify(l);
+      const found = l.update_available ? `Localify ${l.latest} is available` : '';
+      if (force) {
+        const msg = found || (l.version && l.version === l.latest ? 'Localify is up to date' : `Latest Localify release: ${l.latest}`);
+        setStatus(msg);
+        log(msg);
+      } else if (found) {
+        log(found);
+      }
+    } catch (e) {
+      if (force) setStatus(String(e), true);
+      log('Localify update check failed: ' + e);
+    } finally {
+      localifyChecking = false;
+      $('localifyCheck').disabled = busy;
+    }
+  }
+  $('localifyCheck').onclick = () => checkLocalify(true);
   $('localifyInstall').onclick = async () => {
     await run('localify_install');
+    refreshLocalify();
   };
   $('protonInstallDw').onclick = async () => {
     setBusy(true);
@@ -774,6 +829,8 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
     updateStart();
     await refresh();
     await refreshProton();
+    // Not awaited: hashing the DLL and the daily update check must not delay an auto start.
+    refreshLocalify().then(() => checkLocalify(false));
     if (gameFound && (await invoke('take_auto_start'))) return run('start_game'); // start_game also verifies login
     if (loggedIn) {
       try { const s = await invoke('verify_login'); if (!busy) render(s); } catch {}

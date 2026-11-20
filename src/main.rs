@@ -15,6 +15,7 @@ use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
 use gakumas_launcher::launcher::{self, SignIn, Status, Store};
+use gakumas_launcher::localify;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -697,6 +698,25 @@ async fn localify_install(app: AppHandle) -> Result<String, String> {
     .await
 }
 
+/// Installed Localify release, from the saved record and the DLL's SHA-256 (no network).
+#[tauri::command]
+async fn localify_status(app: AppHandle) -> Result<localify::Status, String> {
+    tauri::async_runtime::spawn_blocking(move || localify::status(&app.state::<AppState>().store))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Look up the newest Localify release. Without `force` it only runs once every 24 hours.
+/// It does not take the busy flag, so it never blocks a game start.
+#[tauri::command]
+async fn localify_check(app: AppHandle, force: bool) -> Result<localify::Status, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        localify::check_for_updates(&app.state::<AppState>().store, force)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// 화면(작업 표시줄 제외)보다 창이 크면 높이를 줄여 화면 안에 들어오게 함.
 /// 이때만 내용이 길면 스크롤이 생기고, 보통 화면에서는 기본 높이(스크롤 없음)를 그대로 씀
 fn fit_to_screen(win: &tauri::WebviewWindow) {
@@ -795,6 +815,8 @@ fn main() {
             proton_setup,
             proton_install_dw,
             localify_install,
+            localify_status,
+            localify_check,
             open_dmm_browser,
             open_dmm_registration,
             dmm_browser_navigate
