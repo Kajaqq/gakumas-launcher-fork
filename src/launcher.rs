@@ -757,9 +757,17 @@ pub fn is_in_mygames(store: &Store, mode: &str, token: &str) -> Result<bool, Str
     open_japan_link(store, mode, &|_, _| {})?.is_in_mygames(token)
 }
 
+enum MyGamesAdd {
+    Added,
+    AlreadyPresent,
+}
+
 /// Add the game to My Games over the selected connection mode.
 pub fn add_to_mygames(store: &Store, mode: &str, token: &str) -> Result<String, String> {
-    open_japan_link(store, mode, &|_, _| {})?.add_to_mygames(token)
+    Ok(match open_japan_link(store, mode, &|_, _| {})?.add_to_mygames(token)? {
+        MyGamesAdd::Added => "Game added to My Games".into(),
+        MyGamesAdd::AlreadyPresent => "Game is already in My Games".into(),
+    })
 }
 
 impl JapanLink {
@@ -768,9 +776,9 @@ impl JapanLink {
         mygames_contains_game(&response)
     }
 
-    fn add_to_mygames(&mut self, token: &str) -> Result<String, String> {
+    fn add_to_mygames(&mut self, token: &str) -> Result<MyGamesAdd, String> {
         if self.is_in_mygames(token)? {
-            return Ok("Game is already in My Games".into());
+            return Ok(MyGamesAdd::AlreadyPresent);
         }
         let response = self.post(
             "/v5/detail/mygame/add",
@@ -778,7 +786,7 @@ impl JapanLink {
             token,
         )?;
         check_mygames_response(&response, "add the game to My Games")?;
-        Ok("Game added to My Games".into())
+        Ok(MyGamesAdd::Added)
     }
 }
 
@@ -1270,17 +1278,24 @@ pub fn start_game_with_profile_setup(
                     )
                 })?;
             }
-            313 => {
+            // 314 (NOT_PURCHASED_FAILURE) means DMM does not see the title in
+            // this account's My Games, so the same My Games add can clear it.
+            code @ (313 | 314) => {
                 if !added_mygame {
                     match link.add_to_mygames(&token) {
-                        Ok(message) => {
-                            progress(&message, None);
+                        Ok(MyGamesAdd::Added) => {
+                            progress("Game added to My Games", None);
                             added_mygame = true;
                             continue;
                         }
+                        Ok(MyGamesAdd::AlreadyPresent) => added_mygame = true,
+                        Err(e) if e == PROFILE_REGISTRATION_REQUIRED && code == 314 => return Err(e),
                         Err(e) if e == PROFILE_REGISTRATION_REQUIRED => (),
                         Err(e) => return Err(e),
                     }
+                }
+                if code == 314 {
+                    return Err("DMM reports this account does not have the game (result_code 314). Add Gakumas from its DMM GAMES page in the Browser, then try again.".into());
                 }
                 if let Some(setup) = profile_setup.filter(|_| launch && !tried_profile_setup) {
                     tried_profile_setup = true;
