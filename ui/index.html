@@ -734,9 +734,7 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
     try {
       const path = $('protonPath').value.trim() || $('protonSelect').value;
       const prefix = $('prefixPath').value.trim();
-      await invoke('set_proton_path', { path });
-      await invoke('set_proton_prefix', { path: prefix });
-      renderProton(await invoke('get_proton_status'));
+      renderProton(await invoke('set_proton_settings', { path, prefix }));
       setStatus('Proton settings applied');
     } catch (e) {
       setStatus(String(e), true);

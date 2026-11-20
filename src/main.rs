@@ -499,6 +499,22 @@ fn set_proton_prefix(app: AppHandle, path: String) -> Result<Value, String> {
     }
 }
 
+/// Apply both Proton fields with one settings write and one status scan.
+#[tauri::command]
+fn set_proton_settings(app: AppHandle, path: String, prefix: String) -> Result<Value, String> {
+    #[cfg(not(windows))]
+    {
+        let base = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+        let state = app.state::<AppState>();
+        gakumas_launcher::proton::set_paths(&base, &state.store, &path, &prefix)
+    }
+    #[cfg(windows)]
+    {
+        let _ = (app, path, prefix);
+        Err("Proton settings are only available on Linux".into())
+    }
+}
+
 #[tauri::command]
 async fn proton_setup(app: AppHandle) -> Result<String, String> {
     #[cfg(not(windows))]
@@ -812,6 +828,7 @@ fn main() {
             get_proton_status,
             set_proton_path,
             set_proton_prefix,
+            set_proton_settings,
             proton_setup,
             proton_install_dw,
             localify_install,

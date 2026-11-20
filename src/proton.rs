@@ -180,28 +180,33 @@ pub fn status(base: &Path) -> Value {
     })
 }
 
-fn save(base: &Path, store: &Store, key: &str, path: &str) -> Result<Value, String> {
+/// An empty path means "use the default" and is stored as unset.
+fn optional_path(path: &str) -> Option<String> {
+    Some(path.trim().to_string()).filter(|p| !p.is_empty())
+}
+
+pub fn set_path(base: &Path, store: &Store, path: &str) -> Result<Value, String> {
     let mut settings = store.settings();
-    let value = if path.trim().is_empty() {
-        None
-    } else {
-        Some(path.trim().to_string())
-    };
-    match key {
-        "proton_path" => settings.proton_path = value,
-        "proton_prefix" => settings.proton_prefix = value,
-        _ => {}
-    }
+    settings.proton_path = optional_path(path);
     store.save_settings(&settings)?;
     Ok(status(base))
 }
 
-pub fn set_path(base: &Path, store: &Store, path: &str) -> Result<Value, String> {
-    save(base, store, "proton_path", path)
+pub fn set_prefix(base: &Path, store: &Store, path: &str) -> Result<Value, String> {
+    let mut settings = store.settings();
+    settings.proton_prefix = optional_path(path);
+    store.save_settings(&settings)?;
+    Ok(status(base))
 }
 
-pub fn set_prefix(base: &Path, store: &Store, path: &str) -> Result<Value, String> {
-    save(base, store, "proton_prefix", path)
+/// Save the Proton path and prefix together (one settings write) and return
+/// the resulting status (one candidate scan).
+pub fn set_paths(base: &Path, store: &Store, proton: &str, prefix: &str) -> Result<Value, String> {
+    let mut settings = store.settings();
+    settings.proton_path = optional_path(proton);
+    settings.proton_prefix = optional_path(prefix);
+    store.save_settings(&settings)?;
+    Ok(status(base))
 }
 
 /// Resolve the configured Proton, or the first detected one.
@@ -851,6 +856,35 @@ mod tests {
         assert_eq!(s["available"], json!(true));
         assert!(s["candidates"].is_array());
         assert!(s["prefix"].as_str().is_some_and(|p| p.ends_with("proton-prefix")));
+    }
+
+    #[test]
+    fn set_paths_saves_proton_and_prefix_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let store = Store::new(base.join("data")).unwrap();
+
+        let s = set_paths(base, &store, " /opt/proton/proton ", " /tmp/prefix ").unwrap();
+        assert_eq!(s["proton"], json!("/opt/proton/proton"));
+        assert_eq!(s["prefix"], json!("/tmp/prefix"));
+        // Persisted, as a restart would read it.
+        let saved = Store::new(base.join("data")).unwrap().settings();
+        assert_eq!(saved.proton_path.as_deref(), Some("/opt/proton/proton"));
+        assert_eq!(saved.proton_prefix.as_deref(), Some("/tmp/prefix"));
+
+        // Clearing both fields restores the defaults.
+        let s = set_paths(base, &store, "", "  ").unwrap();
+        let saved = store.settings();
+        assert_eq!(saved.proton_path, None);
+        assert_eq!(saved.proton_prefix, None);
+        assert_eq!(s["prefix"], json!(default_prefix(base).to_string_lossy()));
+
+        // The standalone selection still changes only the Proton path.
+        set_prefix(base, &store, "/tmp/prefix").unwrap();
+        set_path(base, &store, "/opt/other/proton").unwrap();
+        let saved = store.settings();
+        assert_eq!(saved.proton_path.as_deref(), Some("/opt/other/proton"));
+        assert_eq!(saved.proton_prefix.as_deref(), Some("/tmp/prefix"));
     }
 
     #[test]
