@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::fs;
 use std::io::{Read, Write};
+use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -447,18 +448,30 @@ fn direct_post(path: &str, body: &Value, token: Option<&str>) -> Result<Value, S
     serde_json::from_str(&text).map_err(|e| format!("Failed to parse the DMM response: {e}"))
 }
 
-fn direct_get_json(url: &str) -> Result<Value, String> {
-    let resp = agent()
-        .get(url)
+fn fetch_manifest_page(
+    agent: &ureq::Agent,
+    url: &tauri::Url,
+    page: u64,
+) -> Result<ManifestPageData, String> {
+    let resp = agent
+        .get(url.as_str())
         .set("User-Agent", USER_AGENT)
         .set("Client-App", "DMMGamePlayer5")
         .set("Client-version", CLIENT_VERSION)
         .call()
-        .map_err(|e| format!("Failed to connect to the DMM server ({})", describe(&e)))?;
+        .map_err(|e| format!("Failed to fetch game update manifest page {page} ({})", describe(&e)))?;
+    if resp.status() != 200 {
+        return Err(format!("Game update manifest page {page} returned HTTP {}", resp.status()));
+    }
     let text = resp
         .into_string()
-        .map_err(|e| format!("Failed to receive the DMM response: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("Failed to parse the DMM response: {e}"))
+        .map_err(|e| format!("Failed to read game update manifest page {page}: {e}"))?;
+    let response: ManifestPage = serde_json::from_str(&text)
+        .map_err(|e| format!("Invalid game update manifest page {page}: {e}"))?;
+    if let Some(code) = response.result_code.filter(|&code| code != 100) {
+        return Err(format!("Game update manifest page {page} failed (result_code {code})"));
+    }
+    Ok(response.data)
 }
 
 /// Timestamped network log so all tunnel/DNS/proxy activity is visible.
@@ -1234,20 +1247,19 @@ fn remove_stale_tmp(dir: &Path, depth: u32) {
     }
 }
 
-fn md5_file(path: &Path) -> Result<String, String> {
+fn md5_file(path: &Path, buf: &mut [u8]) -> Result<String, String> {
     let mut f = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut h = Md5::new();
-    let mut buf = vec![0u8; 1 << 20];
     loop {
         let n = f
-            .read(&mut buf)
+            .read(buf)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         if n == 0 {
             break;
         }
         h.update(&buf[..n]);
     }
-    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Ok(format!("{:x}", h.finalize()))
 }
 
 fn percent_encode(s: &str) -> String {
@@ -1261,6 +1273,97 @@ fn percent_encode(s: &str) -> String {
         .collect()
 }
 
+#[derive(Deserialize)]
+struct ManifestPage {
+    result_code: Option<i64>,
+    data: ManifestPageData,
+}
+
+#[derive(Deserialize)]
+struct ManifestPageData {
+    domain: Option<String>,
+    page: Option<NonZeroU64>,
+    file_list: Vec<ManifestFile>,
+}
+
+#[derive(Deserialize)]
+struct ManifestFile {
+    local_path: String,
+    path: Option<String>,
+    size: Option<u64>,
+    hash: Option<String>,
+    #[serde(default)]
+    force_delete_flg: bool,
+    #[serde(default)]
+    check_hash_flg: bool,
+    #[serde(default)]
+    protected_flg: bool,
+}
+
+fn load_manifest(
+    agent: &ureq::Agent,
+    url: &tauri::Url,
+    game_dir: &Path,
+) -> Result<(String, Vec<(ManifestFile, PathBuf)>), String> {
+    let mut first = fetch_manifest_page(agent, url, 1)?;
+    let pages = first
+        .page
+        .ok_or("Missing page count in game update manifest")?
+        .get();
+    let domain = first
+        .domain
+        .ok_or("Missing download server in game update manifest")?;
+    let server = tauri::Url::parse(&domain).map_err(|_| "Invalid game update download server")?;
+    if !matches!(server.scheme(), "http" | "https")
+        || server.host_str().is_none()
+        || server.query().is_some()
+        || server.fragment().is_some()
+        || !server.username().is_empty()
+        || server.password().is_some()
+    {
+        return Err("Invalid game update download server".into());
+    }
+
+    let mut files = Vec::new();
+    for number in 1..=pages {
+        let page_files = if number == 1 {
+            std::mem::take(&mut first.file_list)
+        } else {
+            let mut page_url = url.clone();
+            page_url
+                .query_pairs_mut()
+                .append_pair("page", &number.to_string());
+            fetch_manifest_page(agent, &page_url, number)?.file_list
+        };
+        for (index, file) in page_files.into_iter().enumerate() {
+            let invalid = |field| {
+                format!("Invalid {field} in game update manifest page {number}, entry {}", index + 1)
+            };
+            let full =
+                resolve_game_path(game_dir, &file.local_path).ok_or_else(|| invalid("local_path"))?;
+            if !file.force_delete_flg {
+                if !file.protected_flg
+                    && !file
+                        .path
+                        .as_deref()
+                        .is_some_and(|path| !path.trim_matches('/').trim().is_empty())
+                {
+                    return Err(invalid("path"));
+                }
+                if file.check_hash_flg
+                    && !file.hash.as_deref().is_some_and(|hash| {
+                        hash.len() == 32 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+                {
+                    return Err(invalid("hash"));
+                }
+            }
+            files.push((file, full));
+        }
+    }
+    Ok((server.to_string(), files))
+}
+
 fn update_game(
     game_dir: &Path,
     data: &Value,
@@ -1269,45 +1372,29 @@ fn update_game(
 ) -> Result<(), String> {
     let list_url = data["file_list_url"]
         .as_str()
+        .filter(|url| url.starts_with('/'))
         .ok_or("No update information in the response")?;
     let sign = data["sign"]
         .as_str()
         .ok_or("No download signature in the response")?;
     progress("Checking files for updates", None);
-    let first = direct_get_json(&format!("https://{DMM_HOST}{list_url}"))?;
-    let domain = first["data"]["domain"]
-        .as_str()
-        .ok_or("No server address in the file list")?
-        .to_string();
-    let mut files: Vec<Value> = first["data"]["file_list"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let pages = first["data"]["page"].as_u64().unwrap_or(1);
-    for p in 2..=pages {
-        let more = direct_get_json(&format!("https://{DMM_HOST}{list_url}?page={p}"))?;
-        files.extend(
-            more["data"]["file_list"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default(),
-        );
-    }
+    let list_url = tauri::Url::parse(&format!("https://{DMM_HOST}{list_url}"))
+        .map_err(|_| "Invalid game update manifest URL")?;
+    let agent = agent();
+    let (domain, files) = load_manifest(&agent, &list_url, game_dir)?;
 
-    let mut todo: Vec<(&Value, PathBuf)> = Vec::new();
-    let mut delete: Vec<PathBuf> = Vec::new();
-    for (i, f) in files.iter().enumerate() {
+    let mut todo = Vec::new();
+    let mut delete = Vec::new();
+    let mut buf = Vec::new();
+    for (i, (f, full)) in files.iter().enumerate() {
         if i % 10 == 0 {
             progress(
                 &format!("Checking files {}/{}", i, files.len()),
                 Some(i as f32 * 100.0 / files.len().max(1) as f32),
             );
         }
-        let Some(full) = resolve_game_path(game_dir, f["local_path"].as_str().unwrap_or("")) else {
-            continue;
-        };
         let exists = full.is_file();
-        if f["force_delete_flg"].as_bool() == Some(true) {
+        if f.force_delete_flg {
             if exists {
                 delete.push(full);
             }
@@ -1317,10 +1404,11 @@ fn update_game(
             todo.push((f, full));
             continue;
         }
-        if f["check_hash_flg"].as_bool() != Some(true) {
+        if !f.check_hash_flg {
             continue;
         }
-        if md5_file(&full)? != f["hash"].as_str().unwrap_or("").to_ascii_lowercase() {
+        buf.resize(1 << 20, 0);
+        if !md5_file(full, &mut buf)?.eq_ignore_ascii_case(f.hash.as_deref().unwrap_or_default()) {
             todo.push((f, full));
         }
     }
@@ -1328,16 +1416,14 @@ fn update_game(
         progress("Updating: already up to date", Some(100.0));
         return Ok(());
     }
-    if todo
-        .iter()
-        .any(|(f, _)| f["protected_flg"].as_bool() == Some(true))
-    {
+    if todo.iter().any(|(f, _)| f.protected_flg) {
         return Err("This update contains protected files that this launcher cannot download. Please update with DMM GAME PLAYER.".into());
     }
-    let total: u64 = todo
-        .iter()
-        .map(|(f, _)| f["size"].as_u64().unwrap_or(0))
-        .sum();
+    let total = todo.iter().try_fold(0u64, |total, (f, _)| {
+        total
+            .checked_add(f.size.unwrap_or(0))
+            .ok_or("Invalid total game update size")
+    })?;
     progress(
         &format!(
             "Updating: {} files, {:.0} MB",
@@ -1349,7 +1435,7 @@ fn update_game(
     if dry_run {
         for (f, _) in &todo {
             progress(
-                &format!("Updating: file to download: {}", f["local_path"].as_str().unwrap_or("")),
+                &format!("Updating: file to download: {}", f.local_path),
                 None,
             );
         }
@@ -1380,15 +1466,14 @@ fn update_game(
         percent_encode(key_pair)
     );
 
-    let agent = agent();
     let mut done: u64 = 0;
-    let mut buf = vec![0u8; 256 * 1024];
-    for (n, (f, full)) in todo.iter().enumerate() {
-        let local = f["local_path"].as_str().unwrap_or("");
+    buf.resize(256 * 1024, 0);
+    for (n, &(f, full)) in todo.iter().enumerate() {
+        let local = &f.local_path;
         let url = format!(
             "{}/{}?{}",
             domain.trim_end_matches('/'),
-            f["path"].as_str().unwrap_or("").trim_start_matches('/'),
+            f.path.as_deref().unwrap_or_default().trim_start_matches('/'),
             query
         );
         if let Some(parent) = full.parent() {
@@ -1406,6 +1491,7 @@ fn update_game(
                 .map_err(|e| format!("Failed to download {local} ({})", describe(&e)))?;
             let mut reader = resp.into_reader();
             let mut out = fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+            let mut hash = f.check_hash_flg.then(Md5::new);
             let mut last_report = 0u64;
             loop {
                 let k = reader
@@ -1414,8 +1500,12 @@ fn update_game(
                 if k == 0 {
                     break;
                 }
-                out.write_all(&buf[..k])
+                let chunk = &buf[..k];
+                out.write_all(chunk)
                     .map_err(|e| format!("{}: {e}", tmp.display()))?;
+                if let Some(hash) = &mut hash {
+                    hash.update(chunk);
+                }
                 done += k as u64;
                 if done - last_report >= 2 * 1_048_576 {
                     last_report = done;
@@ -1426,9 +1516,10 @@ fn update_game(
                 }
             }
             drop(out);
-            if f["check_hash_flg"].as_bool() == Some(true)
-                && md5_file(&tmp)? != f["hash"].as_str().unwrap_or("").to_ascii_lowercase()
-            {
+            if hash.is_some_and(|hash| {
+                !format!("{:x}", hash.finalize())
+                    .eq_ignore_ascii_case(f.hash.as_deref().unwrap_or_default())
+            }) {
                 return Err(format!("{local}: downloaded file hash mismatch"));
             }
             fs::rename(&tmp, full)
@@ -1443,7 +1534,7 @@ fn update_game(
             Some(done as f32 * 100.0 / total.max(1) as f32),
         );
     }
-    for d in &delete {
+    for d in delete {
         fs::remove_file(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
     progress("Updating: complete", Some(100.0));
@@ -1492,5 +1583,83 @@ mod tests {
         );
         // Parent-directory escapes are still rejected.
         assert!(resolve_game_path(root, r"..\outside").is_none());
+    }
+
+    fn manifest_server(
+        pages: Vec<(&'static str, Value)>,
+    ) -> (tauri::Url, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/manifest?revision=1", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            // Every page must use the same HTTP/1.1 connection.
+            let (stream, _) = listener.accept().unwrap();
+            drop(listener);
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut stream = BufReader::new(stream);
+            for (target, response) in pages {
+                let mut line = String::new();
+                stream.read_line(&mut line).unwrap();
+                assert_eq!(line, format!("GET {target} HTTP/1.1\r\n"));
+                loop {
+                    line.clear();
+                    assert_ne!(stream.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let response = response.to_string();
+                write!(
+                    stream.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{response}",
+                    response.len()
+                ).unwrap();
+            }
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn manifest_loads_all_pages_over_one_connection() {
+        let (url, server) = manifest_server(vec![
+            ("/manifest?revision=1", json!({"result_code": 100, "data": {
+                "domain": "https://cdn.example/", "page": 2,
+                "file_list": [{"local_path": "new.bin", "path": "/new.bin"}]
+            }})),
+            ("/manifest?revision=1&page=2", json!({"data": {
+                "file_list": [{"local_path": "old.bin", "force_delete_flg": true}]
+            }})),
+        ]);
+        let agent = ureq::AgentBuilder::new().try_proxy_from_env(false).build();
+        let root = Path::new("game");
+        let (domain, files) = load_manifest(&agent, &url, root).unwrap();
+        server.join().unwrap();
+        assert_eq!(domain, "https://cdn.example/");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].1, root.join("new.bin"));
+        assert!(files[1].0.force_delete_flg);
+    }
+
+    #[test]
+    fn manifest_rejects_a_missing_list_or_invalid_file_on_a_later_page() {
+        for data in [
+            json!({}),
+            json!({"file_list": [{"local_path": "new.bin", "path": "new.bin", "check_hash_flg": true}]}),
+        ] {
+            let (url, server) = manifest_server(vec![
+                ("/manifest?revision=1", json!({"data": {
+                    "domain": "https://cdn.example/", "page": 2, "file_list": []
+                }})),
+                ("/manifest?revision=1&page=2", json!({"data": data})),
+            ]);
+            let agent = ureq::AgentBuilder::new().try_proxy_from_env(false).build();
+            let result = load_manifest(&agent, &url, Path::new("game"));
+            server.join().unwrap();
+            assert!(matches!(result, Err(message) if message.contains("manifest page 2")));
+        }
     }
 }

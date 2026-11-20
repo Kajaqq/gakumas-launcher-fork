@@ -6,13 +6,14 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::launcher::Store;
+use crate::{http, launcher::Store, localify};
 
 const BUNDLE_ID: &str = "local.gakumas.launcher";
 const DEPS_MARKER: &str = ".gakumas-deps-ok";
@@ -23,18 +24,6 @@ const DRIVER_URL: &str = "https://media.githubusercontent.com/media/magicsword-i
 const DRIVER_SHA256: &str = "64035e86735d0c01e0eb0862def6a48f012ec0a8e701874092ee1506ab65d273";
 const DW_RELEASES_API: &str =
     "https://api.github.com/repos/dawn-winery/dwproton-mirror/releases/latest";
-const LOCALIFY_RELEASES_API: &str =
-    "https://api.github.com/repos/chinosk6/gakuen-imas-localify/releases";
-
-fn download_file(url: &str, path: &Path) -> Result<(), String> {
-    let response = ureq::get(url)
-        .call()
-        .map_err(|e| format!("Failed to download {url}: {e}"))?;
-    let mut reader = response.into_reader();
-    let mut file = fs::File::create(path).map_err(|e| e.to_string())?;
-    std::io::copy(&mut reader, &mut file).map_err(|e| e.to_string())?;
-    Ok(())
-}
 
 fn sha256_hex(data: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, data);
@@ -373,18 +362,17 @@ fn install_webview2_direct(
     compat: &Path,
     progress: &dyn Fn(&str, Option<f32>),
 ) -> Result<(), String> {
-    let installer = base.join("MicrosoftEdgeWebview2Setup.exe");
-    if !installer.is_file() {
-        progress("Downloading the WebView2 runtime installer...", None);
-        let response = ureq::get("https://go.microsoft.com/fwlink/p/?LinkId=2124703")
-            .call()
-            .map_err(|e| format!("Failed to download the WebView2 installer: {e}"))?;
-        let mut reader = response.into_reader();
-        let mut file =
-            fs::File::create(&installer).map_err(|e| format!("Failed to save the installer: {e}"))?;
-        std::io::copy(&mut reader, &mut file)
-            .map_err(|e| format!("Failed to save the installer: {e}"))?;
-    }
+    let download_dir = tempfile::tempdir_in(base)
+        .map_err(|e| format!("Failed to stage the WebView2 installer: {e}"))?;
+    let installer = download_dir.path().join("MicrosoftEdgeWebview2Setup.exe");
+    progress("Downloading the WebView2 runtime installer...", None);
+    http::download_file(
+        &ureq::agent(),
+        "https://go.microsoft.com/fwlink/p/?LinkId=2124703",
+        &installer,
+        None,
+        |_| Ok(()),
+    )?;
     progress("Installing the WebView2 runtime...", None);
     let mut cmd = Command::new(wine);
     cmd.arg(&installer).arg("/silent").arg("/install");
@@ -537,7 +525,9 @@ pub fn install_dw_proton(
     }
 
     progress("Fetching the DW-Proton release list...", None);
-    let response = ureq::get(DW_RELEASES_API)
+    let agent = ureq::agent();
+    let response = agent
+        .get(DW_RELEASES_API)
         .call()
         .map_err(|e| format!("Failed to reach the DW-Proton releases: {e}"))?;
     let body = response
@@ -555,13 +545,19 @@ pub fn install_dw_proton(
                     .is_some_and(|n| n.ends_with(".tar.xz") && !n.ends_with(".torrent"))
             })
         })
-        .and_then(|a| a["browser_download_url"].as_str())
         .ok_or("No DW-Proton archive was found in the latest release")?;
+    let url = asset["browser_download_url"]
+        .as_str()
+        .ok_or("Missing DW-Proton download URL")?;
+    let size = asset["size"]
+        .as_u64()
+        .filter(|&size| size > 0)
+        .ok_or("Invalid DW-Proton archive size in the release metadata")?;
 
     let archive = base.join(format!("dwproton-{tag}-x86_64.tar.xz"));
-    if !archive.is_file() {
+    if !http::cached_file_has_size(&archive, size) {
         progress(&format!("Downloading {tag} (about 330 MB)..."), None);
-        download_file(asset, &archive)?;
+        http::download_file(&agent, url, &archive, Some(size), |_| Ok(()))?;
     }
 
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -653,35 +649,7 @@ pub fn install_localify(
         return Err(format!("Game folder not found: {}", game_dir.display()));
     }
 
-    progress("Checking the latest Localify release...", None);
-    let response = ureq::get(LOCALIFY_RELEASES_API)
-        .call()
-        .map_err(|e| format!("Failed to reach the Localify releases: {e}"))?;
-    let body = response
-        .into_string()
-        .map_err(|e| format!("Failed to read the release list: {e}"))?;
-    let releases: Vec<Value> =
-        serde_json::from_str(&body).map_err(|e| format!("Failed to parse the release list: {e}"))?;
-
-    let (version, asset) = releases
-        .iter()
-        .find_map(|release| {
-            let tag = release["tag_name"].as_str()?;
-            let asset = release["assets"].as_array()?.iter().find(|a| {
-                a["name"]
-                    .as_str()
-                    .is_some_and(|n| n.starts_with("DMM_GakumasLocalify_v") && n.ends_with(".zip"))
-            })?;
-            let url = asset["browser_download_url"].as_str()?;
-            Some((tag.to_string(), url.to_string()))
-        })
-        .ok_or("No DMM_GakumasLocalify_v*.zip asset was found in the releases")?;
-
-    let archive = base.join(format!("DMM_GakumasLocalify_{version}.zip"));
-    if !archive.is_file() {
-        progress(&format!("Downloading Localify {version}..."), None);
-        download_file(&asset, &archive)?;
-    }
+    let (version, archive) = localify::cached_archive(base, progress)?;
     progress("Extracting Localify into the game folder...", None);
     let exit = Command::new("unzip")
         .arg("-o")
@@ -715,16 +683,23 @@ fn ensure_driver_file(base: &Path, prefix: &Path) -> Result<(), String> {
         return Ok(());
     }
     let candidate = base.join("usrdrv017764.sys");
-    if !candidate.is_file() {
-        download_file(DRIVER_URL, &candidate)?;
-    }
-    let bytes = fs::read(&candidate).map_err(|e| e.to_string())?;
-    if sha256_hex(&bytes) != DRIVER_SHA256 {
-        return Err("The downloaded anti-debug driver failed verification".to_string());
+    if !fs::File::open(&candidate).is_ok_and(|file| verify_driver(file).is_ok()) {
+        http::download_file(&ureq::agent(), DRIVER_URL, &candidate, None, |file| {
+            verify_driver(file)
+        })?;
     }
     fs::create_dir_all(system_driver.parent().unwrap_or(prefix)).map_err(|e| e.to_string())?;
     fs::copy(&candidate, &system_driver)
         .map_err(|e| format!("Failed to install the game driver: {e}"))?;
+    Ok(())
+}
+
+fn verify_driver(mut reader: impl Read) -> Result<(), String> {
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if sha256_hex(&bytes) != DRIVER_SHA256 {
+        return Err("The downloaded anti-debug driver failed verification".into());
+    }
     Ok(())
 }
 

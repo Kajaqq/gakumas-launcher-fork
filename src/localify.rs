@@ -6,22 +6,12 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::launcher::Store;
+use crate::{http, launcher::Store};
 
 const RELEASES_API: &str = "https://api.github.com/repos/chinosk6/gakuen-imas-localify/releases";
 const DLL_NAME: &str = "version.dll";
 const MAX_DLL_SIZE: u64 = 64 * 1024 * 1024;
 const DEFAULT_CONFIG: &[u8] = include_bytes!("localify-config.json");
-
-fn download(url: &str, path: &Path) -> Result<(), String> {
-    let response = ureq::get(url)
-        .call()
-        .map_err(|e| format!("Failed to download Localify: {e}"))?;
-    let mut reader = response.into_reader();
-    let mut file = fs::File::create(path).map_err(|e| e.to_string())?;
-    std::io::copy(&mut reader, &mut file).map_err(|e| e.to_string())?;
-    Ok(())
-}
 
 pub fn install(
     base: &Path,
@@ -38,15 +28,29 @@ pub fn install(
         return Err(format!("Game folder not found: {}", game_dir.display()));
     }
 
+    let (version, archive) = cached_archive(base, progress)?;
+    progress("Installing the Localify DLL...", None);
+    let zip =
+        fs::File::open(&archive).map_err(|e| format!("Could not open Localify archive: {e}"))?;
+    install_dll(zip, &game_dir)?;
+    Ok(format!("Localify {version} installed."))
+}
+
+pub(crate) fn cached_archive(
+    base: &Path,
+    progress: &dyn Fn(&str, Option<f32>),
+) -> Result<(String, PathBuf), String> {
     progress("Checking the latest Localify release...", None);
-    let body = ureq::get(RELEASES_API)
+    let agent = ureq::agent();
+    let body = agent
+        .get(RELEASES_API)
         .call()
         .map_err(|e| format!("Failed to reach the Localify releases: {e}"))?
         .into_string()
         .map_err(|e| e.to_string())?;
     let releases: Vec<Value> =
         serde_json::from_str(&body).map_err(|e| format!("Failed to parse releases: {e}"))?;
-    let (version, url) = releases
+    let (version, url, asset) = releases
         .iter()
         .find_map(|r| {
             let tag = r["tag_name"].as_str()?;
@@ -55,29 +59,49 @@ pub fn install(
                     .as_str()
                     .is_some_and(|n| n.starts_with("DMM_GakumasLocalify_v") && n.ends_with(".zip"))
             })?;
-            Some((tag.to_string(), asset["browser_download_url"].as_str()?.to_string()))
+            Some((tag, asset["browser_download_url"].as_str()?, asset))
         })
         .ok_or("No DMM_GakumasLocalify_v*.zip asset found")?;
+    let size = asset["size"]
+        .as_u64()
+        .filter(|&size| size > 0)
+        .ok_or("Invalid Localify archive size in the release metadata")?;
 
     let archive = base.join(format!("DMM_GakumasLocalify_{version}.zip"));
-    if !archive.is_file() {
+    if !http::cached_file_has_size(&archive, size)
+        || !fs::File::open(&archive).is_ok_and(|file| validate_archive(file).is_ok())
+    {
         progress(&format!("Downloading Localify {version}..."), None);
-        download(&url, &archive)?;
+        http::download_file(&agent, url, &archive, Some(size), |file| validate_archive(file))?;
     }
-    progress("Installing the Localify DLL...", None);
-    let zip = fs::File::open(&archive).map_err(|e| format!("Could not open Localify archive: {e}"))?;
-    install_dll(zip, &game_dir)?;
-    Ok(format!("Localify {version} installed."))
+    Ok((version.to_string(), archive))
+}
+
+fn open_archive<R: Read + Seek>(reader: R) -> Result<zip::ZipArchive<R>, String> {
+    zip::ZipArchive::new(reader).map_err(|e| format!("Invalid Localify archive: {e}"))
+}
+
+fn localify_dll<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Result<zip::read::ZipFile<'_, R>, String> {
+    let dll = archive
+        .by_name(DLL_NAME)
+        .map_err(|e| format!("Could not read {DLL_NAME} from Localify archive: {e}"))?;
+    if !dll.is_file() || dll.size() == 0 || dll.size() > MAX_DLL_SIZE {
+        return Err(format!("Invalid {DLL_NAME} in Localify archive"));
+    }
+    Ok(dll)
+}
+
+fn validate_archive(reader: impl Read + Seek) -> Result<(), String> {
+    let mut archive = open_archive(reader)?;
+    localify_dll(&mut archive).map(|_| ())
 }
 
 fn install_dll(reader: impl Read + Seek, game_dir: &Path) -> Result<(), String> {
-    let mut archive = zip::ZipArchive::new(reader).map_err(|e| format!("Invalid Localify archive: {e}"))?;
-    let dll = archive.by_name(DLL_NAME).map_err(|e| format!("Could not read {DLL_NAME} from Localify archive: {e}"))?;
+    let mut archive = open_archive(reader)?;
+    let dll = localify_dll(&mut archive)?;
     let expected = dll.size();
-    if !dll.is_file() || expected == 0 || expected > MAX_DLL_SIZE {
-        return Err(format!("Invalid {DLL_NAME} in Localify archive"));
-    }
-
     let mut staged = tempfile::NamedTempFile::new_in(game_dir).map_err(|e| format!("Could not stage {DLL_NAME}: {e}"))?;
     let copied = std::io::copy(&mut dll.take(MAX_DLL_SIZE + 1), &mut staged)
         .map_err(|e| format!("Could not extract {DLL_NAME}: {e}"))?;
