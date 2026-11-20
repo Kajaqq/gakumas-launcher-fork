@@ -50,6 +50,8 @@
   /* 창 오른쪽 스크롤바 숨김 (휠·터치 스크롤은 유지) */
   html, body { scrollbar-width: none; }
   html::-webkit-scrollbar, body::-webkit-scrollbar { display: none; width: 0; height: 0; }
+  /* 마우스로 끌어 스크롤하는 동안 잡은 손 커서 */
+  body.drag-scrolling, body.drag-scrolling * { cursor: grabbing !important; }
   svg { display: block; }
 
   /* ---------- 창 버튼 (머리 줄 오른쪽, 흰 원형) ---------- */
@@ -828,6 +830,93 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
     if (ok) invoke('force_close');
   });
   $('winMin').onclick = () => appWindow.minimize();
+
+  // Drag to scroll with the mouse: hold the left button on the page and pull, then let go
+  // to glide with momentum. Touch and pen already scroll natively. A press only turns into
+  // a drag after a few pixels of movement, so plain clicks are unaffected; a drag that
+  // started on a button swallows that button's click.
+  (() => {
+    const scroller = document.scrollingElement;
+    const THRESHOLD = 6; // px of movement before a press becomes a drag
+    const TIME_CONSTANT = 325; // ms; how quickly the glide slows down
+    const MAX_SPEED = 6; // px/ms
+    let press = null;
+    let glide = 0;
+    let suppressClick = false;
+
+    const stopGlide = () => {
+      if (glide) cancelAnimationFrame(glide);
+      glide = 0;
+    };
+    const ignored = (el) => !el.closest('main') || el.closest('input, select, textarea, [data-tauri-drag-region]');
+
+    const startGlide = (v) => {
+      let pos = scroller.scrollTop;
+      let prev = performance.now();
+      const step = (now) => {
+        const dt = now - prev;
+        prev = now;
+        v *= Math.exp(-dt / TIME_CONSTANT);
+        const max = scroller.scrollHeight - scroller.clientHeight;
+        pos = Math.min(max, Math.max(0, pos + v * dt));
+        scroller.scrollTop = pos;
+        glide = Math.abs(v) < 0.02 || pos <= 0 || pos >= max ? 0 : requestAnimationFrame(step);
+      };
+      glide = requestAnimationFrame(step);
+    };
+
+    const finish = (e, allowGlide) => {
+      const p = press;
+      press = null;
+      if (!p || !p.dragging) return;
+      document.body.classList.remove('drag-scrolling');
+      suppressClick = true;
+      if (!allowGlide) return;
+      const first = p.samples[0];
+      const last = p.samples[p.samples.length - 1];
+      const dt = last.t - first.t;
+      if (dt <= 0 || e.timeStamp - last.t > 60) return; // paused before letting go
+      const v = Math.max(-MAX_SPEED, Math.min(MAX_SPEED, (first.y - last.y) / dt));
+      startGlide(v);
+    };
+
+    document.addEventListener('pointerdown', (e) => {
+      stopGlide();
+      suppressClick = false;
+      press = null;
+      if (e.pointerType !== 'mouse' || e.button !== 0 || ignored(e.target)) return;
+      press = { id: e.pointerId, y: e.clientY, top: scroller.scrollTop, dragging: false, samples: [] };
+    });
+
+    document.addEventListener('pointermove', (e) => {
+      if (!press || e.pointerId !== press.id) return;
+      if (!(e.buttons & 1)) return finish(e, false); // released outside the window
+      if (!press.dragging) {
+        if (Math.abs(e.clientY - press.y) < THRESHOLD) return;
+        // Start from here so the content doesn't jump by the threshold distance.
+        press.dragging = true;
+        press.y = e.clientY;
+        press.top = scroller.scrollTop;
+        document.documentElement.setPointerCapture(e.pointerId);
+        document.body.classList.add('drag-scrolling');
+      }
+      e.preventDefault();
+      scroller.scrollTop = press.top - (e.clientY - press.y);
+      press.samples.push({ t: e.timeStamp, y: e.clientY });
+      while (press.samples.length > 2 && e.timeStamp - press.samples[0].t > 100) press.samples.shift();
+    });
+
+    document.addEventListener('pointerup', (e) => { if (press && e.pointerId === press.id) finish(e, true); });
+    document.addEventListener('pointercancel', (e) => { if (press && e.pointerId === press.id) finish(e, false); });
+    document.addEventListener('click', (e) => {
+      if (!suppressClick) return;
+      suppressClick = false;
+      e.preventDefault();
+      e.stopPropagation();
+    }, true);
+    document.addEventListener('dragstart', (e) => { if (press) e.preventDefault(); });
+    document.addEventListener('wheel', stopGlide, { passive: true });
+  })();
 
   (async () => {
     updateStart();
