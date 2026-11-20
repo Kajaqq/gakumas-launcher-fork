@@ -47,6 +47,11 @@
   ::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 999px; background: #cfcac6 padding-box; }
   ::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
   ::-webkit-scrollbar-button { display: none; height: 0; }
+  /* 창 오른쪽 스크롤바 숨김 (휠·터치 스크롤은 유지) */
+  html, body { scrollbar-width: none; }
+  html::-webkit-scrollbar, body::-webkit-scrollbar { display: none; width: 0; height: 0; }
+  /* 마우스로 끌어 스크롤하는 동안 잡은 손 커서 */
+  body.drag-scrolling, body.drag-scrolling * { cursor: grabbing !important; }
   svg { display: block; }
 
   /* ---------- 창 버튼 (머리 줄 오른쪽, 흰 원형) ---------- */
@@ -156,11 +161,12 @@
     font-family: "Segoe UI", "NanumSquareRound", "Malgun Gothic", sans-serif; font-weight: 600;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; word-break: normal;
   }
+  /* 한글 글꼴의 마침표는 기준선 아래로 내려가 쉼표처럼 보이므로 버전 문자열도 영문 글꼴 먼저 */
+  #localifyText, #localifyLatest { font-family: "Segoe UI", "NanumSquareRound", "Malgun Gothic", sans-serif; font-weight: 600; }
   .item-main { flex: 1; }
   .item-actions { display: flex; gap: 8px; flex: none; }
-  .account-actions { display: flex; flex-direction: column; gap: 8px; flex: 1; min-width: 150px; }
-  .account-actions .row { display: flex; gap: 8px; }
-  .account-actions .row .pill { flex: 1 1 0; min-width: 0; }
+  .account-actions { display: flex; flex-direction: column; gap: 8px; flex: none; }
+  .account-actions .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .item-sub.account { display: flex; align-items: center; gap: 7px; }
   .item-sub.account .dot { width: 9px; height: 9px; border-radius: 50%; background: #ff6b6b; }
   .item-sub.account .dot.on { background: #4cd27e; }
@@ -352,6 +358,13 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
   <section class="panel">
     <div class="panel-head"><svg class="star-l" viewBox="0 0 24 24"><path fill="currentColor" d="M12 0c1 7 5 11 12 12-7 1-11 5-12 12-1-7-5-11-12-12C7 11 11 7 12 0z"/></svg><span>Localization (Localify)</span><svg class="star-r" viewBox="0 0 32 32"><path fill="#ffb92e" d="M13 2c.8 6.2 3.8 9.2 10 10-6.2.8-9.2 3.8-10 10-.8-6.2-3.8-9.2-10-10 6.2-.8 9.2-3.8 10-10z"/><path fill="#ffffff" opacity=".9" d="M25 18c.4 3.2 1.8 4.6 5 5-3.2.4-4.6 1.8-5 5-.4-3.2-1.8-4.6-5-5 3.2-.4 4.6-1.8 5-5z"/></svg></div>
     <div class="panel-body">
+      <div class="item">
+        <div class="item-main"><div class="item-title">Installed</div><div class="item-sub account"><span class="dot" id="localifyDot"></span><span id="localifyText">Checking…</span></div></div>
+      </div>
+      <div class="item">
+        <div class="item-main"><div class="item-title">Latest release</div><div class="item-sub" id="localifyLatest">Not checked yet</div></div>
+        <div class="item-actions"><button class="pill" id="localifyCheck">Check for updates</button></div>
+      </div>
       <p class="proton-note">See the <a href="https://gakumas.natsume.io/localify/dmm-games" id="localifyGuide">Localify guide</a>.</p>
       <div class="proton-actions"><button class="pill" id="localifyInstall">Install / update Localify</button></div>
     </div>
@@ -437,6 +450,7 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
     busy = b;
     for (const id of ['folder', 'exePick', 'exeClear', 'accountBtn', 'dmmBrowserBtn', 'registerBtn', 'auto', 'closeAfter', 'vpnPick', 'vpnAuth', 'protonApply', 'protonSetup', 'protonInstallDw', 'protonRefresh', 'localifyInstall']) $(id).disabled = b;
     $('mode').querySelectorAll('button').forEach((x) => (x.disabled = b));
+    $('localifyCheck').disabled = b || localifyChecking;
     if (!b) setMeter(null);
     updateStart();
   }
@@ -645,6 +659,7 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
   };
   $('folder').onclick = async () => {
     try { render(await invoke('pick_game_folder')); if (gameFound) setStatus(''); } catch (e) { setStatus(String(e), true); }
+    refreshLocalify();
   };
   $('exePick').onclick = async () => {
     try {
@@ -739,8 +754,54 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
       window.open('https://gakumas.natsume.io/localify/dmm-games', '_blank');
     }
   };
+  // ---------- Localify ----------
+  let localifyChecking = false;
+  function renderLocalify(l) {
+    $('localifyDot').classList.toggle('on', l.installed);
+    $('localifyText').textContent = !l.installed ? 'Not installed'
+      : l.version ? `Installed (${l.version})` : 'Installed (unknown version)';
+    let latest = 'Not checked yet';
+    if (l.latest) {
+      latest = l.latest;
+      if (l.update_available) latest += ' (update available)';
+      else if (l.version === l.latest) latest += ' (up to date)';
+    }
+    $('localifyLatest').textContent = latest;
+    $('localifyLatest').title = l.checked_at ? 'Checked ' + new Date(l.checked_at * 1000).toLocaleString() : '';
+    $('localifyInstall').textContent = !l.installed ? 'Install Localify'
+      : l.update_available ? `Update Localify to ${l.latest}` : 'Reinstall Localify';
+  }
+  async function refreshLocalify() {
+    try { renderLocalify(await invoke('localify_status')); } catch (e) { log('Localify status: ' + e); }
+  }
+  // force: the button. Otherwise the launcher checks at most once every 24 hours, and only when Localify is installed.
+  async function checkLocalify(force) {
+    if (localifyChecking) return;
+    localifyChecking = true;
+    $('localifyCheck').disabled = true;
+    try {
+      const l = await invoke('localify_check', { force });
+      renderLocalify(l);
+      const found = l.update_available ? `Localify ${l.latest} is available` : '';
+      if (force) {
+        const msg = found || (l.version && l.version === l.latest ? 'Localify is up to date' : `Latest Localify release: ${l.latest}`);
+        setStatus(msg);
+        log(msg);
+      } else if (found) {
+        log(found);
+      }
+    } catch (e) {
+      if (force) setStatus(String(e), true);
+      log('Localify update check failed: ' + e);
+    } finally {
+      localifyChecking = false;
+      $('localifyCheck').disabled = busy;
+    }
+  }
+  $('localifyCheck').onclick = () => checkLocalify(true);
   $('localifyInstall').onclick = async () => {
     await run('localify_install');
+    refreshLocalify();
   };
   $('protonInstallDw').onclick = async () => {
     setBusy(true);
@@ -770,10 +831,99 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
   });
   $('winMin').onclick = () => appWindow.minimize();
 
+  // Drag to scroll with the mouse: hold the left button on the page and pull, then let go
+  // to glide with momentum. Touch and pen already scroll natively. A press only turns into
+  // a drag after a few pixels of movement, so plain clicks are unaffected; a drag that
+  // started on a button swallows that button's click.
+  (() => {
+    const scroller = document.scrollingElement;
+    const THRESHOLD = 6; // px of movement before a press becomes a drag
+    const TIME_CONSTANT = 325; // ms; how quickly the glide slows down
+    const MAX_SPEED = 6; // px/ms
+    let press = null;
+    let glide = 0;
+    let suppressClick = false;
+
+    const stopGlide = () => {
+      if (glide) cancelAnimationFrame(glide);
+      glide = 0;
+    };
+    const ignored = (el) => !el.closest('main') || el.closest('input, select, textarea, [data-tauri-drag-region]');
+
+    const startGlide = (v) => {
+      let pos = scroller.scrollTop;
+      let prev = performance.now();
+      const step = (now) => {
+        const dt = now - prev;
+        prev = now;
+        v *= Math.exp(-dt / TIME_CONSTANT);
+        const max = scroller.scrollHeight - scroller.clientHeight;
+        pos = Math.min(max, Math.max(0, pos + v * dt));
+        scroller.scrollTop = pos;
+        glide = Math.abs(v) < 0.02 || pos <= 0 || pos >= max ? 0 : requestAnimationFrame(step);
+      };
+      glide = requestAnimationFrame(step);
+    };
+
+    const finish = (e, allowGlide) => {
+      const p = press;
+      press = null;
+      if (!p || !p.dragging) return;
+      document.body.classList.remove('drag-scrolling');
+      suppressClick = true;
+      if (!allowGlide) return;
+      const first = p.samples[0];
+      const last = p.samples[p.samples.length - 1];
+      const dt = last.t - first.t;
+      if (dt <= 0 || e.timeStamp - last.t > 60) return; // paused before letting go
+      const v = Math.max(-MAX_SPEED, Math.min(MAX_SPEED, (first.y - last.y) / dt));
+      startGlide(v);
+    };
+
+    document.addEventListener('pointerdown', (e) => {
+      stopGlide();
+      suppressClick = false;
+      press = null;
+      if (e.pointerType !== 'mouse' || e.button !== 0 || ignored(e.target)) return;
+      press = { id: e.pointerId, y: e.clientY, top: scroller.scrollTop, dragging: false, samples: [] };
+    });
+
+    document.addEventListener('pointermove', (e) => {
+      if (!press || e.pointerId !== press.id) return;
+      if (!(e.buttons & 1)) return finish(e, false); // released outside the window
+      if (!press.dragging) {
+        if (Math.abs(e.clientY - press.y) < THRESHOLD) return;
+        // Start from here so the content doesn't jump by the threshold distance.
+        press.dragging = true;
+        press.y = e.clientY;
+        press.top = scroller.scrollTop;
+        document.documentElement.setPointerCapture(e.pointerId);
+        document.body.classList.add('drag-scrolling');
+      }
+      e.preventDefault();
+      scroller.scrollTop = press.top - (e.clientY - press.y);
+      press.samples.push({ t: e.timeStamp, y: e.clientY });
+      while (press.samples.length > 2 && e.timeStamp - press.samples[0].t > 100) press.samples.shift();
+    });
+
+    document.addEventListener('pointerup', (e) => { if (press && e.pointerId === press.id) finish(e, true); });
+    document.addEventListener('pointercancel', (e) => { if (press && e.pointerId === press.id) finish(e, false); });
+    document.addEventListener('click', (e) => {
+      if (!suppressClick) return;
+      suppressClick = false;
+      e.preventDefault();
+      e.stopPropagation();
+    }, true);
+    document.addEventListener('dragstart', (e) => { if (press) e.preventDefault(); });
+    document.addEventListener('wheel', stopGlide, { passive: true });
+  })();
+
   (async () => {
     updateStart();
     await refresh();
     await refreshProton();
+    // Not awaited: hashing the DLL and the daily update check must not delay an auto start.
+    refreshLocalify().then(() => checkLocalify(false));
     if (gameFound && (await invoke('take_auto_start'))) return run('start_game'); // start_game also verifies login
     if (loggedIn) {
       try { const s = await invoke('verify_login'); if (!busy) render(s); } catch {}

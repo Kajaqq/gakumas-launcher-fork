@@ -7,8 +7,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::fs;
 use std::io::{Read, Write};
+use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use md5::{Digest, Md5};
@@ -24,7 +25,7 @@ use crate::{platform, vpngate};
 pub const PRODUCT_ID: &str = "gakumas";
 const USER_AGENT: &str = "DMMGamePlayer5-Win/5.5.22 Electron/34.3.0";
 /// 이보다 최근에 받은 목록이면 "갱신" 때 다시 받지 않음 (시작할 때 받은 목록을 그대로 씀)
-const VPNGATE_RECENT: Duration = Duration::from_secs(10 * 60);
+pub const VPNGATE_RECENT: Duration = Duration::from_secs(10 * 60);
 const VPNGATE_OFFICIAL_TRIES: usize = 3;
 const VPNGATE_MORE_TRIES: usize = 5;
 /// DMM 이 VPN 서버를 거부할 때 다른 서버로 바꿔 시도하는 최대 횟수
@@ -33,7 +34,16 @@ const VPNGATE_LAUNCH_ATTEMPTS: usize = 4;
 /// 진행 상황 알림 (메시지, 진행률 0~100)
 pub type ProgressFn<'a> = &'a dyn Fn(&str, Option<f32>);
 /// 로그인 주소를 받아 로그인 완료 후의 code 를 돌려주는 함수 (UI 가 로그인 창으로 구현)
-pub type CodeFn<'a> = &'a dyn Fn(&str) -> Result<String, String>;
+pub type CodeFn<'a> = &'a dyn Fn(&str, SignIn) -> Result<String, String>;
+
+/// How the sign-in window should appear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignIn {
+    /// The user has to fill in the form, so show the window as soon as it exists.
+    Interactive,
+    /// A saved DMM browser session may finish sign-in by itself, so stay hidden briefly first.
+    ReuseSession,
+}
 pub type ProfileSetupFn<'a> = &'a dyn Fn(&str, &str) -> Result<(), String>;
 
 pub const MODE_VPNGATE: &str = "vpngate";
@@ -121,6 +131,23 @@ pub struct VpnFile {
     pub needs_auth: bool,
 }
 
+/// What the launcher last installed from Localify, and its last update check.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LocalifyRecord {
+    /// Release tag of the installed `version.dll`.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// SHA-256 (lowercase hex) of the installed `version.dll`.
+    #[serde(default)]
+    pub dll_sha256: Option<String>,
+    /// Newest release tag seen by the last successful update check.
+    #[serde(default)]
+    pub latest_tag: Option<String>,
+    /// Unix time in seconds of the last successful update check.
+    #[serde(default)]
+    pub checked_at: Option<u64>,
+}
+
 /// 프로그램 데이터 (설정, 암호화된 로그인 토큰, 기기 ID, VPN Gate 목록 캐시, VPN 설정 파일)
 pub struct Store {
     dir: PathBuf,
@@ -128,6 +155,8 @@ pub struct Store {
 // Rotation reopens the same directory through a second Store. Both writers
 // must serialize access to the shared vpngate.csv.tmp file.
 static VPNGATE_CACHE_LOCK: Mutex<()> = Mutex::new(());
+// The install and the background update check both rewrite localify.json.
+static LOCALIFY_LOCK: Mutex<()> = Mutex::new(());
 
 fn file_age(p: &Path) -> Option<Duration> {
     fs::metadata(p).ok()?.modified().ok()?.elapsed().ok()
@@ -167,6 +196,16 @@ impl Store {
     /// VPN Gate 서버 목록을 새로 받아 저장. `max_age` 보다 최근 목록이 있으면 그것을 씀.
     /// 동시에 불리면(시작할 때 받는 중에 연결 시도 등) 먼저 받는 쪽이 끝날 때까지 기다림
     pub fn refresh_vpngate_list(&self, max_age: Duration) -> Result<String, String> {
+        self.refresh_vpngate_list_with(max_age, || {
+            vpngate::fetch_server_list_raw().map_err(|e| e.to_string())
+        })
+    }
+
+    fn refresh_vpngate_list_with(
+        &self,
+        max_age: Duration,
+        fetch: impl FnOnce() -> Result<String, String>,
+    ) -> Result<String, String> {
         let _guard = VPNGATE_CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cache = self.file("vpngate.csv");
         if file_age(&cache).is_some_and(|age| age < max_age) {
@@ -174,8 +213,7 @@ impl Store {
                 return Ok(body);
             }
         }
-        let body = vpngate::fetch_server_list_raw()
-            .map_err(|e| format!("Failed to fetch the VPN Gate server list: {e}"))?;
+        let body = fetch().map_err(|e| format!("Failed to fetch the VPN Gate server list: {e}"))?;
         let tmp = self.file("vpngate.csv.tmp");
         fs::write(&tmp, &body).map_err(|e| e.to_string())?;
         fs::rename(&tmp, &cache).map_err(|e| e.to_string())?;
@@ -224,6 +262,27 @@ impl Store {
         Ok(())
     }
 
+    /// The saved Localify record, or an empty one if none was saved or it is unreadable.
+    pub fn localify(&self) -> LocalifyRecord {
+        fs::read(self.file("localify.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// Change the saved Localify record in place and return the result.
+    pub fn update_localify(&self, change: impl FnOnce(&mut LocalifyRecord)) -> Result<LocalifyRecord, String> {
+        let _guard = LOCALIFY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut record = self.localify();
+        change(&mut record);
+        let text = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
+        let tmp = self.file("localify.json.tmp");
+        fs::write(&tmp, text).map_err(|e| format!("Failed to save the Localify record: {e}"))?;
+        fs::rename(&tmp, self.file("localify.json"))
+            .map_err(|e| format!("Failed to save the Localify record: {e}"))?;
+        Ok(record)
+    }
+
     pub fn token(&self) -> Option<String> {
         let blob = fs::read(self.file("login.dat")).ok()?;
         String::from_utf8(platform::unprotect(&blob).ok()?).ok()
@@ -231,7 +290,9 @@ impl Store {
 
     pub fn save_token(&self, token: &str) -> Result<(), String> {
         let blob = platform::protect(token.as_bytes())?;
-        write_private(&self.file("login.dat"), &blob)
+        let saved = write_private(&self.file("login.dat"), &blob);
+        TOKEN_CHECKS.forget();
+        saved
     }
 
     /// 가져온 VPN 설정 파일 (개인 키가 들어 있어 DPAPI 로 암호화해 둠)
@@ -308,6 +369,7 @@ impl Store {
 
     /// 저장된 로그인 토큰 삭제. 백신 검사 등으로 잠깐 잠겨 있을 수 있어 몇 번 다시 시도
     pub fn clear_token(&self) -> Result<(), String> {
+        TOKEN_CHECKS.forget();
         let path = self.file("login.dat");
         let mut last = None;
         for _ in 0..10 {
@@ -447,18 +509,30 @@ fn direct_post(path: &str, body: &Value, token: Option<&str>) -> Result<Value, S
     serde_json::from_str(&text).map_err(|e| format!("Failed to parse the DMM response: {e}"))
 }
 
-fn direct_get_json(url: &str) -> Result<Value, String> {
-    let resp = agent()
-        .get(url)
+fn fetch_manifest_page(
+    agent: &ureq::Agent,
+    url: &tauri::Url,
+    page: u64,
+) -> Result<ManifestPageData, String> {
+    let resp = agent
+        .get(url.as_str())
         .set("User-Agent", USER_AGENT)
         .set("Client-App", "DMMGamePlayer5")
         .set("Client-version", CLIENT_VERSION)
         .call()
-        .map_err(|e| format!("Failed to connect to the DMM server ({})", describe(&e)))?;
+        .map_err(|e| format!("Failed to fetch game update manifest page {page} ({})", describe(&e)))?;
+    if resp.status() != 200 {
+        return Err(format!("Game update manifest page {page} returned HTTP {}", resp.status()));
+    }
     let text = resp
         .into_string()
-        .map_err(|e| format!("Failed to receive the DMM response: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("Failed to parse the DMM response: {e}"))
+        .map_err(|e| format!("Failed to read game update manifest page {page}: {e}"))?;
+    let response: ManifestPage = serde_json::from_str(&text)
+        .map_err(|e| format!("Invalid game update manifest page {page}: {e}"))?;
+    if let Some(code) = response.result_code.filter(|&code| code != 100) {
+        return Err(format!("Game update manifest page {page} failed (result_code {code})"));
+    }
+    Ok(response.data)
 }
 
 /// Timestamped network log so all tunnel/DNS/proxy activity is visible.
@@ -909,8 +983,13 @@ fn open_vpngate(
 // ---------------------------------------------------------------------------
 
 /// DMM 로그인. 로그인 창은 `get_code` 가 담당 (비밀번호는 이 코드가 다루지 않음)
-pub fn login(store: &Store, get_code: CodeFn, progress: ProgressFn) -> Result<String, String> {
-    progress("Checking login", None);
+pub fn login(
+    store: &Store,
+    get_code: CodeFn,
+    progress: ProgressFn,
+    sign_in: SignIn,
+) -> Result<String, String> {
+    progress("Opening DMM sign-in…", None);
     let r = direct_post("/v5/auth/login/url", &json!({ "prompt": "" }), None)?;
     let url = r["data"]["url"]
         .as_str()
@@ -921,7 +1000,7 @@ pub fn login(store: &Store, get_code: CodeFn, progress: ProgressFn) -> Result<St
             )
         })?
         .to_string();
-    let code = get_code(&url)?;
+    let code = get_code(&url, sign_in)?;
     let r = direct_post("/v5/auth/accesstoken/issue", &json!({ "code": code }), None)?;
     if r["result_code"] != 100 {
         return Err(format!(
@@ -946,9 +1025,109 @@ pub enum TokenCheck {
     Unknown,
 }
 
+/// How long a successful token check also answers later checks of the same token.
+const TOKEN_CHECK_REUSE: Duration = Duration::from_secs(60);
+
+/// Shares DMM token checks between the startup verification and Start.
+///
+/// Callers checking a token while a check of that same token is in flight wait
+/// for its result, and a `Valid` result is reused for `TOKEN_CHECK_REUSE`.
+/// Results are keyed by the token itself, and `forget` (called whenever the
+/// saved token changes) stops an in-flight check from publishing, so a result
+/// for an old token never answers for its replacement.
+struct TokenChecks {
+    state: Mutex<TokenCheckState>,
+    done: Condvar,
+}
+
+struct TokenCheckState {
+    next_id: u64,
+    entry: Option<TokenCheckEntry>,
+}
+
+struct TokenCheckEntry {
+    id: u64,
+    token: String,
+    /// `None` while the check is in flight.
+    result: Option<(TokenCheck, Instant)>,
+}
+
+/// Publishes the check's result when the checking caller finishes, or
+/// withdraws the in-flight entry if it unwinds without one.
+struct InFlightCheck<'a> {
+    checks: &'a TokenChecks,
+    id: u64,
+    result: Option<TokenCheck>,
+}
+
+impl Drop for InFlightCheck<'_> {
+    fn drop(&mut self) {
+        let mut st = self.checks.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.entry.as_ref().is_some_and(|e| e.id == self.id) {
+            match self.result {
+                Some(r) => st.entry.as_mut().unwrap().result = Some((r, Instant::now())),
+                None => st.entry = None,
+            }
+        }
+        drop(st);
+        self.checks.done.notify_all();
+    }
+}
+
+impl TokenChecks {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(TokenCheckState { next_id: 0, entry: None }),
+            done: Condvar::new(),
+        }
+    }
+
+    fn check(&self, token: &str, reuse: Duration, verify: impl FnOnce(&str) -> TokenCheck) -> TokenCheck {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Set once this caller has waited on an in-flight check of its token:
+        // it then takes that check's result whatever it is.
+        let mut joined = None;
+        loop {
+            match st.entry.as_ref().filter(|e| e.token == token) {
+                Some(e) if e.result.is_none() => {
+                    joined = Some(e.id);
+                    st = self.done.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                Some(TokenCheckEntry { id, result: Some((r, at)), .. })
+                    if joined == Some(*id) || (*r == TokenCheck::Valid && at.elapsed() < reuse) =>
+                {
+                    return *r;
+                }
+                _ => break,
+            }
+        }
+        let id = st.next_id;
+        st.next_id += 1;
+        st.entry = Some(TokenCheckEntry { id, token: token.to_string(), result: None });
+        drop(st);
+        let mut in_flight = InFlightCheck { checks: self, id, result: None };
+        let r = verify(token);
+        in_flight.result = Some(r);
+        r
+    }
+
+    /// Drop any in-flight or reusable result (the saved token changed).
+    fn forget(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).entry = None;
+        self.done.notify_all();
+    }
+}
+
+static TOKEN_CHECKS: TokenChecks = TokenChecks::new();
+
+/// 토큰이 아직 유효한지 DMM 에 확인 (같은 토큰의 진행 중인 확인 결과와 직전의 성공 결과를 함께 씀)
+pub fn check_token(token: &str) -> TokenCheck {
+    TOKEN_CHECKS.check(token, TOKEN_CHECK_REUSE, request_token_check)
+}
+
 /// 토큰이 아직 유효한지 DMM 에 확인. DMM 은 지역보다 인증을 먼저 보므로 VPN 없이 일반 회선으로 됨
 /// (만료·무효: 203 / 유효: 100, 일본 밖이면 지역 차단 801·803)
-pub fn check_token(token: &str) -> TokenCheck {
+fn request_token_check(token: &str) -> TokenCheck {
     match direct_post("/v5/userinfo", &json!({}), Some(token)) {
         Ok(r) => match r["result_code"].as_i64() {
             Some(203) => TokenCheck::Expired,
@@ -1019,15 +1198,19 @@ pub fn start_game_with_profile_setup(
     let game_type = settings.game_type.clone().unwrap_or_else(|| "GCL".into());
 
     // 저장된 토큰이 유효하면 그대로 쓰고, 만료됐으면 VPN 을 열기 전에 다시 로그인
-    progress("Checking login", None);
     let mut token = match store.token() {
-        Some(t) if check_token(&t) != TokenCheck::Expired => t,
         Some(t) => {
-            progress("Login expired, signing in again", None);
-            store.clear_token_if(&t)?;
-            login(store, get_code, progress)?
+            progress("Checking login", None);
+            if check_token(&t) == TokenCheck::Expired {
+                progress("Login expired, signing in again", None);
+                store.clear_token_if(&t)?;
+                // The DMM browser session often outlives the token, so try it silently first.
+                login(store, get_code, progress, SignIn::ReuseSession)?
+            } else {
+                t
+            }
         }
-        None => login(store, get_code, progress)?,
+        None => login(store, get_code, progress, SignIn::Interactive)?,
     };
 
     let device = store.device();
@@ -1069,7 +1252,7 @@ pub fn start_game_with_profile_setup(
             203 if !relogged => {
                 progress("A new login is required", None);
                 store.clear_token()?;
-                token = login(store, get_code, progress)?;
+                token = login(store, get_code, progress, SignIn::ReuseSession)?;
                 relogged = true;
             }
             801 | 803 if can_retry => {
@@ -1234,20 +1417,19 @@ fn remove_stale_tmp(dir: &Path, depth: u32) {
     }
 }
 
-fn md5_file(path: &Path) -> Result<String, String> {
+fn md5_file(path: &Path, buf: &mut [u8]) -> Result<String, String> {
     let mut f = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut h = Md5::new();
-    let mut buf = vec![0u8; 1 << 20];
     loop {
         let n = f
-            .read(&mut buf)
+            .read(buf)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         if n == 0 {
             break;
         }
         h.update(&buf[..n]);
     }
-    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Ok(format!("{:x}", h.finalize()))
 }
 
 fn percent_encode(s: &str) -> String {
@@ -1261,6 +1443,132 @@ fn percent_encode(s: &str) -> String {
         .collect()
 }
 
+#[derive(Deserialize)]
+struct ManifestPage {
+    result_code: Option<i64>,
+    data: ManifestPageData,
+}
+
+#[derive(Deserialize)]
+struct ManifestPageData {
+    domain: Option<String>,
+    page: Option<NonZeroU64>,
+    file_list: Vec<ManifestFile>,
+}
+
+#[derive(Deserialize)]
+struct ManifestFile {
+    local_path: String,
+    path: Option<String>,
+    size: Option<u64>,
+    hash: Option<String>,
+    #[serde(default)]
+    force_delete_flg: bool,
+    #[serde(default)]
+    check_hash_flg: bool,
+    #[serde(default)]
+    protected_flg: bool,
+}
+
+fn load_manifest(
+    agent: &ureq::Agent,
+    url: &tauri::Url,
+    game_dir: &Path,
+) -> Result<(String, Vec<(ManifestFile, PathBuf)>), String> {
+    let mut first = fetch_manifest_page(agent, url, 1)?;
+    let pages = first
+        .page
+        .ok_or("Missing page count in game update manifest")?
+        .get();
+    let domain = first
+        .domain
+        .ok_or("Missing download server in game update manifest")?;
+    let server = tauri::Url::parse(&domain).map_err(|_| "Invalid game update download server")?;
+    if !matches!(server.scheme(), "http" | "https")
+        || server.host_str().is_none()
+        || server.query().is_some()
+        || server.fragment().is_some()
+        || !server.username().is_empty()
+        || server.password().is_some()
+    {
+        return Err("Invalid game update download server".into());
+    }
+
+    let mut files = Vec::new();
+    for number in 1..=pages {
+        let page_files = if number == 1 {
+            std::mem::take(&mut first.file_list)
+        } else {
+            let mut page_url = url.clone();
+            page_url
+                .query_pairs_mut()
+                .append_pair("page", &number.to_string());
+            fetch_manifest_page(agent, &page_url, number)?.file_list
+        };
+        for (index, file) in page_files.into_iter().enumerate() {
+            let invalid = |field| {
+                format!("Invalid {field} in game update manifest page {number}, entry {}", index + 1)
+            };
+            let full =
+                resolve_game_path(game_dir, &file.local_path).ok_or_else(|| invalid("local_path"))?;
+            if !file.force_delete_flg {
+                if !file.protected_flg
+                    && !file
+                        .path
+                        .as_deref()
+                        .is_some_and(|path| !path.trim_matches('/').trim().is_empty())
+                {
+                    return Err(invalid("path"));
+                }
+                if file.check_hash_flg
+                    && !file.hash.as_deref().is_some_and(|hash| {
+                        hash.len() == 32 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+                {
+                    return Err(invalid("hash"));
+                }
+            }
+            files.push((file, full));
+        }
+    }
+    Ok((server.to_string(), files))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FileAction {
+    Keep,
+    Download,
+    Delete,
+}
+
+/// Decide what the update does with one manifest entry. A hash-checked file
+/// whose size already differs from the manifest is queued without reading it;
+/// otherwise `md5` hashes it.
+fn file_action(
+    f: &ManifestFile,
+    full: &Path,
+    md5: impl FnOnce(&Path) -> Result<String, String>,
+) -> Result<FileAction, String> {
+    let meta = fs::metadata(full).ok().filter(|m| m.is_file());
+    if f.force_delete_flg {
+        return Ok(if meta.is_some() { FileAction::Delete } else { FileAction::Keep });
+    }
+    let Some(meta) = meta else {
+        return Ok(FileAction::Download);
+    };
+    if !f.check_hash_flg {
+        return Ok(FileAction::Keep);
+    }
+    if f.size.is_some_and(|size| size != meta.len()) {
+        return Ok(FileAction::Download);
+    }
+    Ok(if md5(full)?.eq_ignore_ascii_case(f.hash.as_deref().unwrap_or_default()) {
+        FileAction::Keep
+    } else {
+        FileAction::Download
+    })
+}
+
 fn update_game(
     game_dir: &Path,
     data: &Value,
@@ -1269,75 +1577,49 @@ fn update_game(
 ) -> Result<(), String> {
     let list_url = data["file_list_url"]
         .as_str()
+        .filter(|url| url.starts_with('/'))
         .ok_or("No update information in the response")?;
     let sign = data["sign"]
         .as_str()
         .ok_or("No download signature in the response")?;
     progress("Checking files for updates", None);
-    let first = direct_get_json(&format!("https://{DMM_HOST}{list_url}"))?;
-    let domain = first["data"]["domain"]
-        .as_str()
-        .ok_or("No server address in the file list")?
-        .to_string();
-    let mut files: Vec<Value> = first["data"]["file_list"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let pages = first["data"]["page"].as_u64().unwrap_or(1);
-    for p in 2..=pages {
-        let more = direct_get_json(&format!("https://{DMM_HOST}{list_url}?page={p}"))?;
-        files.extend(
-            more["data"]["file_list"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default(),
-        );
-    }
+    let list_url = tauri::Url::parse(&format!("https://{DMM_HOST}{list_url}"))
+        .map_err(|_| "Invalid game update manifest URL")?;
+    let agent = agent();
+    let (domain, files) = load_manifest(&agent, &list_url, game_dir)?;
 
-    let mut todo: Vec<(&Value, PathBuf)> = Vec::new();
-    let mut delete: Vec<PathBuf> = Vec::new();
-    for (i, f) in files.iter().enumerate() {
+    let mut todo = Vec::new();
+    let mut delete = Vec::new();
+    let mut buf = Vec::new();
+    for (i, (f, full)) in files.iter().enumerate() {
         if i % 10 == 0 {
             progress(
                 &format!("Checking files {}/{}", i, files.len()),
                 Some(i as f32 * 100.0 / files.len().max(1) as f32),
             );
         }
-        let Some(full) = resolve_game_path(game_dir, f["local_path"].as_str().unwrap_or("")) else {
-            continue;
-        };
-        let exists = full.is_file();
-        if f["force_delete_flg"].as_bool() == Some(true) {
-            if exists {
-                delete.push(full);
-            }
-            continue;
-        }
-        if !exists {
-            todo.push((f, full));
-            continue;
-        }
-        if f["check_hash_flg"].as_bool() != Some(true) {
-            continue;
-        }
-        if md5_file(&full)? != f["hash"].as_str().unwrap_or("").to_ascii_lowercase() {
-            todo.push((f, full));
+        let action = file_action(f, full, |path| {
+            buf.resize(1 << 20, 0);
+            md5_file(path, &mut buf)
+        })?;
+        match action {
+            FileAction::Keep => {}
+            FileAction::Download => todo.push((f, full)),
+            FileAction::Delete => delete.push(full),
         }
     }
     if todo.is_empty() && delete.is_empty() {
         progress("Updating: already up to date", Some(100.0));
         return Ok(());
     }
-    if todo
-        .iter()
-        .any(|(f, _)| f["protected_flg"].as_bool() == Some(true))
-    {
+    if todo.iter().any(|(f, _)| f.protected_flg) {
         return Err("This update contains protected files that this launcher cannot download. Please update with DMM GAME PLAYER.".into());
     }
-    let total: u64 = todo
-        .iter()
-        .map(|(f, _)| f["size"].as_u64().unwrap_or(0))
-        .sum();
+    let total = todo.iter().try_fold(0u64, |total, (f, _)| {
+        total
+            .checked_add(f.size.unwrap_or(0))
+            .ok_or("Invalid total game update size")
+    })?;
     progress(
         &format!(
             "Updating: {} files, {:.0} MB",
@@ -1349,7 +1631,7 @@ fn update_game(
     if dry_run {
         for (f, _) in &todo {
             progress(
-                &format!("Updating: file to download: {}", f["local_path"].as_str().unwrap_or("")),
+                &format!("Updating: file to download: {}", f.local_path),
                 None,
             );
         }
@@ -1380,15 +1662,14 @@ fn update_game(
         percent_encode(key_pair)
     );
 
-    let agent = agent();
     let mut done: u64 = 0;
-    let mut buf = vec![0u8; 256 * 1024];
-    for (n, (f, full)) in todo.iter().enumerate() {
-        let local = f["local_path"].as_str().unwrap_or("");
+    buf.resize(256 * 1024, 0);
+    for (n, &(f, full)) in todo.iter().enumerate() {
+        let local = &f.local_path;
         let url = format!(
             "{}/{}?{}",
             domain.trim_end_matches('/'),
-            f["path"].as_str().unwrap_or("").trim_start_matches('/'),
+            f.path.as_deref().unwrap_or_default().trim_start_matches('/'),
             query
         );
         if let Some(parent) = full.parent() {
@@ -1406,6 +1687,7 @@ fn update_game(
                 .map_err(|e| format!("Failed to download {local} ({})", describe(&e)))?;
             let mut reader = resp.into_reader();
             let mut out = fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+            let mut hash = f.check_hash_flg.then(Md5::new);
             let mut last_report = 0u64;
             loop {
                 let k = reader
@@ -1414,8 +1696,12 @@ fn update_game(
                 if k == 0 {
                     break;
                 }
-                out.write_all(&buf[..k])
+                let chunk = &buf[..k];
+                out.write_all(chunk)
                     .map_err(|e| format!("{}: {e}", tmp.display()))?;
+                if let Some(hash) = &mut hash {
+                    hash.update(chunk);
+                }
                 done += k as u64;
                 if done - last_report >= 2 * 1_048_576 {
                     last_report = done;
@@ -1426,9 +1712,10 @@ fn update_game(
                 }
             }
             drop(out);
-            if f["check_hash_flg"].as_bool() == Some(true)
-                && md5_file(&tmp)? != f["hash"].as_str().unwrap_or("").to_ascii_lowercase()
-            {
+            if hash.is_some_and(|hash| {
+                !format!("{:x}", hash.finalize())
+                    .eq_ignore_ascii_case(f.hash.as_deref().unwrap_or_default())
+            }) {
                 return Err(format!("{local}: downloaded file hash mismatch"));
             }
             fs::rename(&tmp, full)
@@ -1443,7 +1730,7 @@ fn update_game(
             Some(done as f32 * 100.0 / total.max(1) as f32),
         );
     }
-    for d in &delete {
+    for d in delete {
         fs::remove_file(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
     progress("Updating: complete", Some(100.0));
@@ -1453,6 +1740,192 @@ fn update_game(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    /// A verifier that counts its calls and takes `delay` to answer.
+    fn counted(calls: &AtomicUsize, delay: Duration, result: TokenCheck) -> impl FnOnce(&str) -> TokenCheck + '_ {
+        move |_: &str| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            thread::sleep(delay);
+            result
+        }
+    }
+
+    #[test]
+    fn concurrent_and_recent_token_checks_share_one_request() {
+        let checks = TokenChecks::new();
+        let calls = AtomicUsize::new(0);
+        let delay = Duration::from_millis(300);
+        thread::scope(|s| {
+            let startup = s.spawn(|| checks.check("t", TOKEN_CHECK_REUSE, counted(&calls, delay, TokenCheck::Valid)));
+            thread::sleep(Duration::from_millis(50));
+            let start = checks.check("t", TOKEN_CHECK_REUSE, counted(&calls, delay, TokenCheck::Valid));
+            assert_eq!(start, TokenCheck::Valid);
+            assert_eq!(startup.join().unwrap(), TokenCheck::Valid);
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Right after a successful check, the result is reused.
+        assert_eq!(checks.check("t", TOKEN_CHECK_REUSE, |_| panic!("not reused")), TokenCheck::Valid);
+        // A different token is checked on its own.
+        assert_eq!(checks.check("other", TOKEN_CHECK_REUSE, counted(&calls, Duration::ZERO, TokenCheck::Valid)), TokenCheck::Valid);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // Once the reuse window has passed, the token is checked again.
+        assert_eq!(checks.check("other", Duration::ZERO, counted(&calls, Duration::ZERO, TokenCheck::Valid)), TokenCheck::Valid);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn only_valid_token_checks_are_reused() {
+        let checks = TokenChecks::new();
+        let calls = AtomicUsize::new(0);
+        for result in [TokenCheck::Expired, TokenCheck::Unknown] {
+            assert_eq!(checks.check("t", TOKEN_CHECK_REUSE, counted(&calls, Duration::ZERO, result)), result);
+        }
+        assert_eq!(checks.check("t", TOKEN_CHECK_REUSE, counted(&calls, Duration::ZERO, TokenCheck::Valid)), TokenCheck::Valid);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn waiters_share_an_unsuccessful_in_flight_result() {
+        let checks = TokenChecks::new();
+        let calls = AtomicUsize::new(0);
+        thread::scope(|s| {
+            let first = s.spawn(|| checks.check("t", TOKEN_CHECK_REUSE, counted(&calls, Duration::from_millis(300), TokenCheck::Unknown)));
+            thread::sleep(Duration::from_millis(50));
+            assert_eq!(checks.check("t", TOKEN_CHECK_REUSE, |_| panic!("joined check repeated")), TokenCheck::Unknown);
+            assert_eq!(first.join().unwrap(), TokenCheck::Unknown);
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn replaced_token_is_not_answered_by_the_old_check() {
+        let checks = TokenChecks::new();
+        let calls = AtomicUsize::new(0);
+        thread::scope(|s| {
+            let old = s.spawn(|| checks.check("old", TOKEN_CHECK_REUSE, counted(&calls, Duration::from_millis(300), TokenCheck::Valid)));
+            thread::sleep(Duration::from_millis(50));
+            // The saved token is replaced while the old check is in flight.
+            checks.forget();
+            assert_eq!(checks.check("new", TOKEN_CHECK_REUSE, counted(&calls, Duration::ZERO, TokenCheck::Expired)), TokenCheck::Expired);
+            assert_eq!(old.join().unwrap(), TokenCheck::Valid);
+        });
+        // The old token's late Valid result was not published for later callers.
+        assert_eq!(checks.check("old", TOKEN_CHECK_REUSE, counted(&calls, Duration::ZERO, TokenCheck::Expired)), TokenCheck::Expired);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn forgetting_releases_waiters_to_check_again() {
+        let checks = TokenChecks::new();
+        let calls = AtomicUsize::new(0);
+        thread::scope(|s| {
+            let first = s.spawn(|| checks.check("t", TOKEN_CHECK_REUSE, counted(&calls, Duration::from_millis(400), TokenCheck::Valid)));
+            let waiter = s.spawn(|| {
+                thread::sleep(Duration::from_millis(50));
+                checks.check("t", TOKEN_CHECK_REUSE, counted(&calls, Duration::ZERO, TokenCheck::Expired))
+            });
+            thread::sleep(Duration::from_millis(150));
+            checks.forget();
+            assert_eq!(waiter.join().unwrap(), TokenCheck::Expired);
+            assert_eq!(first.join().unwrap(), TokenCheck::Valid);
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn manifest_file(size: Option<u64>, hash: &str, check_hash: bool, force_delete: bool) -> ManifestFile {
+        ManifestFile {
+            local_path: "f.bin".into(),
+            path: Some("/f.bin".into()),
+            size,
+            hash: Some(hash.into()),
+            force_delete_flg: force_delete,
+            check_hash_flg: check_hash,
+            protected_flg: false,
+        }
+    }
+
+    #[test]
+    fn update_scan_queues_size_mismatches_without_hashing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        fs::write(&path, b"0123456789").unwrap();
+        let mut buf = vec![0; 64];
+        let hash = md5_file(&path, &mut buf).unwrap();
+        let md5 = |p: &Path| md5_file(p, &mut vec![0; 64]);
+        let no_read = |_: &Path| -> Result<String, String> { panic!("file was read") };
+
+        // Truncated: the size differs, so it is queued without reading.
+        assert_eq!(file_action(&manifest_file(Some(20), &hash, true, false), &path, no_read), Ok(FileAction::Download));
+        // Intact.
+        assert_eq!(file_action(&manifest_file(Some(10), &hash, true, false), &path, md5), Ok(FileAction::Keep));
+        // Same size but corrupt: found by hashing.
+        let hashed = AtomicUsize::new(0);
+        let counted_md5 = |p: &Path| { hashed.fetch_add(1, Ordering::SeqCst); md5(p) };
+        let other = "0".repeat(32);
+        assert_eq!(file_action(&manifest_file(Some(10), &other, true, false), &path, counted_md5), Ok(FileAction::Download));
+        assert_eq!(hashed.load(Ordering::SeqCst), 1);
+        // No size in the manifest: still hashed.
+        assert_eq!(file_action(&manifest_file(None, &hash, true, false), &path, md5), Ok(FileAction::Keep));
+        assert_eq!(file_action(&manifest_file(None, &other, true, false), &path, md5), Ok(FileAction::Download));
+        // Not hash-checked: kept as before, even with a different size.
+        assert_eq!(file_action(&manifest_file(Some(20), &other, false, false), &path, no_read), Ok(FileAction::Keep));
+        // Force delete.
+        assert_eq!(file_action(&manifest_file(Some(10), &hash, true, true), &path, no_read), Ok(FileAction::Delete));
+        let missing = dir.path().join("missing.bin");
+        assert_eq!(file_action(&manifest_file(Some(10), &hash, true, true), &missing, no_read), Ok(FileAction::Keep));
+        assert_eq!(file_action(&manifest_file(Some(10), &hash, true, false), &missing, no_read), Ok(FileAction::Download));
+    }
+
+    #[test]
+    fn vpngate_list_refresh_honors_cache_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        let downloads = AtomicUsize::new(0);
+        let fetch = |body: &'static str| {
+            let downloads = &downloads;
+            move || {
+                downloads.fetch_add(1, Ordering::SeqCst);
+                Ok(body.to_string())
+            }
+        };
+
+        // Missing cache: downloaded once, then fresh for the next refreshes (a quick restart).
+        assert_eq!(store.refresh_vpngate_list_with(VPNGATE_RECENT, fetch("first")), Ok("first".into()));
+        assert_eq!(store.refresh_vpngate_list_with(VPNGATE_RECENT, fetch("second")), Ok("first".into()));
+        assert_eq!(store.refresh_vpngate_list_with(VPNGATE_RECENT, fetch("second")), Ok("first".into()));
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+
+        // Expired cache whose refresh fails: the error is reported and the stale list is kept for fallback.
+        let failed = store.refresh_vpngate_list_with(Duration::ZERO, || Err("offline".into()));
+        assert!(failed.unwrap_err().contains("offline"));
+        assert_eq!(store.cached_vpngate_list().as_deref(), Some("first"));
+
+        // Expired cache: downloaded again.
+        assert_eq!(store.refresh_vpngate_list_with(Duration::ZERO, fetch("second")), Ok("second".into()));
+        assert_eq!(downloads.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn overlapping_vpngate_refreshes_share_one_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        let downloads = AtomicUsize::new(0);
+        let fetch = || {
+            downloads.fetch_add(1, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(200));
+            Ok("list".to_string())
+        };
+        thread::scope(|s| {
+            let startup = s.spawn(|| store.refresh_vpngate_list_with(VPNGATE_RECENT, fetch));
+            thread::sleep(Duration::from_millis(50));
+            assert_eq!(store.refresh_vpngate_list_with(VPNGATE_RECENT, fetch), Ok("list".into()));
+            assert_eq!(startup.join().unwrap(), Ok("list".into()));
+        });
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn terms_confirmation_is_checked_and_not_repeated() {
@@ -1492,5 +1965,83 @@ mod tests {
         );
         // Parent-directory escapes are still rejected.
         assert!(resolve_game_path(root, r"..\outside").is_none());
+    }
+
+    fn manifest_server(
+        pages: Vec<(&'static str, Value)>,
+    ) -> (tauri::Url, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/manifest?revision=1", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            // Every page must use the same HTTP/1.1 connection.
+            let (stream, _) = listener.accept().unwrap();
+            drop(listener);
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut stream = BufReader::new(stream);
+            for (target, response) in pages {
+                let mut line = String::new();
+                stream.read_line(&mut line).unwrap();
+                assert_eq!(line, format!("GET {target} HTTP/1.1\r\n"));
+                loop {
+                    line.clear();
+                    assert_ne!(stream.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let response = response.to_string();
+                write!(
+                    stream.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{response}",
+                    response.len()
+                ).unwrap();
+            }
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn manifest_loads_all_pages_over_one_connection() {
+        let (url, server) = manifest_server(vec![
+            ("/manifest?revision=1", json!({"result_code": 100, "data": {
+                "domain": "https://cdn.example/", "page": 2,
+                "file_list": [{"local_path": "new.bin", "path": "/new.bin"}]
+            }})),
+            ("/manifest?revision=1&page=2", json!({"data": {
+                "file_list": [{"local_path": "old.bin", "force_delete_flg": true}]
+            }})),
+        ]);
+        let agent = ureq::AgentBuilder::new().try_proxy_from_env(false).build();
+        let root = Path::new("game");
+        let (domain, files) = load_manifest(&agent, &url, root).unwrap();
+        server.join().unwrap();
+        assert_eq!(domain, "https://cdn.example/");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].1, root.join("new.bin"));
+        assert!(files[1].0.force_delete_flg);
+    }
+
+    #[test]
+    fn manifest_rejects_a_missing_list_or_invalid_file_on_a_later_page() {
+        for data in [
+            json!({}),
+            json!({"file_list": [{"local_path": "new.bin", "path": "new.bin", "check_hash_flg": true}]}),
+        ] {
+            let (url, server) = manifest_server(vec![
+                ("/manifest?revision=1", json!({"data": {
+                    "domain": "https://cdn.example/", "page": 2, "file_list": []
+                }})),
+                ("/manifest?revision=1&page=2", json!({"data": data})),
+            ]);
+            let agent = ureq::AgentBuilder::new().try_proxy_from_env(false).build();
+            let result = load_manifest(&agent, &url, Path::new("game"));
+            server.join().unwrap();
+            assert!(matches!(result, Err(message) if message.contains("manifest page 2")));
+        }
     }
 }

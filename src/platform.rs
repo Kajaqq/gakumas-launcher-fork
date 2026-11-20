@@ -44,6 +44,15 @@ pub fn user_profile_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Whether the user's display language is Chinese (any region).
+#[cfg(windows)]
+pub fn system_language_is_chinese() -> bool {
+    const LANG_CHINESE: u16 = 0x04;
+    // The low 10 bits of a LANGID are the primary language.
+    let langid = unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() };
+    langid & 0x3ff == LANG_CHINESE
+}
+
 // ---------------------------------------------------------------------------
 // Linux / other Unix: std-only implementations.
 // ---------------------------------------------------------------------------
@@ -222,12 +231,43 @@ mod unix {
     pub fn user_profile_dir() -> Option<PathBuf> {
         prefix_user_dir()
     }
+
+    /// Whether the user's display language is Chinese, following the usual
+    /// precedence of the locale environment variables.
+    pub fn system_language_is_chinese() -> bool {
+        ["LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"]
+            .iter()
+            .find_map(|key| std::env::var(key).ok().filter(|v| !v.is_empty()))
+            .is_some_and(|value| locale_is_chinese(&value))
+    }
+
+    /// `LANGUAGE` may list several languages separated by colons; the first one wins.
+    pub(super) fn locale_is_chinese(value: &str) -> bool {
+        let first = value.split(':').next().unwrap_or_default();
+        first.get(..2).is_some_and(|lang| lang.eq_ignore_ascii_case("zh"))
+            && first[2..].chars().next().map_or(true, |c| matches!(c, '_' | '-' | '.' | '@'))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::locale_is_chinese;
+
+        #[test]
+        fn chinese_locales_are_recognized() {
+            for value in ["zh_CN.UTF-8", "zh_TW", "zh", "zh-HK", "zh_CN:en_US", "ZH_cn"] {
+                assert!(locale_is_chinese(value), "{value}");
+            }
+            for value in ["en_US.UTF-8", "ja_JP", "C", "zha", "en_US:zh_CN"] {
+                assert!(!locale_is_chinese(value), "{value}");
+            }
+        }
+    }
 }
 
 #[cfg(not(windows))]
 pub use unix::{
     appdata_dir, is_process_running, protect, unprotect, unprotect_powershell_secure_string,
-    user_profile_dir,
+    system_language_is_chinese, user_profile_dir,
 };
 
 #[cfg(not(windows))]

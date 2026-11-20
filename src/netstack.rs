@@ -426,7 +426,7 @@ impl TunnelStack {
                     None,
                     &query,
                     Duration::from_secs(6),
-                    dns_tcp_complete,
+                    Completion::Custom(dns_tcp_complete),
                 )
                 .and_then(|raw| dns_answer(&raw, id));
             match answer {
@@ -596,7 +596,7 @@ impl TunnelStack {
             Some(ip) => ip,
             None => resolve_v4(host)?,
         };
-        let mut exchange = Exchange::new(host, tls, req, timeout, http::is_complete)?;
+        let mut exchange = Exchange::new(host, tls, req, timeout, Completion::http())?;
         let handle = lock()?.start_socket(ip, port)?;
         let result = loop {
             let tick = {
@@ -623,7 +623,7 @@ impl TunnelStack {
         req: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, String> {
-        self.request_ip_until(ip, host, port, tls, req, timeout, http::is_complete)
+        self.request_ip_until(ip, host, port, tls, req, timeout, Completion::http())
     }
 
     /// `ip` 로 접속해 요청을 보내고, `complete` 가 참이 되거나 연결이 닫힐 때까지 응답을 받음
@@ -636,7 +636,7 @@ impl TunnelStack {
         tls: Option<Arc<ClientConfig>>,
         req: &[u8],
         timeout: Duration,
-        complete: fn(&[u8]) -> bool,
+        complete: Completion,
     ) -> Result<Vec<u8>, String> {
         let mut exchange = Exchange::new(host, tls, req, timeout, complete)?;
         let h = self.start_socket(ip, port)?;
@@ -666,13 +666,34 @@ impl TunnelStack {
     }
 }
 
+/// Decides when an exchange has received its whole response.
+enum Completion {
+    /// HTTP framing, tracked incrementally across reads.
+    Http(http::ResponseFraming),
+    /// A stateless check of the whole buffer (used for small, non-HTTP replies).
+    Custom(fn(&[u8]) -> bool),
+}
+
+impl Completion {
+    fn http() -> Self {
+        Self::Http(http::ResponseFraming::default())
+    }
+
+    fn check(&mut self, resp: &[u8]) -> bool {
+        match self {
+            Self::Http(framing) => framing.is_complete(resp),
+            Self::Custom(complete) => complete(resp),
+        }
+    }
+}
+
 struct Exchange {
     deadline: Instant,
     conn: Option<ClientConnection>,
     outgoing: Vec<u8>,
     response: Vec<u8>,
     connected: bool,
-    complete: fn(&[u8]) -> bool,
+    complete: Completion,
 }
 
 impl Exchange {
@@ -681,7 +702,7 @@ impl Exchange {
         tls: Option<Arc<ClientConfig>>,
         req: &[u8],
         timeout: Duration,
-        complete: fn(&[u8]) -> bool,
+        complete: Completion,
     ) -> Result<Self, String> {
         let conn = match tls {
             Some(cfg) => {
@@ -743,7 +764,7 @@ impl Exchange {
             } else {
                 self.response.extend_from_slice(&buf[..n]);
             }
-            if (self.complete)(&self.response) || tls_closed {
+            if self.complete.check(&self.response) || tls_closed {
                 return Ok(true);
             }
         }

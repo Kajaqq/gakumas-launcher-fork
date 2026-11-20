@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
-use gakumas_launcher::launcher::{self, Status, Store};
+use gakumas_launcher::launcher::{self, SignIn, Status, Store};
+use gakumas_launcher::localify;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -67,9 +68,19 @@ static LOGIN_SEQ: AtomicUsize = AtomicUsize::new(0);
 /// 로그인이 끝나면 이 주소로 넘어가며 code 를 넘겨줌 (원래는 DMM 플레이어를 여는 페이지)
 const LOGIN_SUCCESS_HOST: &str = "webdgp-gameplayer.games.dmm.com";
 
+/// How long a hidden login window may finish on a saved DMM session before it is shown.
+const SILENT_LOGIN_WAIT: Duration = Duration::from_secs(6);
+const LOGIN_FORM_WAIT: Duration = Duration::from_secs(900);
+
 /// 로그인 창을 띄워 로그인 완료 주소의 code 를 받아 옴.
-/// 저장된 로그인 상태로 바로 지나가면 창을 보이지 않은 채로 끝남
-fn login_window(app: &AppHandle, url: &str, cookies: &RefCell<Option<cookie_store::CookieStore>>) -> Result<String, String> {
+/// `SignIn::Interactive` shows the window as soon as it is built. With
+/// `SignIn::ReuseSession` a saved DMM session can finish without ever showing it.
+fn login_window(
+    app: &AppHandle,
+    url: &str,
+    sign_in: SignIn,
+    cookies: &RefCell<Option<cookie_store::CookieStore>>,
+) -> Result<String, String> {
     cookies.replace(None);
     let target: tauri::Url = url.parse().map_err(|e| format!("Invalid login URL: {e}"))?;
     let (tx, rx) = mpsc::channel::<Option<String>>();
@@ -103,15 +114,24 @@ fn login_window(app: &AppHandle, url: &str, cookies: &RefCell<Option<cookie_stor
     });
     drop(tx);
 
-    let code = match rx.recv_timeout(Duration::from_secs(6)) {
-        Ok(c) => c,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            emit_progress(app, "Please sign in in the login window", None);
-            let _ = win.show();
-            let _ = win.set_focus();
-            rx.recv_timeout(Duration::from_secs(900)).ok().flatten()
+    let show = || {
+        emit_progress(app, "Please sign in in the login window", None);
+        let _ = win.show();
+        let _ = win.set_focus();
+    };
+    let code = match sign_in {
+        SignIn::Interactive => {
+            show();
+            rx.recv_timeout(LOGIN_FORM_WAIT).ok().flatten()
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => None,
+        SignIn::ReuseSession => match rx.recv_timeout(SILENT_LOGIN_WAIT) {
+            Ok(c) => c,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                show();
+                rx.recv_timeout(LOGIN_FORM_WAIT).ok().flatten()
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => None,
+        },
     };
     if code.is_some() {
         // This is already a blocking worker, not the WebView event thread.
@@ -348,7 +368,7 @@ async fn start_game(app: AppHandle) -> Result<String, String> {
     let result = run_busy(app.clone(), |app, store| {
         let progress = |m: &str, p: Option<f32>| emit_progress(app, m, p);
         let captured = RefCell::new(None);
-        let get_code = |url: &str| login_window(app, url, &captured);
+        let get_code = |url: &str, sign_in: SignIn| login_window(app, url, sign_in, &captured);
         let apply_profile = |mode: &str, token: &str| {
             let state = app.state::<AppState>();
             let mut session = state.profile_session.lock().map_err(|_| "DMM profile session state unavailable")?;
@@ -373,11 +393,15 @@ async fn start_game(app: AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 async fn login(app: AppHandle) -> Result<String, String> {
-    run_busy(app, |app, store| {
+    login_with(app, SignIn::Interactive).await
+}
+
+async fn login_with(app: AppHandle, sign_in: SignIn) -> Result<String, String> {
+    run_busy(app, move |app, store| {
         let progress = |m: &str, p: Option<f32>| emit_progress(app, m, p);
         let captured = RefCell::new(None);
-        let get_code = |url: &str| login_window(app, url, &captured);
-        let token = launcher::login(store, &get_code, &progress)?;
+        let get_code = |url: &str, sign_in: SignIn| login_window(app, url, sign_in, &captured);
+        let token = launcher::login(store, &get_code, &progress, sign_in)?;
         *app.state::<AppState>().profile_session.lock().unwrap() = captured.into_inner()
             .map(|jar| profile_setup::Session::new(&token, jar));
         Ok("Logged in".into())
@@ -564,8 +588,10 @@ async fn open_dmm_registration(app: AppHandle) -> Result<String, String> {
     wait.recv().await.ok_or("Could not observe the DMM registration window closing")?;
     // Use the same direct login flow as the menu's Login button, including
     // capture of the session needed by windowless profile setup later on.
+    // The account was just signed in inside the registration window, so let
+    // that browser session finish sign-in without flashing the login window.
     if state.store.token().is_none() {
-        return login(app.clone()).await;
+        return login_with(app.clone(), SignIn::ReuseSession).await;
     }
     Ok("Registration window closed; kept the current launcher login".into())
 }
@@ -672,6 +698,25 @@ async fn localify_install(app: AppHandle) -> Result<String, String> {
     .await
 }
 
+/// Installed Localify release, from the saved record and the DLL's SHA-256 (no network).
+#[tauri::command]
+async fn localify_status(app: AppHandle) -> Result<localify::Status, String> {
+    tauri::async_runtime::spawn_blocking(move || localify::status(&app.state::<AppState>().store))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Look up the newest Localify release. Without `force` it only runs once every 24 hours.
+/// It does not take the busy flag, so it never blocks a game start.
+#[tauri::command]
+async fn localify_check(app: AppHandle, force: bool) -> Result<localify::Status, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        localify::check_for_updates(&app.state::<AppState>().store, force)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// 화면(작업 표시줄 제외)보다 창이 크면 높이를 줄여 화면 안에 들어오게 함.
 /// 이때만 내용이 길면 스크롤이 생기고, 보통 화면에서는 기본 높이(스크롤 없음)를 그대로 씀
 fn fit_to_screen(win: &tauri::WebviewWindow) {
@@ -736,13 +781,14 @@ fn main() {
                 profile_session: Mutex::new(None),
             });
             // 시작하자마자 VPN Gate 서버 목록을 새로 받아 둠 (게임 시작은 받는 동안에도 쓰쿠바대 서버로 먼저 시도)
+            // A list saved within the last ten minutes is still fresh, so a quick restart downloads nothing.
             if vpngate_mode {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
                     let _ = handle
                         .state::<AppState>()
                         .store
-                        .refresh_vpngate_list(Duration::ZERO);
+                        .refresh_vpngate_list(launcher::VPNGATE_RECENT);
                 });
             }
             Ok(())
@@ -769,6 +815,8 @@ fn main() {
             proton_setup,
             proton_install_dw,
             localify_install,
+            localify_status,
+            localify_check,
             open_dmm_browser,
             open_dmm_registration,
             dmm_browser_navigate
