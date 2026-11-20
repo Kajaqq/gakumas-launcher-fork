@@ -47,6 +47,9 @@
   ::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 999px; background: #cfcac6 padding-box; }
   ::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
   ::-webkit-scrollbar-button { display: none; height: 0; }
+  /* 창 오른쪽 스크롤바 숨김 (휠·터치 스크롤은 유지) */
+  html, body { scrollbar-width: none; }
+  html::-webkit-scrollbar, body::-webkit-scrollbar { display: none; width: 0; height: 0; }
   svg { display: block; }
 
   /* ---------- 창 버튼 (머리 줄 오른쪽, 흰 원형) ---------- */
@@ -156,11 +159,12 @@
     font-family: "Segoe UI", "NanumSquareRound", "Malgun Gothic", sans-serif; font-weight: 600;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; word-break: normal;
   }
+  /* 한글 글꼴의 마침표는 기준선 아래로 내려가 쉼표처럼 보이므로 버전 문자열도 영문 글꼴 먼저 */
+  #localifyText, #localifyLatest { font-family: "Segoe UI", "NanumSquareRound", "Malgun Gothic", sans-serif; font-weight: 600; }
   .item-main { flex: 1; }
   .item-actions { display: flex; gap: 8px; flex: none; }
-  .account-actions { display: flex; flex-direction: column; gap: 8px; flex: 1; min-width: 150px; }
-  .account-actions .row { display: flex; gap: 8px; }
-  .account-actions .row .pill { flex: 1 1 0; min-width: 0; }
+  .account-actions { display: flex; flex-direction: column; gap: 8px; flex: none; }
+  .account-actions .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .item-sub.account { display: flex; align-items: center; gap: 7px; }
   .item-sub.account .dot { width: 9px; height: 9px; border-radius: 50%; background: #ff6b6b; }
   .item-sub.account .dot.on { background: #4cd27e; }
