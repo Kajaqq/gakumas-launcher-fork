@@ -71,7 +71,7 @@ fn main() {
         Some(p) => println!("{:>6} ms  [{p:5.1}%] {m}", t0.elapsed().as_millis()),
         None => println!("{:>6} ms  {m}", t0.elapsed().as_millis()),
     };
-    let no_login = |_: &str| -> Result<String, String> {
+    let no_login = |_: &str, _: launcher::SignIn| -> Result<String, String> {
         Err("This test program cannot open a login window".into())
     };
     match launcher::start_game(&store, &no_login, &progress, launch) {

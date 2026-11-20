@@ -34,7 +34,16 @@ const VPNGATE_LAUNCH_ATTEMPTS: usize = 4;
 /// 진행 상황 알림 (메시지, 진행률 0~100)
 pub type ProgressFn<'a> = &'a dyn Fn(&str, Option<f32>);
 /// 로그인 주소를 받아 로그인 완료 후의 code 를 돌려주는 함수 (UI 가 로그인 창으로 구현)
-pub type CodeFn<'a> = &'a dyn Fn(&str) -> Result<String, String>;
+pub type CodeFn<'a> = &'a dyn Fn(&str, SignIn) -> Result<String, String>;
+
+/// How the sign-in window should appear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignIn {
+    /// The user has to fill in the form, so show the window as soon as it exists.
+    Interactive,
+    /// A saved DMM browser session may finish sign-in by itself, so stay hidden briefly first.
+    ReuseSession,
+}
 pub type ProfileSetupFn<'a> = &'a dyn Fn(&str, &str) -> Result<(), String>;
 
 pub const MODE_VPNGATE: &str = "vpngate";
@@ -922,8 +931,13 @@ fn open_vpngate(
 // ---------------------------------------------------------------------------
 
 /// DMM 로그인. 로그인 창은 `get_code` 가 담당 (비밀번호는 이 코드가 다루지 않음)
-pub fn login(store: &Store, get_code: CodeFn, progress: ProgressFn) -> Result<String, String> {
-    progress("Checking login", None);
+pub fn login(
+    store: &Store,
+    get_code: CodeFn,
+    progress: ProgressFn,
+    sign_in: SignIn,
+) -> Result<String, String> {
+    progress("Opening DMM sign-in…", None);
     let r = direct_post("/v5/auth/login/url", &json!({ "prompt": "" }), None)?;
     let url = r["data"]["url"]
         .as_str()
@@ -934,7 +948,7 @@ pub fn login(store: &Store, get_code: CodeFn, progress: ProgressFn) -> Result<St
             )
         })?
         .to_string();
-    let code = get_code(&url)?;
+    let code = get_code(&url, sign_in)?;
     let r = direct_post("/v5/auth/accesstoken/issue", &json!({ "code": code }), None)?;
     if r["result_code"] != 100 {
         return Err(format!(
@@ -1032,15 +1046,19 @@ pub fn start_game_with_profile_setup(
     let game_type = settings.game_type.clone().unwrap_or_else(|| "GCL".into());
 
     // 저장된 토큰이 유효하면 그대로 쓰고, 만료됐으면 VPN 을 열기 전에 다시 로그인
-    progress("Checking login", None);
     let mut token = match store.token() {
-        Some(t) if check_token(&t) != TokenCheck::Expired => t,
         Some(t) => {
-            progress("Login expired, signing in again", None);
-            store.clear_token_if(&t)?;
-            login(store, get_code, progress)?
+            progress("Checking login", None);
+            if check_token(&t) == TokenCheck::Expired {
+                progress("Login expired, signing in again", None);
+                store.clear_token_if(&t)?;
+                // The DMM browser session often outlives the token, so try it silently first.
+                login(store, get_code, progress, SignIn::ReuseSession)?
+            } else {
+                t
+            }
         }
-        None => login(store, get_code, progress)?,
+        None => login(store, get_code, progress, SignIn::Interactive)?,
     };
 
     let device = store.device();
@@ -1082,7 +1100,7 @@ pub fn start_game_with_profile_setup(
             203 if !relogged => {
                 progress("A new login is required", None);
                 store.clear_token()?;
-                token = login(store, get_code, progress)?;
+                token = login(store, get_code, progress, SignIn::ReuseSession)?;
                 relogged = true;
             }
             801 | 803 if can_retry => {
