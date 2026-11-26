@@ -142,19 +142,25 @@ pub struct LocalifyRecord {
     pub dll_sha256: Option<String>,
 }
 
-/// The last update check. The launcher and Localify are checked together,
-/// so they share one clock.
+/// Saved update lookups. The daily check on launch looks up the launcher and
+/// Localify together on one clock; a button looks up only its own component.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct UpdateCheck {
-    /// Unix time in seconds of the last check where every lookup succeeded.
+    /// Unix time in seconds of the last daily check where every lookup succeeded.
     #[serde(default)]
     pub checked_at: Option<u64>,
     /// Newest launcher release tag for this platform.
     #[serde(default)]
     pub launcher: Option<String>,
+    /// Unix time in seconds the launcher's releases were last looked up.
+    #[serde(default)]
+    pub launcher_checked_at: Option<u64>,
     /// Newest Localify release tag.
     #[serde(default)]
     pub localify: Option<String>,
+    /// Unix time in seconds Localify's releases were last looked up.
+    #[serde(default)]
+    pub localify_checked_at: Option<u64>,
 }
 
 /// 프로그램 데이터 (설정, 암호화된 로그인 토큰, 기기 ID, VPN Gate 목록 캐시, VPN 설정 파일)

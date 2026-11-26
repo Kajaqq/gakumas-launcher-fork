@@ -723,11 +723,11 @@ async fn updates_status(app: AppHandle) -> Result<updates::Updates, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Check for launcher and Localify updates. Without `force` it runs at most once
-/// every 24 hours. It does not take the busy flag, so it never blocks a game start.
+/// Check for updates in `scope`: "daily" (both, at most once every 24 hours) or one panel's
+/// component ("launcher", "localify"). It does not take the busy flag, so it never blocks a game start.
 #[tauri::command]
-async fn updates_check(app: AppHandle, force: bool) -> Result<updates::Updates, String> {
-    tauri::async_runtime::spawn_blocking(move || updates::check(&app.state::<AppState>().store, force))
+async fn updates_check(app: AppHandle, scope: updates::Scope) -> Result<updates::Updates, String> {
+    tauri::async_runtime::spawn_blocking(move || updates::check(&app.state::<AppState>().store, scope))
         .await
         .map_err(|e| e.to_string())?
 }

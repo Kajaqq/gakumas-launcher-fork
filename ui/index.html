@@ -767,10 +767,9 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
       window.open('https://gakumas.natsume.io/localify/dmm-games', '_blank');
     }
   };
-  // ---------- Updates: Localify and the launcher share one check ----------
+  // ---------- Updates: one check helper; launch checks both, each button only its own ----------
   let updatesChecking = false;
   let updatesState = null; // last { launcher, localify, checked, error }
-  let promptWaiting = false;
   function renderLocalify(l) {
     $('localifyDot').classList.toggle('on', l.installed);
     $('localifyText').textContent = !l.installed ? 'Not installed'
@@ -819,37 +818,46 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
   async function refreshUpdates() {
     try { renderUpdates(await invoke('updates_status')); } catch (e) { log('Update status: ' + e); }
   }
-  // Updates that can be installed from here (local builds never replace themselves).
-  function installable(u) {
+  // Scopes: 'daily' (both, at launch) or the component whose button was clicked.
+  const inScope = (scope, part) => scope === 'daily' || scope === part;
+  // Updates in `scope` that can be installed from here (local builds never replace themselves).
+  function installable(u, scope) {
     const list = [];
-    if (u.localify.installed && u.localify.update_available) list.push('localify');
-    if (u.launcher.update_available && u.launcher.release_build) list.push('launcher');
+    if (inScope(scope, 'localify') && u.localify.installed && u.localify.update_available) list.push('localify');
+    if (inScope(scope, 'launcher') && u.launcher.update_available && u.launcher.release_build) list.push('launcher');
     return list;
   }
-  function updateSummary(u) {
+  function updateSummary(u, scope) {
     const l = u.launcher, z = u.localify;
-    const parts = [!l.latest ? 'No launcher release found'
-      : l.update_available ? `Launcher ${l.latest} is available` : `Launcher is up to date (v${l.current})`];
-    if (z.installed && z.latest) parts.push(z.update_available ? `Localify ${z.latest} is available` : 'Localify is up to date');
+    const parts = [];
+    if (inScope(scope, 'launcher')) {
+      parts.push(!l.latest ? 'No launcher release found'
+        : l.update_available ? `Launcher ${l.latest} is available` : `Launcher is up to date (v${l.current})`);
+    }
+    if (scope === 'localify' && !z.installed) parts.push(z.latest ? `Latest Localify release: ${z.latest}` : 'No Localify release found');
+    else if (inScope(scope, 'localify') && z.installed && z.latest) {
+      parts.push(z.update_available ? `Localify ${z.latest} is available` : `Localify is up to date (${z.version})`);
+    }
     return parts.join('. ');
   }
-  // force: the buttons. On launch the shared check runs at most once every 24 hours.
-  async function checkUpdates(force) {
+  // 'daily' runs on launch, at most once every 24 hours; a button checks only its own component.
+  async function checkUpdates(scope) {
     if (updatesChecking) return;
+    const manual = scope !== 'daily';
     updatesChecking = true;
     syncUpdateButtons();
     try {
-      const u = await invoke('updates_check', { force });
+      const u = await invoke('updates_check', { scope });
       renderUpdates(u);
       if (u.error) log('Update check failed: ' + u.error.replace(/\n/g, '; '));
-      if (force) setStatus(u.error ? u.error.split('\n')[0] : updateSummary(u), !!u.error);
+      if (manual) setStatus(u.error ? u.error.split('\n')[0] : updateSummary(u, scope), !!u.error);
       // Ask only after a lookup that actually ran, so a postponed update is asked about once a day.
-      if (u.checked && installable(u).length) {
-        log(updateSummary(u));
-        promptUpdates();
+      if (u.checked && installable(u, scope).length) {
+        log(updateSummary(u, scope));
+        promptUpdates(scope);
       }
     } catch (e) {
-      if (force) setStatus(String(e), true);
+      if (manual) setStatus(String(e), true);
       log('Update check failed: ' + e);
     } finally {
       updatesChecking = false;
@@ -857,14 +865,18 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
     }
   }
   // Ask once the launcher is idle: never over another popup or while a task runs.
-  function promptUpdates() {
-    if (promptWaiting) return;
-    promptWaiting = true;
+  // Scopes asked for while waiting are merged into the one popup.
+  const promptScopes = new Set();
+  function promptUpdates(scope) {
+    const waiting = promptScopes.size > 0;
+    promptScopes.add(scope);
+    if (waiting) return;
     const tryShow = async () => {
       if (busy || $('overlay').classList.contains('shown')) return void setTimeout(tryShow, 1000);
-      promptWaiting = false;
       const u = updatesState;
-      const list = u ? installable(u) : [];
+      const scopes = [...promptScopes];
+      promptScopes.clear();
+      const list = u ? [...new Set(scopes.flatMap((s) => installable(u, s)))] : [];
       if (!list.length) return;
       const lines = [];
       if (list.includes('launcher')) lines.push(`Launcher ${u.launcher.latest} (you have v${u.launcher.current})`);
@@ -904,8 +916,8 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
   async function restartLauncher() {
     try { await invoke('launcher_restart'); } catch (e) { setStatus(String(e), true); log('Restart failed: ' + e); }
   }
-  $('localifyCheck').onclick = () => checkUpdates(true);
-  $('launcherCheck').onclick = () => checkUpdates(true);
+  $('localifyCheck').onclick = () => checkUpdates('localify');
+  $('launcherCheck').onclick = () => checkUpdates('launcher');
   $('localifyInstall').onclick = async () => {
     await run('localify_install');
     refreshUpdates();
@@ -1040,7 +1052,7 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
     await refresh();
     await refreshProton();
     // Not awaited: hashing the DLL and the daily update check must not delay an auto start.
-    refreshUpdates().then(() => checkUpdates(false));
+    refreshUpdates().then(() => checkUpdates('daily'));
     if (gameFound && (await invoke('take_auto_start'))) return run('start_game'); // start_game also verifies login
     if (loggedIn) {
       try { const s = await invoke('verify_login'); if (!busy) render(s); } catch {}

@@ -62,11 +62,11 @@ version and the building repository to the compiler (`LAUNCHER_VERSION`, `LAUNCH
 `Cargo.toml` and `Cargo.lock` are not modified and the build stays `--locked`. Local builds show
 `Cargo.toml`'s version, can check for updates, and do not replace themselves.
 
-The launcher and Localify are checked together on one clock: on launch at most once every 24 hours,
-and immediately with either **Check for updates** button. Localify is looked up only while it is
-installed. If a lookup fails, the other result is still saved and the check runs again on the next
-launch. When a check finds an update that can be installed, a popup lists it and asks whether to
-install it now. **Later** skips it until the next check. The popup waits until no other task or popup
+On launch the launcher and Localify are checked together, at most once every 24 hours. Localify is
+looked up only while it is installed. If a lookup fails, the other result is still saved and the
+check runs again on the next launch. Each panel's **Check for updates** button looks up only that
+panel's component, right away, and does not reset the daily check. When a check finds an update that
+can be installed, a popup lists it and asks whether to install it now. **Later** skips it until the next check. The popup waits until no other task or popup
 is open, installs Localify before the launcher, and offers to restart after a launcher update.
 
 The Proton version and prefix are remembered in the launcher's settings.

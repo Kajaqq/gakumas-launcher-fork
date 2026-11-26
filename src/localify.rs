@@ -82,8 +82,12 @@ pub fn install(
         r.dll_sha256 = Some(dll_sha256);
     });
     // Installing just read the release list, so record the newest tag. The
-    // shared clock stays put: the launcher's release was not checked.
-    let _ = store.update_update_check(|c| c.localify = Some(version.clone()));
+    // daily clock stays put: the launcher was not looked up.
+    let now = github::now_secs();
+    let _ = store.update_update_check(|c| {
+        c.localify = Some(version.clone());
+        c.localify_checked_at = Some(now);
+    });
     let done = match (first_install, english) {
         (true, true) => format!("Localify {version} installed with the English translation settings."),
         (true, false) => format!("Localify {version} installed."),
@@ -168,7 +172,7 @@ pub fn status(store: &Store, check: &UpdateCheck) -> Status {
         version,
         latest: check.localify.clone(),
         update_available,
-        checked_at: check.checked_at,
+        checked_at: check.localify_checked_at,
     }
 }
 
@@ -616,7 +620,7 @@ mod tests {
         store.update_update_check(|c| c.localify = Some("v2".into())).unwrap();
         store.update_update_check(|c| c.checked_at = Some(7)).unwrap();
         assert_eq!(store.localify().tag.as_deref(), Some("v1"));
-        assert_eq!(store.update_check(), UpdateCheck { checked_at: Some(7), localify: Some("v2".into()), launcher: None });
+        assert_eq!(store.update_check(), UpdateCheck { checked_at: Some(7), localify: Some("v2".into()), ..Default::default() });
     }
 
     #[test]

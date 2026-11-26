@@ -89,7 +89,7 @@ fn make_status(check: &UpdateCheck, current: &str, restart_pending: Option<Strin
         release_build: RELEASE_VERSION.is_some(),
         latest: check.launcher.clone(),
         update_available,
-        checked_at: check.checked_at,
+        checked_at: check.launcher_checked_at,
         url: releases_url(),
         restart_pending,
     }
@@ -157,8 +157,12 @@ pub fn update(store: &Store, base: &Path, progress: &dyn Fn(&str, Option<f32>)) 
     let releases = github::releases(&agent, REPO)?;
     let (tag, asset) = select_release(&releases, current_version())
         .ok_or_else(|| format!("No launcher release has {ASSET_NAME}"))?;
-    // Record what was found without moving the shared clock: Localify was not checked.
-    let _ = store.update_update_check(|c| c.launcher = Some(tag.clone()));
+    // Record the lookup. The daily clock stays put: Localify was not looked up.
+    let now = github::now_secs();
+    let _ = store.update_update_check(|c| {
+        c.launcher = Some(tag.clone());
+        c.launcher_checked_at = Some(now);
+    });
     if !github::is_newer(&tag, current_version()) {
         return Ok(format!("The launcher is up to date (v{}).", current_version()));
     }
@@ -249,7 +253,7 @@ mod tests {
 
     #[test]
     fn status_reports_an_update_until_it_is_installed() {
-        let check = UpdateCheck { launcher: Some("v0.4.0".into()), checked_at: Some(1), ..Default::default() };
+        let check = UpdateCheck { launcher: Some("v0.4.0".into()), launcher_checked_at: Some(1), ..Default::default() };
         assert!(make_status(&check, "0.3.0", None).update_available);
         assert!(!make_status(&check, "0.4.0", None).update_available);
         assert!(!make_status(&check, "0.5.0", None).update_available);
