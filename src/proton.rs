@@ -407,6 +407,94 @@ fn install_webview2_direct(
     Ok(())
 }
 
+/// Keep Unity's `persistentDataPath` outside the Proton prefix.
+///
+/// The game's asset-cache index lives under
+/// `AppData/LocalLow/BANDAI NAMCO Entertainment Inc_`. If the prefix is
+/// deleted, that index is lost and the game re-downloads its ~7 GB `octo/v1`
+/// asset cache from the game folder. Move the real directory into the
+/// launcher's app-data folder and leave a symlink in the prefix, so a new
+/// prefix points at the same data.
+fn ensure_game_appdata(prefix: &Path, base: &Path) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+
+    let name = "BANDAI NAMCO Entertainment Inc_";
+    let link = prefix
+        .join("drive_c/users/steamuser/AppData/LocalLow")
+        .join(name);
+    let stable = base.join("game-appdata").join(name);
+
+    fs::create_dir_all(stable.parent().ok_or("Invalid app-data path")?)
+        .map_err(|e| format!("Failed to create the game app-data folder: {e}"))?;
+
+    match fs::symlink_metadata(&link) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if fs::read_link(&link).ok().as_deref() == Some(stable.as_path()) {
+                fs::create_dir_all(&stable)
+                    .map_err(|e| format!("Failed to create the game app-data folder: {e}"))?;
+                return verify_game_appdata(&link, &stable);
+            }
+            let wrong = link.with_file_name(format!("{name}.wrong-link"));
+            fs::rename(&link, &wrong)
+                .map_err(|e| format!("Failed to set aside an old app-data link: {e}"))?;
+        }
+        Ok(_) => {
+            // A real directory: move it to the stable location. If that is not
+            // possible (different filesystems), merge its contents instead.
+            if !stable.exists() && fs::rename(&link, &stable).is_ok() {
+                symlink(&stable, &link)
+                    .map_err(|e| format!("Failed to link game app-data: {e}"))?;
+                return verify_game_appdata(&link, &stable);
+            }
+            copy_tree(&link, &stable)?;
+            let backup = link.with_file_name(format!("{name}.prefix-backup"));
+            fs::rename(&link, &backup)
+                .map_err(|e| format!("Failed to set aside the old app-data folder: {e}"))?;
+        }
+        Err(_) => {}
+    }
+
+    fs::create_dir_all(&stable)
+        .map_err(|e| format!("Failed to create the game app-data folder: {e}"))?;
+    symlink(&stable, &link).map_err(|e| format!("Failed to link game app-data: {e}"))?;
+    verify_game_appdata(&link, &stable)
+}
+
+/// Confirm the prefix path is a symlink to the stable folder, which exists.
+fn verify_game_appdata(link: &Path, stable: &Path) -> Result<(), String> {
+    let meta = fs::symlink_metadata(link)
+        .map_err(|e| format!("Game app-data link is missing: {e}"))?;
+    if !meta.file_type().is_symlink() {
+        return Err(format!("{} is not a symlink", link.display()));
+    }
+    if fs::read_link(link).ok().as_deref() != Some(stable) {
+        return Err(format!("{} points at the wrong target", link.display()));
+    }
+    if !stable.is_dir() {
+        return Err(format!("Game app-data folder {} is missing", stable.display()));
+    }
+    Ok(())
+}
+
+/// Copy `src` into `dst` without deleting either tree. Existing files are left
+/// untouched, so this is safe when a stable app-data folder already exists.
+fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| format!("Failed to create {}: {e}", dst.display()))?;
+    for entry in fs::read_dir(src).map_err(|e| format!("Failed to read {}: {e}", src.display()))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let source = entry.path();
+        let target = dst.join(entry.file_name());
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        if kind.is_dir() {
+            copy_tree(&source, &target)?;
+        } else if kind.is_file() && !target.exists() {
+            fs::copy(&source, &target)
+                .map_err(|e| format!("Failed to copy {}: {e}", source.display()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Install the tested DXVK D3D11/DXGI pair where Wine can find it.
 /// `WINEDLLOVERRIDES=d3d11=n;dxgi=n` makes Wine load native DLLs. The game
 /// process searches the game folder, but Vuplex's Chromium child searches
@@ -494,6 +582,7 @@ pub fn setup(
     if !created {
         return Err(format!("Failed to create the Proton prefix: {last_error}"));
     }
+    ensure_game_appdata(&prefix, base)?;
 
     // 2) Install the Windows runtime components using the system winetricks
     // and the selected Proton only. No Heroic / protontricks dependency.
@@ -804,6 +893,7 @@ pub fn launch_game(exe: &Path, args: &str, cwd: &Path) -> Result<(), String> {
             .to_path_buf()
     });
     ensure_driver_file(&base, &prefix)?;
+    ensure_game_appdata(&prefix, &base)?;
 
     // The driver service and the game must run in the SAME Wine session.
     // A service started in one Proton invocation is gone in the next one, so
@@ -963,5 +1053,61 @@ mod tests {
         assert!(body.starts_with("#!/bin/sh"));
         assert!(body.contains("runinprefix"));
         assert!(body.contains("Proton-GE Latest"));
+    }
+
+    #[test]
+    fn moves_real_game_appdata_into_a_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prefix = dir.path().join("prefix");
+        let base = dir.path().join("data");
+        let leaf = "BANDAI NAMCO Entertainment Inc_";
+        let link = prefix.join("drive_c/users/steamuser/AppData/LocalLow").join(leaf);
+        fs::create_dir_all(link.join("gakumas")).expect("create real dir");
+        fs::write(link.join("gakumas/cache.bin"), b"index").expect("write cache");
+
+        ensure_game_appdata(&prefix, &base).expect("migrate");
+
+        let stable = base.join("game-appdata").join(leaf);
+        assert!(fs::symlink_metadata(&link).expect("link").file_type().is_symlink());
+        assert_eq!(fs::read_link(&link).expect("target"), stable);
+        assert_eq!(fs::read(link.join("gakumas/cache.bin")).expect("read via link"), b"index");
+        verify_game_appdata(&link, &stable).expect("verify");
+    }
+
+    #[test]
+    fn keeps_an_existing_correct_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prefix = dir.path().join("prefix");
+        let base = dir.path().join("data");
+        let leaf = "BANDAI NAMCO Entertainment Inc_";
+        let link = prefix.join("drive_c/users/steamuser/AppData/LocalLow").join(leaf);
+        let stable = base.join("game-appdata").join(leaf);
+        fs::create_dir_all(&stable).expect("stable dir");
+        fs::write(stable.join("marker"), b"ok").expect("marker");
+        fs::create_dir_all(link.parent().expect("parent")).expect("link parent");
+        symlink(&stable, &link).expect("symlink");
+
+        ensure_game_appdata(&prefix, &base).expect("no-op");
+        assert_eq!(fs::read_link(&link).expect("target"), stable);
+        assert_eq!(fs::read(stable.join("marker")).expect("marker"), b"ok");
+    }
+
+    #[test]
+    fn replaces_a_wrong_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prefix = dir.path().join("prefix");
+        let base = dir.path().join("data");
+        let leaf = "BANDAI NAMCO Entertainment Inc_";
+        let link = prefix.join("drive_c/users/steamuser/AppData/LocalLow").join(leaf);
+        let stable = base.join("game-appdata").join(leaf);
+        fs::create_dir_all(&stable).expect("stable dir");
+        fs::create_dir_all(link.parent().expect("parent")).expect("link parent");
+        symlink(dir.path().join("somewhere-else"), &link).expect("wrong symlink");
+
+        ensure_game_appdata(&prefix, &base).expect("replace wrong link");
+        assert_eq!(fs::read_link(&link).expect("target"), stable);
+        verify_game_appdata(&link, &stable).expect("verify");
     }
 }
