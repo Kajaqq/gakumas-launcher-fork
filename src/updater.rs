@@ -17,12 +17,9 @@ use serde_json::Value;
 use crate::launcher::{Store, UpdateCheck};
 use crate::{github, http};
 
-/// `owner/name` of the repository this build updates from. The release
-/// workflow sets it to the repository that built the release.
-pub const REPO: &str = match option_env!("LAUNCHER_REPO") {
-    Some(repo) => repo,
-    None => "Portalboy07/gakumas-launcher-fork",
-};
+/// `owner/name` of the repository every build updates from: the upstream
+/// project, wherever the build was made.
+pub const REPO: &str = "Portalboy07/gakumas-launcher-fork";
 
 /// The release tag's version, set by the release workflow. Local builds leave
 /// it unset: they show `Cargo.toml`'s version and do not replace themselves.
@@ -249,6 +246,12 @@ mod tests {
         draft["draft"] = json!(true);
         let releases = [draft, release("latest", false, &[ASSET_NAME])];
         assert_eq!(selected(&releases, "0.3.0"), None);
+    }
+
+    #[test]
+    fn updates_come_from_the_upstream_repository() {
+        assert_eq!(REPO, "Portalboy07/gakumas-launcher-fork");
+        assert_eq!(releases_url(), "https://github.com/Portalboy07/gakumas-launcher-fork/releases");
     }
 
     #[test]

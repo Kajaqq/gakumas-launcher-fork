@@ -57,9 +57,10 @@ The **Launcher update** panel shows the running version and the newest stable re
 [the fork's GitHub releases](https://github.com/Portalboy07/gakumas-launcher-fork/releases) that has a
 binary for this platform (prereleases are offered only to prerelease builds). **Update launcher**
 downloads `GakumasLauncher.exe` or `GakumasLauncher-linux`, checks it against the release's SHA-256
-digest, replaces the executable, and then offers to restart. The release workflow passes the tag's
-version and the building repository to the compiler (`LAUNCHER_VERSION`, `LAUNCHER_REPO`), so
-`Cargo.toml` and `Cargo.lock` are not modified and the build stays `--locked`. Local builds show
+digest, replaces the executable, and then offers to restart. Every build, including forks' builds,
+updates from this repository's releases. The release workflow passes the tag's version to the compiler
+(`LAUNCHER_VERSION`), so `Cargo.toml` and `Cargo.lock` are not modified and the build stays
+`--locked`. Local builds show
 `Cargo.toml`'s version, can check for updates, and do not replace themselves.
 
 On launch the launcher and Localify are checked together, at most once every 24 hours. Localify is
