@@ -47,6 +47,12 @@ The **Localization (Localify)** panel downloads the latest `DMM_GakumasLocalify_
 
 Before launching, the launcher downloads and verifies the anti-debug driver (`usrdrv017764.sys`), installs it into the prefix, and registers/starts its service in the **same Wine session** as the game via a generated CMD script. Wine's `NtLoadDriver` is a stub, so doing this beforehand is what lets the original executable run. `WINE_SERVICES_SESSION0=1` and `version.dll=n,b` (native then builtin, for localization mods) are set automatically.
 
+The launcher bundles the DXVK D3D11/DXGI build from
+[GE-Proton10-31](https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/GE-Proton10-31)
+rather than an upstream release: that exact build is needed for the in-game
+Vuplex webview. See [assets/dxvk/SOURCE.md](assets/dxvk/SOURCE.md) for hashes
+and provenance.
+
 The Proton version and prefix are remembered in the launcher's settings.
 
 The Linux driver-fix approach is based on [0nikod/gakumas-proton](https://github.com/0nikod/gakumas-proton), which documents preloading the `usrdrv017764.sys` anti-debug driver service in the same Wine session so the original executable can start.

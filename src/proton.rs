@@ -18,6 +18,19 @@ use crate::{http, launcher::Store, localify};
 const BUNDLE_ID: &str = "local.gakumas.launcher";
 const DEPS_MARKER: &str = ".gakumas-deps-ok";
 
+/// DXVK v2.7.1-451-g3731c2f5: the exact build shipped in GE-Proton10-31
+/// (upstream commit 3731c2f5b67942f5eafbb12e7444b787dfb12775).
+/// This specific build is required for Vuplex's D3D11 shared-texture/fence
+/// handoff to work under Proton. Provenance and hashes: assets/dxvk/SOURCE.md;
+/// license: assets/dxvk/LICENSE.
+const DXVK_D3D11_X64_SHA256: &str =
+    "3ba898530288520aedfe0876c6a98939c2684af1792c720d259f3b1d30393296";
+const DXVK_DXGI_X64_SHA256: &str =
+    "793f542bd38669757c59f87c7f188e30bb51f01f86a7177a4c6a1fe3fff8090f";
+const DXVK_D3D11_X64: &[u8] = include_bytes!("../assets/dxvk/x86_64/d3d11.dll");
+const DXVK_DXGI_X64: &[u8] = include_bytes!("../assets/dxvk/x86_64/dxgi.dll");
+const DXVK_LICENSE: &[u8] = include_bytes!("../assets/dxvk/LICENSE");
+
 /// The anti-debug driver the original executable asks Wine to load via the
 /// (stubbed) NtLoadDriver. Sourced from LOLDrivers; SHA-256 verified.
 const DRIVER_URL: &str = "https://media.githubusercontent.com/media/magicsword-io/LOLDrivers/main/drivers/ed96f1a99a3693d40cc302d5ae0840b8.bin";
@@ -394,6 +407,45 @@ fn install_webview2_direct(
     Ok(())
 }
 
+/// Install the tested DXVK D3D11/DXGI pair where Wine can find it.
+/// `WINEDLLOVERRIDES=d3d11=n;dxgi=n` makes Wine load native DLLs. The game
+/// process searches the game folder, but Vuplex's Chromium child searches
+/// its own executable folder, so both locations need the pair.
+fn install_dxvk(game: &Path, progress: &dyn Fn(&str, Option<f32>)) -> Result<(), String> {
+    if !game.exists() {
+        return Err(format!("Game folder not found: {}", game.display()));
+    }
+    let locations = [
+        game.to_path_buf(),
+        game.join("gakumas_Data/Plugins/x86_64/VuplexWebViewChromium"),
+    ];
+    for (name, data, expected) in [
+        ("d3d11.dll", DXVK_D3D11_X64, DXVK_D3D11_X64_SHA256),
+        ("dxgi.dll", DXVK_DXGI_X64, DXVK_DXGI_X64_SHA256),
+    ] {
+        let actual = sha256_hex(data);
+        if actual != expected {
+            return Err(format!("Bundled {name} failed its SHA-256 check ({actual})"));
+        }
+        for dir in &locations {
+            if !dir.is_dir() {
+                continue;
+            }
+            let path = dir.join(name);
+            let current = fs::read(&path).ok();
+            if current.as_deref().map(|bytes| sha256_hex(bytes) == expected).unwrap_or(false) {
+                continue;
+            }
+            progress(&format!("Installing bundled DXVK {name} in {}...", dir.display()), None);
+            fs::write(&path, data)
+                .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+        }
+    }
+    let license = game.join("DXVK-LICENSE.txt");
+    let _ = fs::write(&license, DXVK_LICENSE);
+    Ok(())
+}
+
 /// Create the prefix and install the Windows runtime dependencies.
 pub fn setup(
     base: &Path,
@@ -497,6 +549,10 @@ pub fn setup(
     }
 
     let _ = install_mod_fonts(&prefix);
+
+    if let Some(game) = settings.game_path.as_ref().filter(|s| !s.trim().is_empty()) {
+        install_dxvk(Path::new(game), progress)?;
+    }
 
     fs::write(prefix.join(DEPS_MARKER), b"ok\n")
         .map_err(|e| format!("Failed to save the dependency marker: {e}"))?;
@@ -763,6 +819,9 @@ pub fn launch_game(exe: &Path, args: &str, cwd: &Path) -> Result<(), String> {
         .file_name()
         .unwrap_or(exe.as_os_str())
         .to_string_lossy();
+    // Self-heal: make sure the tested DXVK pair is present even if the
+    // dependency setup was skipped (the marker already existed).
+    install_dxvk(script_dir, &|_: &str, _: Option<f32>| {})?;
     let script_path = prefix.join("drive_c/gakumas-launch.cmd");
     let script_body = format!(
         "@echo off\r\n\
@@ -782,8 +841,10 @@ pub fn launch_game(exe: &Path, args: &str, cwd: &Path) -> Result<(), String> {
 
     let mut cmd = Command::new(&proton_script);
     prepare_command(&mut cmd, &proton_script, &prefix)?;
-    // Always load a game-folder version.dll first (native, then builtin).
-    cmd.env("WINEDLLOVERRIDES", "version.dll=n,b");
+    // version.dll: localization proxy; winmm=b: ignore leftover shims;
+    // d3d11/dxgi=n: use the tested DXVK pair bundled in the game folder.
+    cmd.env("WINEDLLOVERRIDES",
+            "version.dll=n,b;winmm=b;d3d11=n;dxgi=n");
     cmd.arg("cmd.exe")
         .arg("/c")
         .arg(windows_path(&script_path));

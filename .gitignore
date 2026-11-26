@@ -2,3 +2,6 @@
 /dist
 /gen
 *.dmmtmp
+
+# Reference-only DXVK binaries; not embedded or shipped.
+assets/dxvk/i386/
