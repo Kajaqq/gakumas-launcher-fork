@@ -15,11 +15,51 @@ pub(crate) fn cached_file_has_size(path: &Path, expected_size: u64) -> bool {
 }
 
 /// Validate a download before replacing its cache entry on the same filesystem.
+// Only the Linux Proton setup downloads without reporting progress.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn download_file(
     agent: &ureq::Agent,
     url: &str,
     path: &Path,
     expected_size: Option<u64>,
+    validate: impl FnOnce(&mut File) -> Result<(), String>,
+) -> Result<(), String> {
+    download_file_with_progress(agent, url, path, expected_size, &|_, _| {}, validate)
+}
+
+/// Report download progress at most this often (in bytes).
+const PROGRESS_STEP: u64 = 256 * 1024;
+
+/// Counts bytes read and reports them with the expected total.
+struct ProgressReader<'a, R> {
+    inner: R,
+    done: u64,
+    reported: u64,
+    total: Option<u64>,
+    progress: &'a dyn Fn(u64, Option<u64>),
+}
+
+impl<R: io::Read> io::Read for ProgressReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.done += n as u64;
+        if n == 0 || self.done - self.reported >= PROGRESS_STEP {
+            self.reported = self.done;
+            (self.progress)(self.done, self.total);
+        }
+        Ok(n)
+    }
+}
+
+/// [`download_file`] that reports `(bytes received, expected total)` as it goes.
+/// With a known size it stops reading one byte past it, so an oversized
+/// response fails without being downloaded in full.
+pub(crate) fn download_file_with_progress(
+    agent: &ureq::Agent,
+    url: &str,
+    path: &Path,
+    expected_size: Option<u64>,
+    progress: &dyn Fn(u64, Option<u64>),
     validate: impl FnOnce(&mut File) -> Result<(), String>,
 ) -> Result<(), String> {
     let parent = path
@@ -38,7 +78,15 @@ pub(crate) fn download_file(
     let content_length = response
         .header("Content-Length")
         .and_then(|len| len.parse::<u64>().ok());
-    let copied = io::copy(&mut response.into_reader(), &mut staged)
+    let total = expected_size.or(content_length);
+    let mut reader = ProgressReader {
+        inner: io::Read::take(response.into_reader(), total.map_or(u64::MAX, |size| size + 1)),
+        done: 0,
+        reported: 0,
+        total,
+        progress,
+    };
+    let copied = io::copy(&mut reader, &mut staged)
         .map_err(|e| format!("Failed to download {}: {e}", path.display()))?;
     if copied == 0 || expected_size.or(content_length).is_some_and(|size| size != copied) {
         return Err(format!("Unexpected download size for {}", path.display()));
@@ -403,6 +451,50 @@ mod tests {
         }).unwrap();
         assert!(cached_file_has_size(&path, 8));
         assert_eq!(fs::read(&path).unwrap(), b"complete");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn download_reports_progress_and_rejects_an_oversized_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let big = vec![b'x'; 3 * PROGRESS_STEP as usize];
+        let bodies = [big.clone(), big.clone()];
+        let server = std::thread::spawn(move || {
+            for body in bodies {
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    assert_ne!(stream.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                // No Content-Length: the body ends when the connection closes.
+                stream.get_mut().write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n").unwrap();
+                let _ = stream.get_mut().write_all(&body);
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.bin");
+        let agent = ureq::AgentBuilder::new().try_proxy_from_env(false).build();
+        let size = big.len() as u64;
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let report = |done: u64, total: Option<u64>| seen.borrow_mut().push((done, total));
+        download_file_with_progress(&agent, &url, &path, Some(size), &report, |_| Ok(())).unwrap();
+        let seen = seen.into_inner();
+        assert!(seen.len() >= 3, "{seen:?}");
+        assert_eq!(seen.last(), Some(&(size, Some(size))));
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0));
+
+        // A body longer than the expected size fails without publishing anything.
+        let other = dir.path().join("small.bin");
+        assert!(download_file(&agent, &url, &other, Some(size / 2), |_| Ok(())).is_err());
+        assert!(!other.exists());
         server.join().unwrap();
     }
 }

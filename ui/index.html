@@ -283,20 +283,6 @@
   </div>
 
   <section class="panel">
-    <div class="panel-head"><svg class="star-l" viewBox="0 0 24 24"><path fill="currentColor" d="M12 0c1 7 5 11 12 12-7 1-11 5-12 12-1-7-5-11-12-12C7 11 11 7 12 0z"/></svg><span>Launcher update</span><svg class="star-r" viewBox="0 0 32 32"><path fill="#ffb92e" d="M13 2c.8 6.2 3.8 9.2 10 10-6.2.8-9.2 3.8-10 10-.8-6.2-3.8-9.2-10-10 6.2-.8 9.2-3.8 10-10z"/><path fill="#ffffff" opacity=".9" d="M25 18c.4 3.2 1.8 4.6 5 5-3.2.4-4.6 1.8-5 5-.4-3.2-1.8-4.6-5-5 3.2-.4 4.6-1.8 5-5z"/></svg></div>
-    <div class="panel-body">
-      <div class="item">
-        <div class="item-main"><div class="item-title">Installed</div><div class="item-sub account"><span class="dot on" id="launcherDot"></span><span id="launcherCurrent">Checking…</span></div></div>
-      </div>
-      <div class="item">
-        <div class="item-main"><div class="item-title">Latest release</div><div class="item-sub" id="launcherLatest">Not checked yet</div></div>
-        <div class="item-actions stack"><button class="pill" id="launcherCheck">Check for updates</button><button class="pill" id="launcherUpdate">Update launcher</button></div>
-      </div>
-      <p class="proton-note">Releases: <a href="https://github.com/Portalboy07/gakumas-launcher-fork/releases" id="launcherReleases">GitHub</a>.</p>
-    </div>
-  </section>
-
-  <section class="panel">
     <div class="panel-head"><svg class="star-l" viewBox="0 0 24 24"><path fill="currentColor" d="M12 0c1 7 5 11 12 12-7 1-11 5-12 12-1-7-5-11-12-12C7 11 11 7 12 0z"/></svg><span>Japan Connection</span><svg class="star-r" viewBox="0 0 32 32"><path fill="#ffb92e" d="M13 2c.8 6.2 3.8 9.2 10 10-6.2.8-9.2 3.8-10 10-.8-6.2-3.8-9.2-10-10 6.2-.8 9.2-3.8 10-10z"/><path fill="#ffffff" opacity=".9" d="M25 18c.4 3.2 1.8 4.6 5 5-3.2.4-4.6 1.8-5 5-.4-3.2-1.8-4.6-5-5 3.2-.4 4.6-1.8 5-5z"/></svg></div>
     <div class="panel-body">
       <div class="tiles three" id="mode" role="radiogroup" aria-label="Japan Connection">
@@ -384,6 +370,20 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
     </div>
   </section>
 
+  <section class="panel">
+    <div class="panel-head"><svg class="star-l" viewBox="0 0 24 24"><path fill="currentColor" d="M12 0c1 7 5 11 12 12-7 1-11 5-12 12-1-7-5-11-12-12C7 11 11 7 12 0z"/></svg><span>Launcher update</span><svg class="star-r" viewBox="0 0 32 32"><path fill="#ffb92e" d="M13 2c.8 6.2 3.8 9.2 10 10-6.2.8-9.2 3.8-10 10-.8-6.2-3.8-9.2-10-10 6.2-.8 9.2-3.8 10-10z"/><path fill="#ffffff" opacity=".9" d="M25 18c.4 3.2 1.8 4.6 5 5-3.2.4-4.6 1.8-5 5-.4-3.2-1.8-4.6-5-5 3.2-.4 4.6-1.8 5-5z"/></svg></div>
+    <div class="panel-body">
+      <div class="item">
+        <div class="item-main"><div class="item-title">Installed</div><div class="item-sub account"><span class="dot on" id="launcherDot"></span><span id="launcherCurrent">Checking…</span></div></div>
+      </div>
+      <div class="item">
+        <div class="item-main"><div class="item-title">Latest release</div><div class="item-sub" id="launcherLatest">Not checked yet</div></div>
+        <div class="item-actions stack"><button class="pill" id="launcherCheck">Check for updates</button><button class="pill" id="launcherUpdate">Update launcher</button></div>
+      </div>
+      <p class="proton-note">Releases: <a href="https://github.com/Portalboy07/gakumas-launcher-fork/releases" id="launcherReleases">GitHub</a>.</p>
+    </div>
+  </section>
+
 </main>
 
 <div class="bottom">
@@ -463,9 +463,9 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
   }
   function setBusy(b) {
     busy = b;
-    for (const id of ['folder', 'exePick', 'exeClear', 'accountBtn', 'dmmBrowserBtn', 'registerBtn', 'auto', 'closeAfter', 'vpnPick', 'vpnAuth', 'protonApply', 'protonSetup', 'protonInstallDw', 'protonRefresh', 'localifyInstall', 'launcherCheck', 'launcherUpdate']) $(id).disabled = b;
+    for (const id of ['folder', 'exePick', 'exeClear', 'accountBtn', 'dmmBrowserBtn', 'registerBtn', 'auto', 'closeAfter', 'vpnPick', 'vpnAuth', 'protonApply', 'protonSetup', 'protonInstallDw', 'protonRefresh', 'localifyInstall']) $(id).disabled = b;
     $('mode').querySelectorAll('button').forEach((x) => (x.disabled = b));
-    $('localifyCheck').disabled = b || localifyChecking;
+    syncUpdateButtons();
     if (!b) setMeter(null);
     updateStart();
   }
@@ -674,7 +674,7 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
   };
   $('folder').onclick = async () => {
     try { render(await invoke('pick_game_folder')); if (gameFound) setStatus(''); } catch (e) { setStatus(String(e), true); }
-    refreshLocalify();
+    refreshUpdates();
   };
   $('exePick').onclick = async () => {
     try {
@@ -767,8 +767,10 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
       window.open('https://gakumas.natsume.io/localify/dmm-games', '_blank');
     }
   };
-  // ---------- Localify ----------
-  let localifyChecking = false;
+  // ---------- Updates: Localify and the launcher share one check ----------
+  let updatesChecking = false;
+  let updatesState = null; // last { launcher, localify, checked, error }
+  let promptWaiting = false;
   function renderLocalify(l) {
     $('localifyDot').classList.toggle('on', l.installed);
     $('localifyText').textContent = !l.installed ? 'Not installed'
@@ -784,84 +786,139 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
     $('localifyInstall').textContent = !l.installed ? 'Install Localify'
       : l.update_available ? `Update Localify to ${l.latest}` : 'Reinstall Localify';
   }
-  async function refreshLocalify() {
-    try { renderLocalify(await invoke('localify_status')); } catch (e) { log('Localify status: ' + e); }
+  // Button state from the last status; setBusy calls this too.
+  function syncUpdateButtons() {
+    for (const id of ['localifyCheck', 'launcherCheck']) $(id).disabled = busy || updatesChecking;
+    const s = updatesState && updatesState.launcher;
+    const btn = $('launcherUpdate');
+    if (s && s.restart_pending) {
+      btn.textContent = 'Restart to update';
+      btn.disabled = busy;
+      btn.title = `Close this launcher and start ${s.restart_pending}`;
+    } else {
+      btn.textContent = s && s.update_available ? `Update to ${s.latest}` : 'Update launcher';
+      btn.disabled = busy || !s || !s.update_available || !s.release_build;
+      btn.title = s && !s.release_build ? 'Local builds do not update themselves' : '';
+    }
   }
-  // force: the button. Otherwise the launcher checks at most once every 24 hours, and only when Localify is installed.
-  async function checkLocalify(force) {
-    if (localifyChecking) return;
-    localifyChecking = true;
-    $('localifyCheck').disabled = true;
+  function renderLauncher(s) {
+    $('launcherCurrent').textContent = `v${s.current}` + (s.release_build ? '' : ' (local build)');
+    let latest = s.checked_at ? 'No release found' : 'Not checked yet';
+    if (s.restart_pending) latest = `${s.restart_pending} (restart to finish)`;
+    else if (s.latest) latest = s.latest + (s.update_available ? ' (update available)' : ' (up to date)');
+    $('launcherLatest').textContent = latest;
+    $('launcherLatest').title = s.checked_at ? 'Checked ' + new Date(s.checked_at * 1000).toLocaleString() : '';
+    $('launcherReleases').href = s.url;
+  }
+  function renderUpdates(u) {
+    updatesState = u;
+    renderLocalify(u.localify);
+    renderLauncher(u.launcher);
+    syncUpdateButtons();
+  }
+  async function refreshUpdates() {
+    try { renderUpdates(await invoke('updates_status')); } catch (e) { log('Update status: ' + e); }
+  }
+  // Updates that can be installed from here (local builds never replace themselves).
+  function installable(u) {
+    const list = [];
+    if (u.localify.installed && u.localify.update_available) list.push('localify');
+    if (u.launcher.update_available && u.launcher.release_build) list.push('launcher');
+    return list;
+  }
+  function updateSummary(u) {
+    const l = u.launcher, z = u.localify;
+    const parts = [!l.latest ? 'No launcher release found'
+      : l.update_available ? `Launcher ${l.latest} is available` : `Launcher is up to date (v${l.current})`];
+    if (z.installed && z.latest) parts.push(z.update_available ? `Localify ${z.latest} is available` : 'Localify is up to date');
+    return parts.join('. ');
+  }
+  // force: the buttons. On launch the shared check runs at most once every 24 hours.
+  async function checkUpdates(force) {
+    if (updatesChecking) return;
+    updatesChecking = true;
+    syncUpdateButtons();
     try {
-      const l = await invoke('localify_check', { force });
-      renderLocalify(l);
-      const found = l.update_available ? `Localify ${l.latest} is available` : '';
-      if (force) {
-        const msg = found || (l.version && l.version === l.latest ? 'Localify is up to date' : `Latest Localify release: ${l.latest}`);
-        setStatus(msg);
-        log(msg);
-      } else if (found) {
-        log(found);
+      const u = await invoke('updates_check', { force });
+      renderUpdates(u);
+      if (u.error) log('Update check failed: ' + u.error.replace(/\n/g, '; '));
+      if (force) setStatus(u.error ? u.error.split('\n')[0] : updateSummary(u), !!u.error);
+      // Ask only after a lookup that actually ran, so a postponed update is asked about once a day.
+      if (u.checked && installable(u).length) {
+        log(updateSummary(u));
+        promptUpdates();
       }
     } catch (e) {
       if (force) setStatus(String(e), true);
-      log('Localify update check failed: ' + e);
+      log('Update check failed: ' + e);
     } finally {
-      localifyChecking = false;
-      $('localifyCheck').disabled = busy;
+      updatesChecking = false;
+      syncUpdateButtons();
     }
   }
-  $('localifyCheck').onclick = () => checkLocalify(true);
+  // Ask once the launcher is idle: never over another popup or while a task runs.
+  function promptUpdates() {
+    if (promptWaiting) return;
+    promptWaiting = true;
+    const tryShow = async () => {
+      if (busy || $('overlay').classList.contains('shown')) return void setTimeout(tryShow, 1000);
+      promptWaiting = false;
+      const u = updatesState;
+      const list = u ? installable(u) : [];
+      if (!list.length) return;
+      const lines = [];
+      if (list.includes('launcher')) lines.push(`Launcher ${u.launcher.latest} (you have v${u.launcher.current})`);
+      if (list.includes('localify')) {
+        lines.push(`Localify ${u.localify.latest} (${u.localify.version ? 'you have ' + u.localify.version : 'installed version unknown'})`);
+      }
+      const ok = await openModal({
+        title: list.length > 1 ? 'Updates available' : 'Update available',
+        body: textBody(lines.join('\n') + '\n\nInstall now?'),
+        buttons: [
+          { label: 'Later', kind: 'secondary', icon: 'cross', value: false },
+          { label: 'Install', kind: 'primary', icon: 'check', value: true },
+        ],
+      });
+      if (!ok) return log('Update postponed');
+      await installUpdates(list);
+    };
+    tryShow();
+  }
+  // Localify first: installing the launcher ends with a restart.
+  async function installUpdates(list) {
+    if (list.includes('localify')) await run('localify_install');
+    if (list.includes('launcher')) await run('launcher_update_install');
+    await refreshUpdates();
+    const pending = updatesState && updatesState.launcher.restart_pending;
+    if (!pending) return;
+    const restart = await openModal({
+      title: 'Restart launcher',
+      body: textBody(`Launcher ${pending} is installed.\nRestart now to use it?`),
+      buttons: [
+        { label: 'Later', kind: 'secondary', icon: 'cross', value: false },
+        { label: 'Restart', kind: 'primary', icon: 'check', value: true },
+      ],
+    });
+    if (restart) restartLauncher();
+  }
+  async function restartLauncher() {
+    try { await invoke('launcher_restart'); } catch (e) { setStatus(String(e), true); log('Restart failed: ' + e); }
+  }
+  $('localifyCheck').onclick = () => checkUpdates(true);
+  $('launcherCheck').onclick = () => checkUpdates(true);
   $('localifyInstall').onclick = async () => {
     await run('localify_install');
-    refreshLocalify();
+    refreshUpdates();
   };
-  // ---------- Launcher update ----------
-  let launcherChecking = false;
-  function renderUpdater(s) {
-    $('launcherCurrent').textContent = `v${s.current}`;
-    let latest = 'Not checked yet';
-    if (s.latest) {
-      latest = s.latest;
-      if (s.update_available) latest += ' (update available)';
-      else latest += ' (up to date)';
-    }
-    $('launcherLatest').textContent = latest;
-    $('launcherLatest').title = s.checked_at ? 'Checked ' + new Date(s.checked_at * 1000).toLocaleString() : '';
-    $('launcherUpdate').textContent = s.update_available ? `Update to ${s.latest}` : 'Update launcher';
-  }
-  async function refreshUpdater() {
-    try { renderUpdater(await invoke('launcher_update_status')); } catch (e) { log('Launcher version: ' + e); }
-  }
-  async function checkUpdater(force) {
-    if (launcherChecking) return;
-    launcherChecking = true;
-    $('launcherCheck').disabled = true;
-    try {
-      const s = await invoke('launcher_update_check', { force });
-      renderUpdater(s);
-      const msg = force
-        ? (s.update_available ? `Launcher ${s.latest} is available` : `Launcher is up to date (v${s.current})`)
-        : (s.update_available ? `Launcher ${s.latest} is available` : '');
-      if (force) setStatus(msg);
-      if (msg) log(msg);
-    } catch (e) {
-      if (force) setStatus(String(e), true);
-      log('Launcher update check failed: ' + e);
-    } finally {
-      launcherChecking = false;
-      $('launcherCheck').disabled = busy;
-    }
-  }
-  $('launcherCheck').onclick = () => checkUpdater(true);
   $('launcherReleases').onclick = async (e) => {
     e.preventDefault();
-    try { await window.__TAURI__.opener.openUrl('https://github.com/Portalboy07/gakumas-launcher-fork/releases'); }
-    catch { window.open('https://github.com/Portalboy07/gakumas-launcher-fork/releases', '_blank'); }
+    const url = $('launcherReleases').href;
+    try { await window.__TAURI__.opener.openUrl(url); }
+    catch { window.open(url, '_blank'); }
   };
-  $('launcherUpdate').onclick = async () => {
-    await run('launcher_update_install');
-    refreshUpdater();
+  $('launcherUpdate').onclick = () => {
+    if (updatesState && updatesState.launcher.restart_pending) return restartLauncher();
+    installUpdates(['launcher']);
   };
   $('protonInstallDw').onclick = async () => {
     setBusy(true);
@@ -983,8 +1040,7 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
     await refresh();
     await refreshProton();
     // Not awaited: hashing the DLL and the daily update check must not delay an auto start.
-    refreshLocalify().then(() => checkLocalify(false));
-    refreshUpdater().then(() => checkUpdater(false));
+    refreshUpdates().then(() => checkUpdates(false));
     if (gameFound && (await invoke('take_auto_start'))) return run('start_game'); // start_game also verifies login
     if (loggedIn) {
       try { const s = await invoke('verify_login'); if (!busy) render(s); } catch {}

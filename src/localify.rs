@@ -9,15 +9,17 @@
 use std::fs;
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::{http, launcher::Store, platform};
+use crate::launcher::{Settings, Store, UpdateCheck};
+use crate::{github, http, platform};
 
-const RELEASES_API: &str = "https://api.github.com/repos/chinosk6/gakuen-imas-localify/releases";
+const REPO: &str = "chinosk6/gakuen-imas-localify";
 const DLL_NAME: &str = "version.dll";
+/// The game's executable when no override is set.
+const GAME_EXE: &str = "gakumas.exe";
 const MAX_DLL_SIZE: u64 = 64 * 1024 * 1024;
 const ARCHIVE_PREFIX: &str = "DMM_GakumasLocalify_";
 const LOCAL_DIR: &str = "gakumas-local";
@@ -25,8 +27,6 @@ const LOCAL_FILES: &str = "local-files";
 const ENGLISH_ASSETS_URL: &str = "https://api.github.com/repos/NatsumeLS/Gakumas-Translation-Data-EN/releases/latest";
 /// Upper bound for any single file extracted from the archive.
 const MAX_ENTRY_SIZE: u64 = 64 * 1024 * 1024;
-/// The automatic update check on launch runs at most this often.
-pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// What the launcher knows about Localify in the selected game folder.
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -37,7 +37,8 @@ pub struct Status {
     pub version: Option<String>,
     /// Newest release tag seen by the last update check.
     pub latest: Option<String>,
-    /// The installed release is known and differs from `latest`.
+    /// `latest` is newer than the installed release, or the installed DLL
+    /// does not match the one the launcher recorded (its version is unknown).
     pub update_available: bool,
     /// Unix time in seconds of the last successful update check.
     pub checked_at: Option<u64>,
@@ -56,30 +57,33 @@ pub fn install(
     store: &Store,
     progress: &dyn Fn(&str, Option<f32>),
 ) -> Result<String, String> {
-    let game_path = store
-        .settings()
+    let settings = store.settings();
+    let game_path = settings
         .game_path
+        .clone()
         .filter(|p| !p.trim().is_empty())
         .ok_or("Please select the game folder first")?;
     let game_dir = PathBuf::from(game_path);
     if !game_dir.is_dir() {
         return Err(format!("Game folder not found: {}", game_dir.display()));
     }
+    ensure_game_closed(&settings)?;
 
     let (version, archive) = cached_archive(base, progress)?;
+    // Checked again: the game may have been started during the download.
+    ensure_game_closed(&settings)?;
     progress("Installing the Localify DLL...", None);
     let zip =
         fs::File::open(&archive).map_err(|e| format!("Could not open Localify archive: {e}"))?;
     let english = !platform::system_language_is_chinese();
     let (dll_sha256, first_install) = install_from_archive(zip, &game_dir, english)?;
-    let checked_at = now_secs();
     let saved = store.update_localify(|r| {
         r.tag = Some(version.clone());
         r.dll_sha256 = Some(dll_sha256);
-        // Installing just read the release list, so it counts as an update check.
-        r.latest_tag = Some(version.clone());
-        r.checked_at = Some(checked_at);
     });
+    // Installing just read the release list, so record the newest tag. The
+    // shared clock stays put: the launcher's release was not checked.
+    let _ = store.update_update_check(|c| c.localify = Some(version.clone()));
     let done = match (first_install, english) {
         (true, true) => format!("Localify {version} installed with the English translation settings."),
         (true, false) => format!("Localify {version} installed."),
@@ -105,60 +109,72 @@ fn install_from_archive(
     }
 }
 
-/// Report the installed Localify release without using the network.
-pub fn status(store: &Store) -> Status {
-    let record = store.localify();
-    let dll = store
+/// Refuse to replace the DLL while the game runs: Windows keeps a loaded DLL
+/// locked, and the game would keep the old version until it restarts anyway.
+fn ensure_game_closed(settings: &Settings) -> Result<(), String> {
+    let override_name = settings
+        .game_exe_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .and_then(|p| Path::new(p).file_name())
+        .map(|name| name.to_string_lossy().into_owned());
+    let running = std::iter::once(GAME_EXE.to_string())
+        .chain(override_name)
+        .any(|name| platform::is_process_running(&name));
+    if running {
+        return Err("The game is running. Close it before installing or updating Localify.".into());
+    }
+    Ok(())
+}
+
+/// `version.dll` in the selected game folder, if it exists.
+fn installed_dll(store: &Store) -> Option<PathBuf> {
+    store
         .settings()
         .game_path
         .filter(|p| !p.trim().is_empty())
         .map(|p| PathBuf::from(p).join(DLL_NAME))
-        .filter(|p| p.is_file());
+        .filter(|p| p.is_file())
+}
+
+/// Whether `version.dll` is in the selected game folder (no hashing).
+pub fn is_installed(store: &Store) -> bool {
+    installed_dll(store).is_some()
+}
+
+/// Report the installed Localify release against the saved update check,
+/// without using the network.
+pub fn status(store: &Store, check: &UpdateCheck) -> Status {
+    let record = store.localify();
+    let dll = installed_dll(store);
     let version = match (&dll, record.tag, record.dll_sha256) {
         (Some(dll), Some(tag), Some(expected)) => fs::File::open(dll)
-            .and_then(sha256_hex)
+            .and_then(github::sha256_hex)
             .is_ok_and(|actual| actual == expected)
             .then_some(tag),
         _ => None,
     };
-    let update_available = matches!((&version, &record.latest_tag), (Some(v), Some(latest)) if v != latest);
+    let update_available = dll.is_some()
+        && match (&version, &check.localify) {
+            (Some(installed), Some(latest)) => github::is_newer(latest, installed),
+            // A DLL the launcher did not install (or one replaced since):
+            // installing the latest release is the only way to know the version.
+            (None, Some(_)) => true,
+            (_, None) => false,
+        };
     Status {
         installed: dll.is_some(),
         version,
-        latest: record.latest_tag,
+        latest: check.localify.clone(),
         update_available,
-        checked_at: record.checked_at,
+        checked_at: check.checked_at,
     }
 }
 
-/// Look up the newest release and save its tag. Unless `force` is set, this
-/// only reaches GitHub when Localify is installed and the last check is older
-/// than [`UPDATE_CHECK_INTERVAL`].
-pub fn check_for_updates(store: &Store, force: bool) -> Result<Status, String> {
-    let current = status(store);
-    if !force && (!current.installed || !check_due(current.checked_at, now_secs())) {
-        return Ok(current);
-    }
-    let release = latest_release(&ureq::agent())?;
-    let checked_at = now_secs();
-    store.update_localify(|r| {
-        r.latest_tag = Some(release.tag);
-        r.checked_at = Some(checked_at);
-    })?;
-    Ok(status(store))
-}
-
-/// A check is due when none has run yet, the interval has passed, or the
-/// saved time is in the future (the clock was moved back).
-fn check_due(checked_at: Option<u64>, now: u64) -> bool {
-    checked_at.map_or(true, |t| t > now || now - t >= UPDATE_CHECK_INTERVAL.as_secs())
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// The newest Localify release tag.
+pub fn latest_tag(agent: &ureq::Agent) -> Result<String, String> {
+    latest_release(agent).map(|release| release.tag)
 }
 
 /// Download the newest Localify archive into `base` unless a verified copy is
@@ -168,14 +184,18 @@ pub(crate) fn cached_archive(
     progress: &dyn Fn(&str, Option<f32>),
 ) -> Result<(String, PathBuf), String> {
     progress("Checking the latest Localify release...", None);
-    let agent = ureq::agent();
+    let agent = github::agent();
     let release = latest_release(&agent)?;
     let archive = base.join(format!("{ARCHIVE_PREFIX}{}.zip", release.tag));
     let cached = http::cached_file_has_size(&archive, release.size)
         && fs::File::open(&archive).is_ok_and(|mut file| verify_archive(&mut file, &release.sha256).is_ok());
     if !cached {
-        progress(&format!("Downloading Localify {}...", release.tag), None);
-        http::download_file(&agent, &release.url, &archive, Some(release.size), |file| {
+        let label = format!("Downloading Localify {}...", release.tag);
+        progress(&label, None);
+        let report = |done: u64, total: Option<u64>| {
+            progress(&label, total.filter(|&t| t > 0).map(|t| done as f32 * 100.0 / t as f32));
+        };
+        http::download_file_with_progress(&agent, &release.url, &archive, Some(release.size), &report, |file| {
             verify_archive(file, &release.sha256)
         })?;
     }
@@ -184,51 +204,30 @@ pub(crate) fn cached_archive(
 }
 
 fn latest_release(agent: &ureq::Agent) -> Result<Release, String> {
-    let body = agent
-        .get(RELEASES_API)
-        .call()
-        .map_err(|e| format!("Failed to reach the Localify releases: {e}"))?
-        .into_string()
-        .map_err(|e| e.to_string())?;
-    let releases: Vec<Value> =
-        serde_json::from_str(&body).map_err(|e| format!("Failed to parse releases: {e}"))?;
-    parse_latest_release(&releases)
+    parse_latest_release(&github::releases(agent, REPO)?)
 }
 
+fn is_dmm_asset(name: &str) -> bool {
+    name.starts_with("DMM_GakumasLocalify_v") && name.ends_with(".zip")
+}
+
+/// The highest-versioned release with a DMM build. Localify publishes every
+/// release as a prerelease, so only drafts are skipped.
 fn parse_latest_release(releases: &[Value]) -> Result<Release, String> {
     let (tag, asset) = releases
         .iter()
-        .find_map(|r| {
-            let tag = r["tag_name"].as_str()?;
-            let asset = r["assets"].as_array()?.iter().find(|a| {
-                a["name"]
-                    .as_str()
-                    .is_some_and(|n| n.starts_with("DMM_GakumasLocalify_v") && n.ends_with(".zip"))
-            })?;
-            Some((tag, asset))
-        })
+        .filter(|r| !github::is_draft(r))
+        .filter_map(|r| Some((r["tag_name"].as_str()?, github::find_asset(r, is_dmm_asset)?)))
+        // GitHub lists newest first; reversing keeps the newest of equal (or
+        // unparseable) versions, so a later hotfix to an older line never wins.
+        .rev()
+        .max_by_key(|(tag, _)| github::parse_version(tag))
         .ok_or("No DMM_GakumasLocalify_v*.zip asset found")?;
     if !valid_tag(tag) {
         return Err(format!("Unexpected Localify release tag: {tag}"));
     }
-    let url = asset["browser_download_url"]
-        .as_str()
-        .ok_or("Missing Localify download URL in the release metadata")?;
-    let size = asset["size"]
-        .as_u64()
-        .filter(|&size| size > 0)
-        .ok_or("Invalid Localify archive size in the release metadata")?;
-    let sha256 = asset["digest"]
-        .as_str()
-        .and_then(|d| d.strip_prefix("sha256:"))
-        .filter(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
-        .ok_or("The Localify release has no SHA-256 digest to verify the download")?;
-    Ok(Release {
-        tag: tag.to_string(),
-        url: url.to_string(),
-        size,
-        sha256: sha256.to_ascii_lowercase(),
-    })
+    let asset = github::parse_asset(asset)?;
+    Ok(Release { tag: tag.to_string(), url: asset.url, size: asset.size, sha256: asset.sha256 })
 }
 
 /// The tag becomes part of a cache file name, so allow only plain characters.
@@ -251,22 +250,9 @@ fn prune_archives(base: &Path, keep: &Path) {
     }
 }
 
-fn sha256_hex(mut reader: impl Read) -> io::Result<String> {
-    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        ctx.update(&buf[..n]);
-    }
-    Ok(ctx.finish().as_ref().iter().map(|b| format!("{b:02x}")).collect())
-}
-
 /// Check the archive against the release's SHA-256, then that it holds the DLL.
 fn verify_archive(file: &mut fs::File, sha256: &str) -> Result<(), String> {
-    let actual = sha256_hex(&mut *file).map_err(|e| format!("Could not read Localify archive: {e}"))?;
+    let actual = github::sha256_hex(&mut *file).map_err(|e| format!("Could not read Localify archive: {e}"))?;
     if actual != sha256 {
         return Err("The Localify archive does not match the release's SHA-256 digest".into());
     }
@@ -317,7 +303,7 @@ fn stage_dll<R: Read + Seek>(
         return Err(format!("Unexpected size for {DLL_NAME} in Localify archive"));
     }
     staged.as_file_mut().rewind().map_err(|e| format!("Could not read {DLL_NAME}: {e}"))?;
-    let sha256 = sha256_hex(staged.as_file_mut()).map_err(|e| format!("Could not read {DLL_NAME}: {e}"))?;
+    let sha256 = github::sha256_hex(staged.as_file_mut()).map_err(|e| format!("Could not read {DLL_NAME}: {e}"))?;
     Ok((staged, sha256))
 }
 
@@ -430,7 +416,7 @@ mod tests {
     }
 
     fn sha(data: &[u8]) -> String {
-        sha256_hex(data).unwrap()
+        github::sha256_hex(data).unwrap()
     }
 
     /// A store whose settings point at `game`.
@@ -603,63 +589,87 @@ mod tests {
     }
 
     #[test]
-    fn check_is_due_once_a_day_or_when_the_clock_goes_back() {
-        let day = UPDATE_CHECK_INTERVAL.as_secs();
-        assert!(check_due(None, 1_000));
-        assert!(!check_due(Some(1_000), 1_000 + day - 1));
-        assert!(check_due(Some(1_000), 1_000 + day));
-        assert!(check_due(Some(5_000), 1_000));
+    fn latest_release_is_the_highest_version_and_skips_drafts() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let mut draft = release_json("v9.0.0", Some(&digest));
+        draft["draft"] = json!(true);
+        // Prereleases still count: Localify marks every release as one.
+        let mut pre = release_json("v3.5.0", Some(&digest));
+        pre["prerelease"] = json!(true);
+        let hotfix = release_json("v3.4.2", Some(&digest));
+        let release = parse_latest_release(&[draft, hotfix, pre]).unwrap();
+        assert_eq!(release.tag, "v3.5.0");
+    }
+
+    /// A saved update check that saw `latest` as the newest Localify release.
+    fn seen(latest: &str) -> UpdateCheck {
+        UpdateCheck { localify: Some(latest.into()), ..Default::default() }
     }
 
     #[test]
-    fn store_keeps_the_localify_record() {
+    fn store_keeps_the_localify_record_and_update_check() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path().to_path_buf()).unwrap();
         assert_eq!(store.localify(), Default::default());
+        assert_eq!(store.update_check(), Default::default());
         store.update_localify(|r| r.tag = Some("v1".into())).unwrap();
-        store.update_localify(|r| r.latest_tag = Some("v2".into())).unwrap();
-        let record = store.localify();
-        assert_eq!(record.tag.as_deref(), Some("v1"));
-        assert_eq!(record.latest_tag.as_deref(), Some("v2"));
+        store.update_update_check(|c| c.localify = Some("v2".into())).unwrap();
+        store.update_update_check(|c| c.checked_at = Some(7)).unwrap();
+        assert_eq!(store.localify().tag.as_deref(), Some("v1"));
+        assert_eq!(store.update_check(), UpdateCheck { checked_at: Some(7), localify: Some("v2".into()), launcher: None });
     }
 
     #[test]
     fn status_reports_the_recorded_version_only_while_the_dll_matches() {
         let game = tempfile::tempdir().unwrap();
         let (_data, store) = store_for(game.path());
-        assert!(!status(&store).installed);
+        assert!(!status(&store, &seen("v2")).installed);
 
         fs::write(game.path().join(DLL_NAME), b"dll").unwrap();
-        let unknown = status(&store);
+        let unknown = status(&store, &UpdateCheck::default());
         assert!(unknown.installed && unknown.version.is_none() && !unknown.update_available);
 
         store
             .update_localify(|r| {
                 r.tag = Some("v1".into());
                 r.dll_sha256 = Some(sha(b"dll"));
-                r.latest_tag = Some("v2".into());
             })
             .unwrap();
-        let known = status(&store);
+        let known = status(&store, &seen("v2"));
         assert_eq!(known.version.as_deref(), Some("v1"));
         assert!(known.update_available);
 
+        // An unrecognized DLL has an unknown version, so the latest release is offered.
         fs::write(game.path().join(DLL_NAME), b"replaced").unwrap();
-        let replaced = status(&store);
-        assert!(replaced.installed && replaced.version.is_none() && !replaced.update_available);
+        let replaced = status(&store, &seen("v2"));
+        assert!(replaced.installed && replaced.version.is_none() && replaced.update_available);
     }
 
     #[test]
-    fn automatic_check_skips_the_network_when_not_due() {
+    fn an_older_latest_tag_is_not_an_update() {
         let game = tempfile::tempdir().unwrap();
         let (_data, store) = store_for(game.path());
-        // Not installed: no check, even though none has run.
-        assert_eq!(check_for_updates(&store, false).unwrap().checked_at, None);
-        // Installed and checked just now: the saved result is returned.
         fs::write(game.path().join(DLL_NAME), b"dll").unwrap();
-        let now = now_secs();
-        store.update_localify(|r| { r.latest_tag = Some("v9".into()); r.checked_at = Some(now); }).unwrap();
-        let s = check_for_updates(&store, false).unwrap();
-        assert_eq!((s.latest.as_deref(), s.checked_at), (Some("v9"), Some(now)));
+        let installed = |tag: &str| {
+            store
+                .update_localify(|r| {
+                    r.tag = Some(tag.into());
+                    r.dll_sha256 = Some(sha(b"dll"));
+                })
+                .unwrap();
+        };
+        installed("v3.5.0");
+        assert!(!status(&store, &seen("v3.4.1")).update_available);
+        assert!(!status(&store, &seen("v3.5.0")).update_available);
+        installed("v3.4.1");
+        assert!(status(&store, &seen("v3.5.0")).update_available);
+    }
+
+    #[test]
+    fn install_refuses_while_the_game_runs() {
+        // The test binary itself stands in for a running game executable.
+        let exe = std::env::current_exe().unwrap();
+        let settings = Settings { game_exe_override: Some(exe.display().to_string()), ..Settings::default() };
+        assert!(ensure_game_closed(&settings).unwrap_err().contains("Close it"));
     }
 }
