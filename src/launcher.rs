@@ -131,7 +131,7 @@ pub struct VpnFile {
     pub needs_auth: bool,
 }
 
-/// What the launcher last installed from Localify, and its last update check.
+/// What the launcher last installed from Localify.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct LocalifyRecord {
     /// Release tag of the installed `version.dll`.
@@ -140,12 +140,27 @@ pub struct LocalifyRecord {
     /// SHA-256 (lowercase hex) of the installed `version.dll`.
     #[serde(default)]
     pub dll_sha256: Option<String>,
-    /// Newest release tag seen by the last successful update check.
-    #[serde(default)]
-    pub latest_tag: Option<String>,
-    /// Unix time in seconds of the last successful update check.
+}
+
+/// Saved update lookups. The daily check on launch looks up the launcher and
+/// Localify together on one clock; a button looks up only its own component.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct UpdateCheck {
+    /// Unix time in seconds of the last daily check where every lookup succeeded.
     #[serde(default)]
     pub checked_at: Option<u64>,
+    /// Newest launcher release tag for this platform.
+    #[serde(default)]
+    pub launcher: Option<String>,
+    /// Unix time in seconds the launcher's releases were last looked up.
+    #[serde(default)]
+    pub launcher_checked_at: Option<u64>,
+    /// Newest Localify release tag.
+    #[serde(default)]
+    pub localify: Option<String>,
+    /// Unix time in seconds Localify's releases were last looked up.
+    #[serde(default)]
+    pub localify_checked_at: Option<u64>,
 }
 
 /// 프로그램 데이터 (설정, 암호화된 로그인 토큰, 기기 ID, VPN Gate 목록 캐시, VPN 설정 파일)
@@ -155,8 +170,9 @@ pub struct Store {
 // Rotation reopens the same directory through a second Store. Both writers
 // must serialize access to the shared vpngate.csv.tmp file.
 static VPNGATE_CACHE_LOCK: Mutex<()> = Mutex::new(());
-// The install and the background update check both rewrite localify.json.
+// Installs and the background update check rewrite these records.
 static LOCALIFY_LOCK: Mutex<()> = Mutex::new(());
+static UPDATE_CHECK_LOCK: Mutex<()> = Mutex::new(());
 
 fn file_age(p: &Path) -> Option<Duration> {
     fs::metadata(p).ok()?.modified().ok()?.elapsed().ok()
@@ -262,25 +278,50 @@ impl Store {
         Ok(())
     }
 
-    /// The saved Localify record, or an empty one if none was saved or it is unreadable.
-    pub fn localify(&self) -> LocalifyRecord {
-        fs::read(self.file("localify.json"))
+    /// A saved JSON record, or the default if none was saved or it is unreadable.
+    fn record<T: serde::de::DeserializeOwned + Default>(&self, name: &str) -> T {
+        fs::read(self.file(name))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default()
     }
 
+    /// Change a saved JSON record in place under `lock` and return the result.
+    fn update_record<T: Serialize + serde::de::DeserializeOwned + Default>(
+        &self,
+        name: &str,
+        lock: &Mutex<()>,
+        change: impl FnOnce(&mut T),
+    ) -> Result<T, String> {
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut record = self.record(name);
+        change(&mut record);
+        let failed = |e: &dyn std::fmt::Display| format!("Failed to save {name}: {e}");
+        let text = serde_json::to_string_pretty(&record).map_err(|e| failed(&e))?;
+        let tmp = self.file(&format!("{name}.tmp"));
+        fs::write(&tmp, text).map_err(|e| failed(&e))?;
+        fs::rename(&tmp, self.file(name)).map_err(|e| failed(&e))?;
+        Ok(record)
+    }
+
+    /// The saved Localify record.
+    pub fn localify(&self) -> LocalifyRecord {
+        self.record("localify.json")
+    }
+
     /// Change the saved Localify record in place and return the result.
     pub fn update_localify(&self, change: impl FnOnce(&mut LocalifyRecord)) -> Result<LocalifyRecord, String> {
-        let _guard = LOCALIFY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let mut record = self.localify();
-        change(&mut record);
-        let text = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
-        let tmp = self.file("localify.json.tmp");
-        fs::write(&tmp, text).map_err(|e| format!("Failed to save the Localify record: {e}"))?;
-        fs::rename(&tmp, self.file("localify.json"))
-            .map_err(|e| format!("Failed to save the Localify record: {e}"))?;
-        Ok(record)
+        self.update_record("localify.json", &LOCALIFY_LOCK, change)
+    }
+
+    /// The last update check.
+    pub fn update_check(&self) -> UpdateCheck {
+        self.record("updates.json")
+    }
+
+    /// Change the saved update check in place and return the result.
+    pub fn update_update_check(&self, change: impl FnOnce(&mut UpdateCheck)) -> Result<UpdateCheck, String> {
+        self.update_record("updates.json", &UPDATE_CHECK_LOCK, change)
     }
 
     pub fn token(&self) -> Option<String> {

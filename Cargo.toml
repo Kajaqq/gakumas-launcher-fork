@@ -47,7 +47,9 @@ native-tls = "0.2"
 boringtun = "0.7.1"
 ring = "0.17"
 ctr = "0.9"
-self_update = { version = "1.3.3", default-features = false, features = ["github", "ureq", "rustls", "checksums"] }
+# Launcher self-update: swap the running executable for a verified download.
+self-replace = "1.5"
+semver = "1"
 
 [target.'cfg(windows)'.dependencies]
 # Same versions Tauri/wry use; only for switching on WebView2's own password save in the login window.

@@ -13,10 +13,12 @@ pub mod browser_proxy;
 #[cfg(not(windows))]
 pub mod proton;
 
+pub mod github;
 pub mod http;
 pub mod launcher;
 pub mod localify;
 pub mod updater;
+pub mod updates;
 pub mod netstack;
 pub mod openvpn;
 pub mod vpngate;

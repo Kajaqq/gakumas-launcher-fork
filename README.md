@@ -43,7 +43,7 @@ The Linux build runs the Windows game through a user-selected Proton version.
 3. Use **Game folder → Change** to point at the folder containing `gakumas.exe` (auto-detection from DMM GAME PLAYER only works on Windows). Use **Executable override** to choose a different executable.
 4. Log in and start the game as usual.
 
-The **Localization (Localify)** panel downloads the latest `DMM_GakumasLocalify_v*.zip` from [gakuen-imas-localify](https://github.com/chinosk6/gakuen-imas-localify) and installs it next to `gakumas.exe`. On a first install (no `gakumas-local` folder yet) it extracts `version.dll` and `gakumas-local/`. Unless the system language is Chinese, it leaves out the bundled Chinese `local-files`, sets `replaceFont` to `false` in `localizationConfig.json`, and in `config.json` sets `useAPITextureAssets` to `false`, `useAPIAssets` to `true`, and `useAPIAssetsURL` to the [English translation data](https://github.com/NatsumeLS/Gakumas-Translation-Data-EN). An update replaces only `version.dll` and leaves existing localization files alone. The download is checked against the release's SHA-256 digest, and only the newest archive is kept in the cache. The launcher records the installed tag and the SHA-256 of `version.dll`, shows whether Localify is installed and which version, and checks for a newer release at most once every 24 hours on launch (or on demand with **Check for updates**).
+The **Localization (Localify)** panel downloads the latest `DMM_GakumasLocalify_v*.zip` from [gakuen-imas-localify](https://github.com/chinosk6/gakuen-imas-localify) and installs it next to `gakumas.exe`. On a first install (no `gakumas-local` folder yet) it extracts `version.dll` and `gakumas-local/`. Unless the system language is Chinese, it leaves out the bundled Chinese `local-files`, sets `replaceFont` to `false` in `localizationConfig.json`, and in `config.json` sets `useAPITextureAssets` to `false`, `useAPIAssets` to `true`, and `useAPIAssetsURL` to the [English translation data](https://github.com/NatsumeLS/Gakumas-Translation-Data-EN). An update replaces only `version.dll` and leaves existing localization files alone. The download is checked against the release's SHA-256 digest, and only the newest archive is kept in the cache. The launcher records the installed tag and the SHA-256 of `version.dll`, shows whether Localify is installed and which version, and looks for a newer release as part of the shared update check described below. Releases are compared as semver, so an older tag is never offered as an update. A `version.dll` the launcher did not install counts as unknown, and the latest release is offered for it. Installing or updating is refused while the game is running.
 
 Before launching, the launcher downloads and verifies the anti-debug driver (`usrdrv017764.sys`), installs it into the prefix, and registers/starts its service in the **same Wine session** as the game via a generated CMD script. Wine's `NtLoadDriver` is a stub, so doing this beforehand is what lets the original executable run. `WINE_SERVICES_SESSION0=1` and `version.dll=n,b` (native then builtin, for localization mods) are set automatically.
 
@@ -53,11 +53,22 @@ rather than an upstream release: that exact build is needed for the in-game
 Vuplex webview. See [assets/dxvk/SOURCE.md](assets/dxvk/SOURCE.md) for hashes
 and provenance.
 
-The **Launcher update** panel shows the version compiled into the running executable and the newest
-release from [the fork's GitHub releases](https://github.com/Portalboy07/gakumas-launcher-fork/releases).
-The startup check is cached for 24 hours; **Check for updates** refreshes it, and **Update launcher**
-downloads the matching Windows/Linux binary and replaces the executable. Release builds set
-`Cargo.toml`'s version from the git tag, so the displayed version matches the release tag.
+The **Launcher update** panel shows the running version and the newest stable release from
+[the fork's GitHub releases](https://github.com/Portalboy07/gakumas-launcher-fork/releases) that has a
+binary for this platform (prereleases are offered only to prerelease builds). **Update launcher**
+downloads `GakumasLauncher.exe` or `GakumasLauncher-linux`, checks it against the release's SHA-256
+digest, replaces the executable, and then offers to restart. Every build, including forks' builds,
+updates from this repository's releases. The release workflow passes the tag's version to the compiler
+(`LAUNCHER_VERSION`), so `Cargo.toml` and `Cargo.lock` are not modified and the build stays
+`--locked`. Local builds show
+`Cargo.toml`'s version, can check for updates, and do not replace themselves.
+
+On launch the launcher and Localify are checked together, at most once every 24 hours. Localify is
+looked up only while it is installed. If a lookup fails, the other result is still saved and the
+check runs again on the next launch. Each panel's **Check for updates** button looks up only that
+panel's component, right away, and does not reset the daily check. When a check finds an update that
+can be installed, a popup lists it and asks whether to install it now. **Later** skips it until the next check. The popup waits until no other task or popup
+is open, installs Localify before the launcher, and offers to restart after a launcher update.
 
 The Proton version and prefix are remembered in the launcher's settings.
 
