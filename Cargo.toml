@@ -1,6 +1,6 @@
 [package]
 name = "gakumas-launcher"
-version = "0.1.2"
+version = "0.3.0"
 edition = "2021"
 publish = false
 license = "MIT"
@@ -47,6 +47,7 @@ native-tls = "0.2"
 boringtun = "0.7.1"
 ring = "0.17"
 ctr = "0.9"
+self_update = { version = "1.3.3", default-features = false, features = ["github", "ureq", "rustls", "checksums"] }
 
 [target.'cfg(windows)'.dependencies]
 # Same versions Tauri/wry use; only for switching on WebView2's own password save in the login window.

@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use gakumas_launcher::launcher::{self, SignIn, Status, Store};
 use gakumas_launcher::localify;
+use gakumas_launcher::updater;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -733,6 +734,34 @@ async fn localify_check(app: AppHandle, force: bool) -> Result<localify::Status,
     .map_err(|e| e.to_string())?
 }
 
+/// Current launcher version and the last cached release check (no network).
+#[tauri::command]
+async fn launcher_update_status(app: AppHandle) -> Result<updater::Status, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+        Ok(updater::status(&base))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Check GitHub releases for a newer launcher. `force` bypasses the 24h cache.
+#[tauri::command]
+async fn launcher_update_check(app: AppHandle, force: bool) -> Result<updater::Status, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+        updater::check(&base, force)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Download and install the launcher release. Triggered only by the UI button.
+#[tauri::command]
+async fn launcher_update_install(app: AppHandle) -> Result<String, String> {
+    run_busy(app, |_, _| updater::update()).await
+}
+
 /// 화면(작업 표시줄 제외)보다 창이 크면 높이를 줄여 화면 안에 들어오게 함.
 /// 이때만 내용이 길면 스크롤이 생기고, 보통 화면에서는 기본 높이(스크롤 없음)를 그대로 씀
 fn fit_to_screen(win: &tauri::WebviewWindow) {
@@ -834,6 +863,9 @@ fn main() {
             localify_install,
             localify_status,
             localify_check,
+            launcher_update_status,
+            launcher_update_check,
+            launcher_update_install,
             open_dmm_browser,
             open_dmm_registration,
             dmm_browser_navigate

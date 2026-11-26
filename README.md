@@ -53,6 +53,12 @@ rather than an upstream release: that exact build is needed for the in-game
 Vuplex webview. See [assets/dxvk/SOURCE.md](assets/dxvk/SOURCE.md) for hashes
 and provenance.
 
+The **Launcher update** panel shows the version compiled into the running executable and the newest
+release from [the fork's GitHub releases](https://github.com/Portalboy07/gakumas-launcher-fork/releases).
+The startup check is cached for 24 hours; **Check for updates** refreshes it, and **Update launcher**
+downloads the matching Windows/Linux binary and replaces the executable. Release builds set
+`Cargo.toml`'s version from the git tag, so the displayed version matches the release tag.
+
 The Proton version and prefix are remembered in the launcher's settings.
 
 The Linux driver-fix approach is based on [0nikod/gakumas-proton](https://github.com/0nikod/gakumas-proton), which documents preloading the `usrdrv017764.sys` anti-debug driver service in the same Wine session so the original executable can start.

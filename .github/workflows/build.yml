@@ -37,8 +37,19 @@ jobs:
             librsvg2-dev \
             patchelf
 
+      - name: Set version from release tag
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          python - "$VERSION" <<'PY'
+          import pathlib, re, sys
+          p = pathlib.Path("Cargo.toml")
+          text = p.read_text()
+          p.write_text(re.sub(r'(?m)^version = "[^"]+"', f'version = "{sys.argv[1]}"', text, count=1))
+          PY
+
       - name: Build
-        run: cargo build --release --locked --bins
+        run: cargo build --release --bins
 
       - name: Collect (Windows)
         if: runner.os == 'Windows'

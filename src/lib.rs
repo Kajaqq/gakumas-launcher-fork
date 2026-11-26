@@ -16,6 +16,7 @@ pub mod proton;
 pub mod http;
 pub mod launcher;
 pub mod localify;
+pub mod updater;
 pub mod netstack;
 pub mod openvpn;
 pub mod vpngate;
