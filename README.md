@@ -103,6 +103,10 @@ The Linux build runs the Windows game through [DW-Proton](https://github.com/daw
   - If an existing symlink pointed elsewhere, that folder's contents are copied in and the old link is kept as `BANDAI NAMCO Entertainment Inc_.wrong-link`.
   - If the move fails, the game still launches with its data inside the prefix.
 
+### Desktop entry and icon
+
+On every start the Linux build installs (or refreshes) its desktop entry, `~/.local/share/applications/local.gakumas.launcher.desktop`, and its icon. The launcher then shows up in the application menu. Wayland compositors (KWin, GNOME Shell) take a window's icon from the desktop entry whose name matches the window's app id (`local.gakumas.launcher`), so without this entry they show a generic icon. The entry's `Exec=` follows the binary if it moves. To customize the entry, delete its `X-GakumasLauncher-Managed=true` line and the launcher will no longer touch it. A shortcut you made yourself under another file name launches the launcher fine, but it does not supply the window icon; use the generated entry instead, for example via *Add to Desktop* in the application menu.
+
 ## Data folder
 
 Settings, encrypted credentials, cached downloads, and (on Linux) the default Proton prefix and `game-appdata/` are stored in the launcher's app-local-data folder:

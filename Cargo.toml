@@ -66,6 +66,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Same version GTK/Tauri use; only to set the program name, which GTK 3 sends
+# to Wayland compositors as the window's app id.
+glib = "0.18"
+
 [profile.release]
 # Balance binary size and runtime speed:
 # - Default to size optimization (`"s"`) with full LTO, symbol stripping, and
