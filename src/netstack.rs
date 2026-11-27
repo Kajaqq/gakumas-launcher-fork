@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
@@ -150,6 +150,58 @@ mod tests {
             assert_eq!(stack.tcp_connected(current), Ok(false));
         }
     }
+
+    #[test]
+    fn resolve_in_tunnel_races_pushed_dns_without_waiting_on_unreachable_servers() {
+        let (a, b) = (Packets::default(), Packets::default());
+        struct DnsPipe { addr: [u8; 4], dns: Vec<[u8; 4]>, rx: Packets, tx: Packets }
+        impl IpTunnel for DnsPipe {
+            fn address(&self) -> TunnelAddr {
+                TunnelAddr { local_ip: self.addr, prefix_len: 24, gateway: None, mtu: 1300, dns: self.dns.clone() }
+            }
+            fn send_ip(&mut self, ip: &[u8]) -> Result<(), String> {
+                self.tx.lock().unwrap().push_back(ip.to_vec()); Ok(())
+            }
+            fn pump(&mut self, _: Duration) -> Result<(), String> { Ok(()) }
+            fn take_inbound(&mut self) -> Option<Vec<u8>> { self.rx.lock().unwrap().pop_front() }
+        }
+        let client = Arc::new(Mutex::new(
+            TunnelStack::new(DnsPipe { addr: [10, 0, 0, 1], dns: vec![[10, 0, 0, 2]], rx: a.clone(), tx: b.clone() }).unwrap()
+        ));
+        let mut server = TunnelStack::new(DnsPipe { addr: [10, 0, 0, 2], dns: vec![], rx: b, tx: a }).unwrap();
+        let mut listener = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; 8192]), tcp::SocketBuffer::new(vec![0; 8192]));
+        listener.listen((Ipv4Address::new(10, 0, 0, 2), 53)).unwrap();
+        let dns_sock = server.sockets.add(listener);
+
+        let started = Instant::now();
+        let lookup = {
+            let client = client.clone();
+            std::thread::spawn(move || {
+                TunnelStack::resolve_in_tunnel_shared(&client, "api.dmm.test", Duration::from_secs(3))
+            })
+        };
+        let mut pending = Vec::new();
+        while !lookup.is_finished() && started.elapsed() < Duration::from_secs(3) {
+            server.keepalive().unwrap();
+            let s = server.sockets.get_mut::<tcp::Socket>(dns_sock);
+            if s.can_recv() {
+                s.recv(|buf| { pending.extend_from_slice(buf); (buf.len(), ()) }).unwrap();
+                if dns_tcp_complete(&pending) {
+                    let mut ans = pending[2..].to_vec();
+                    ans[2..4].copy_from_slice(&[0x81, 0x80]);
+                    ans[6..8].copy_from_slice(&[0, 1]);
+                    ans.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, 42]);
+                    let reply = [&(ans.len() as u16).to_be_bytes()[..], &ans].concat();
+                    s.send_slice(&reply).unwrap();
+                    s.close();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(lookup.join().unwrap(), Ok(Ipv4Addr::new(203, 0, 113, 42)));
+        assert!(started.elapsed() < Duration::from_secs(1), "DNS race waited too long: {:?}", started.elapsed());
+        assert_eq!(client.lock().unwrap().cached_ip("api.dmm.test"), Some(Ipv4Addr::new(203, 0, 113, 42)));
+    }
 }
 
 /// 터널 안에서 이 프로그램이 쓰는 주소
@@ -239,6 +291,7 @@ pub struct TunnelStack {
     proxy_handles: HashMap<ProxyHandle, SocketHandle>,
     retired: Vec<(SocketHandle, Instant)>,
     next_port: u16,
+    last_activity: Instant,
 }
 
 /// DNS-over-TCP 질의 (2바이트 길이 + DNS 메시지, A 레코드)
@@ -308,6 +361,18 @@ const DOH_SERVERS: &[([u8; 4], &str, &str)] = &[
     ([1, 1, 1, 1], "cloudflare-dns.com", "/dns-query"),
 ];
 
+fn parse_doh_a_record(raw: &[u8]) -> Result<Ipv4Addr, String> {
+    let (_, body) = http::parse_response(raw)?;
+    let v: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+    v["Answer"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|a| a["type"] == 1)
+        .find_map(|a| a["data"].as_str()?.parse::<Ipv4Addr>().ok())
+        .ok_or_else(|| "no A record".to_string())
+}
+
 pub fn resolve_v4(host: &str) -> Result<Ipv4Addr, String> {
     (host, 0)
         .to_socket_addrs()
@@ -358,6 +423,7 @@ impl TunnelStack {
             proxy_handles: HashMap::new(),
             retired: Vec::new(),
             next_port: 49152 + u16::from_le_bytes([seed[0], seed[1]]) % 16384,
+            last_activity: Instant::now(),
         })
     }
 
@@ -365,77 +431,323 @@ impl TunnelStack {
         self.hosts.get(host).copied()
     }
 
-    /// `host` 의 주소를 터널 안에서(일본 쪽 DNS 로) 찾아 이후 요청에 씀.
-    /// CDN 은 묻는 쪽 위치에 따라 다른 서버를 알려 주는데, 한국 쪽 서버는 VPN Gate 에서 연결되지 않을 수 있음
+    /// How long since this tunnel last received traffic from the VPN peer.
+    pub fn idle_for(&self) -> Duration {
+        self.last_activity.elapsed()
+    }
+
+    fn dns_tcp_servers(&self) -> Vec<[u8; 4]> {
+        let mut servers = self.dns.clone();
+        for s in [[1, 1, 1, 1], [8, 8, 8, 8]] {
+            if !servers.contains(&s) {
+                servers.push(s);
+            }
+        }
+        servers.truncate(4);
+        servers
+    }
+
+    /// Resolve `host` inside the tunnel (from the Japan exit) and cache the IPv4 address.
+    /// Races pushed DNS + public DNS over TCP:53 first (fast, no TLS overhead), then falls
+    /// back to racing DoH servers if port 53 is blocked.
     pub fn resolve_in_tunnel(&mut self, host: &str) -> Result<Ipv4Addr, String> {
+        self.resolve_in_tunnel_cancellable(host, Duration::from_secs(6), None)
+    }
+
+    pub fn resolve_in_tunnel_cancellable(
+        &mut self,
+        host: &str,
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Ipv4Addr, String> {
+        if let Ok(ip) = host.parse::<Ipv4Addr>() {
+            return Ok(ip);
+        }
+        let total_deadline = Instant::now() + timeout;
+        let mut errors = Vec::new();
+
+        // Phase 1: race TCP:53 queries concurrently (pushed DNS first, then 1.1.1.1 & 8.8.8.8).
+        let tcp_budget = (timeout * 2 / 3).clamp(Duration::from_millis(1200), Duration::from_millis(3500)).min(timeout);
+        match self.race_dns_tcp(host, tcp_budget, cancel) {
+            Ok(addr) => {
+                self.hosts.insert(host.to_string(), addr);
+                return Ok(addr);
+            }
+            Err(e) => errors.push(e),
+        }
+
+        if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+            return Err("DNS lookup cancelled".into());
+        }
+
+        // Phase 2: if port 53 is blocked, race both DoH endpoints concurrently with remaining time.
+        let remaining = total_deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            match self.race_dns_doh(host, remaining, cancel) {
+                Ok(addr) => {
+                    self.hosts.insert(host.to_string(), addr);
+                    return Ok(addr);
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+
+        Err(errors.join(" / "))
+    }
+
+    fn race_dns_tcp(
+        &mut self,
+        host: &str,
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Ipv4Addr, String> {
+        struct Probe {
+            server: Ipv4Addr,
+            id: [u8; 2],
+            handle: SocketHandle,
+            exchange: Exchange,
+        }
+        let servers = self.dns_tcp_servers();
+        let mut probes = Vec::with_capacity(servers.len());
+        let mut errors = Vec::new();
+        for s in servers {
+            let server = Ipv4Addr::from(s);
+            let mut id = [0u8; 2];
+            getrandom::getrandom(&mut id).map_err(|e| e.to_string())?;
+            let query = dns_query(host, id);
+            match Exchange::new("", None, &query, timeout, Completion::Custom(dns_tcp_complete))
+                .and_then(|ex| self.start_socket(server, 53).map(|h| (h, ex)))
+            {
+                Ok((handle, exchange)) => probes.push(Probe { server, id, handle, exchange }),
+                Err(e) => errors.push(format!("DNS {server}: {e}")),
+            }
+        }
+        let mut winner = None;
+        let mut step_err = None;
+        while !probes.is_empty() && winner.is_none() {
+            if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+                step_err = Some("DNS lookup cancelled".into());
+                break;
+            }
+            if let Err(e) = self.step() {
+                step_err = Some(e);
+                break;
+            }
+            let mut i = 0;
+            while i < probes.len() {
+                let tick = if Instant::now() >= probes[i].exchange.deadline {
+                    Err(if probes[i].exchange.connected { "response timed out" } else { "TCP connect timed out" }.into())
+                } else {
+                    let h = probes[i].handle;
+                    probes[i].exchange.advance(self.sockets.get_mut::<tcp::Socket>(h))
+                };
+                match tick {
+                    Ok(false) => i += 1,
+                    Ok(true) => {
+                        let p = probes.swap_remove(i);
+                        self.retire_exchange(p.handle);
+                        match dns_answer(&p.exchange.response, p.id) {
+                            Ok(addr) => {
+                                winner = Some(addr);
+                                break;
+                            }
+                            Err(e) => errors.push(format!("DNS {}: {e}", p.server)),
+                        }
+                    }
+                    Err(e) => {
+                        let p = probes.swap_remove(i);
+                        self.retire_exchange(p.handle);
+                        errors.push(format!("DNS {}: {e}", p.server));
+                    }
+                }
+            }
+        }
+        for p in probes {
+            self.retire_exchange(p.handle);
+        }
+        if let Some(addr) = winner {
+            return Ok(addr);
+        }
+        if let Some(e) = step_err {
+            return Err(e);
+        }
+        Err(errors.join(" / "))
+    }
+
+    fn race_dns_doh(
+        &mut self,
+        host: &str,
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Ipv4Addr, String> {
+        struct Probe {
+            name: &'static str,
+            handle: SocketHandle,
+            exchange: Exchange,
+        }
+        let tls = http::dmm_tls_config();
+        let mut probes = Vec::with_capacity(DOH_SERVERS.len());
         let mut errors = Vec::new();
         for &(ip, name, path) in DOH_SERVERS {
             let req = format!(
                 "GET {path}?name={host}&type=A HTTP/1.1\r\nHost: {name}\r\n\
                  Accept: application/dns-json\r\nConnection: close\r\n\r\n"
             );
-            let answer = self
-                .request_ip(
-                    Ipv4Addr::from(ip),
-                    name,
-                    443,
-                    Some(http::dmm_tls_config()),
-                    req.as_bytes(),
-                    Duration::from_secs(6),
-                )
-                .and_then(|raw| http::parse_response(&raw))
-                .and_then(|(_, body)| {
-                    let v: serde_json::Value =
-                        serde_json::from_slice(&body).map_err(|e| e.to_string())?;
-                    v["Answer"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter(|a| a["type"] == 1)
-                        .find_map(|a| a["data"].as_str()?.parse::<Ipv4Addr>().ok())
-                        .ok_or_else(|| "no A record".to_string())
-                });
-            match answer {
-                Ok(addr) => {
-                    self.hosts.insert(host.to_string(), addr);
-                    return Ok(addr);
-                }
+            match Exchange::new(name, Some(tls.clone()), req.as_bytes(), timeout, Completion::http())
+                .and_then(|ex| self.start_socket(Ipv4Addr::from(ip), 443).map(|h| (h, ex)))
+            {
+                Ok((handle, exchange)) => probes.push(Probe { name, handle, exchange }),
                 Err(e) => errors.push(format!("{name}: {e}")),
             }
         }
-        // DoH 가 막힌 VPN(광고 차단 기능 등)도 있어, 터널이 알려 준 DNS 와 공개 DNS 에 TCP 로 직접 물어봄
-        let mut servers = self.dns.clone();
-        for s in [[8, 8, 8, 8], [1, 1, 1, 1]] {
-            if !servers.contains(&s) {
-                servers.push(s);
+        let mut winner = None;
+        let mut step_err = None;
+        while !probes.is_empty() && winner.is_none() {
+            if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+                step_err = Some("DNS lookup cancelled".into());
+                break;
+            }
+            if let Err(e) = self.step() {
+                step_err = Some(e);
+                break;
+            }
+            let mut i = 0;
+            while i < probes.len() {
+                let tick = if Instant::now() >= probes[i].exchange.deadline {
+                    Err(if probes[i].exchange.connected { "response timed out" } else { "TCP connect timed out" }.into())
+                } else {
+                    let h = probes[i].handle;
+                    probes[i].exchange.advance(self.sockets.get_mut::<tcp::Socket>(h))
+                };
+                match tick {
+                    Ok(false) => i += 1,
+                    Ok(true) => {
+                        let p = probes.swap_remove(i);
+                        self.retire_exchange(p.handle);
+                        match parse_doh_a_record(&p.exchange.response) {
+                            Ok(addr) => {
+                                winner = Some(addr);
+                                break;
+                            }
+                            Err(e) => errors.push(format!("{}: {e}", p.name)),
+                        }
+                    }
+                    Err(e) => {
+                        let p = probes.swap_remove(i);
+                        self.retire_exchange(p.handle);
+                        errors.push(format!("{}: {e}", p.name));
+                    }
+                }
             }
         }
-        for s in servers {
-            let server = Ipv4Addr::from(s);
-            let id: [u8; 2] = {
-                let mut b = [0u8; 2];
-                getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
-                b
-            };
-            let query = dns_query(host, id);
-            let answer = self
-                .request_ip_until(
-                    server,
-                    "",
-                    53,
-                    None,
-                    &query,
-                    Duration::from_secs(6),
-                    Completion::Custom(dns_tcp_complete),
-                )
-                .and_then(|raw| dns_answer(&raw, id));
-            match answer {
-                Ok(addr) => {
-                    self.hosts.insert(host.to_string(), addr);
-                    return Ok(addr);
-                }
-                Err(e) => errors.push(format!("DNS {server}: {e}")),
+        for p in probes {
+            self.retire_exchange(p.handle);
+        }
+        if let Some(addr) = winner {
+            return Ok(addr);
+        }
+        if let Some(e) = step_err {
+            return Err(e);
+        }
+        Err(errors.join(" / "))
+    }
+
+    /// Resolve `host` inside a shared tunnel (TCP:53 race) without holding the stack lock
+    /// across the whole exchange, caching the result on success.
+    pub(crate) fn resolve_in_tunnel_shared(
+        shared: &Mutex<Self>,
+        host: &str,
+        timeout: Duration,
+    ) -> Result<Ipv4Addr, String> {
+        if let Ok(ip) = host.parse::<Ipv4Addr>() {
+            return Ok(ip);
+        }
+        let lock = || shared.lock().map_err(|e| e.to_string());
+        let servers = {
+            let stack = lock()?;
+            if let Some(ip) = stack.cached_ip(host) {
+                return Ok(ip);
             }
+            stack.dns_tcp_servers()
+        };
+        struct Probe {
+            server: Ipv4Addr,
+            id: [u8; 2],
+            handle: SocketHandle,
+            exchange: Exchange,
+        }
+        let mut probes = Vec::with_capacity(servers.len());
+        let mut errors = Vec::new();
+        {
+            let mut stack = lock()?;
+            for s in servers {
+                let server = Ipv4Addr::from(s);
+                let mut id = [0u8; 2];
+                getrandom::getrandom(&mut id).map_err(|e| e.to_string())?;
+                let query = dns_query(host, id);
+                match Exchange::new("", None, &query, timeout, Completion::Custom(dns_tcp_complete))
+                    .and_then(|ex| stack.start_socket(server, 53).map(|h| (h, ex)))
+                {
+                    Ok((handle, exchange)) => probes.push(Probe { server, id, handle, exchange }),
+                    Err(e) => errors.push(format!("DNS {server}: {e}")),
+                }
+            }
+        }
+        let mut winner = None;
+        let mut step_err = None;
+        while !probes.is_empty() && winner.is_none() {
+            {
+                let mut stack = lock()?;
+                if let Err(e) = stack.step() {
+                    step_err = Some(e);
+                    break;
+                }
+                let mut i = 0;
+                while i < probes.len() {
+                    let tick = if Instant::now() >= probes[i].exchange.deadline {
+                        Err(if probes[i].exchange.connected { "response timed out" } else { "TCP connect timed out" }.into())
+                    } else {
+                        let h = probes[i].handle;
+                        probes[i].exchange.advance(stack.sockets.get_mut::<tcp::Socket>(h))
+                    };
+                    match tick {
+                        Ok(false) => i += 1,
+                        Ok(true) => {
+                            let p = probes.swap_remove(i);
+                            stack.retire_exchange(p.handle);
+                            match dns_answer(&p.exchange.response, p.id) {
+                                Ok(addr) => {
+                                    stack.hosts.insert(host.to_string(), addr);
+                                    winner = Some(addr);
+                                    break;
+                                }
+                                Err(e) => errors.push(format!("DNS {}: {e}", p.server)),
+                            }
+                        }
+                        Err(e) => {
+                            let p = probes.swap_remove(i);
+                            stack.retire_exchange(p.handle);
+                            errors.push(format!("DNS {}: {e}", p.server));
+                        }
+                    }
+                }
+            }
+            if !probes.is_empty() && winner.is_none() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        if !probes.is_empty() {
+            if let Ok(mut stack) = lock() {
+                for p in probes {
+                    stack.retire_exchange(p.handle);
+                }
+            }
+        }
+        if let Some(addr) = winner {
+            return Ok(addr);
+        }
+        if let Some(e) = step_err {
+            return Err(e);
         }
         Err(errors.join(" / "))
     }
@@ -539,6 +851,7 @@ impl TunnelStack {
             self.dev.rx.push_back(p);
         }
         if !self.dev.rx.is_empty() {
+            self.last_activity = Instant::now();
             self.poll_and_flush()?;
         }
         Ok(())
@@ -727,10 +1040,7 @@ impl Exchange {
         })
     }
 
-    fn advance(&mut self, sock: &mut tcp::Socket<'_>) -> Result<bool, String> {
-        if matches!(sock.state(), tcp::State::Established | tcp::State::CloseWait) {
-            self.connected = true;
-        }
+    fn flush_outgoing(&mut self, sock: &mut tcp::Socket<'_>) -> Result<(), String> {
         if let Some(c) = self.conn.as_mut() {
             while c.wants_write() {
                 c.write_tls(&mut self.outgoing)
@@ -741,6 +1051,14 @@ impl Exchange {
             let n = sock.send_slice(&self.outgoing).map_err(|e| format!("TCP send: {e:?}"))?;
             self.outgoing.drain(..n);
         }
+        Ok(())
+    }
+
+    fn advance(&mut self, sock: &mut tcp::Socket<'_>) -> Result<bool, String> {
+        if matches!(sock.state(), tcp::State::Established | tcp::State::CloseWait) {
+            self.connected = true;
+        }
+        self.flush_outgoing(sock)?;
         let mut tls_closed = false;
         if sock.can_recv() {
             // Read at most one chunk per turn to give other sockets lock time.
@@ -761,6 +1079,8 @@ impl Exchange {
                         }
                     }
                 }
+                // Flush TLS handshake replies immediately instead of waiting for the next poll cycle.
+                self.flush_outgoing(sock)?;
             } else {
                 self.response.extend_from_slice(&buf[..n]);
             }

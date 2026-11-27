@@ -218,7 +218,7 @@ impl WgTunnel {
         Ok(t)
     }
 
-    /// 데이터그램 하나를 기다려 처리. 받은 게 있으면 true
+    /// Receive one datagram before `deadline` and decapsulate it. Returns `true` if a datagram arrived.
     fn recv_once(&mut self, deadline: Instant) -> Result<bool, String> {
         let now = Instant::now();
         if now >= deadline {
@@ -227,10 +227,16 @@ impl WgTunnel {
         self.sock
             .set_read_timeout(Some((deadline - now).max(Duration::from_millis(1))))
             .map_err(|e| e.to_string())?;
+        self.recv_and_decapsulate()
+    }
+
+    fn recv_and_decapsulate(&mut self) -> Result<bool, String> {
         let n = match self.sock.recv(&mut self.dgram) {
             Ok(n) => n,
             Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut
+                    || e.kind() == io::ErrorKind::Interrupted =>
             {
                 return Ok(false)
             }
@@ -246,14 +252,14 @@ impl WgTunnel {
             match self.tunn.decapsulate(src, input, &mut self.buf) {
                 TunnResult::WriteToNetwork(p) => {
                     self.sock.send(p).map_err(|e| format!("VPN send: {e}"))?;
-                    first = false; // 대기 중인 패킷이 더 있으면 이어서 보냄
+                    first = false; // Flush any queued packets immediately.
                 }
                 TunnResult::WriteToTunnelV4(p, _) => {
                     self.inbox.push_back(p.to_vec());
                     break;
                 }
                 TunnResult::WriteToTunnelV6(..) | TunnResult::Done => break,
-                TunnResult::Err(_) => break, // 깨진 패킷 하나는 버림
+                TunnResult::Err(_) => break, // Drop single corrupt datagram.
             }
         }
         Ok(true)
@@ -297,10 +303,25 @@ impl IpTunnel for WgTunnel {
     fn pump(&mut self, wait: Duration) -> Result<(), String> {
         self.tick_timers()?;
         let deadline = Instant::now() + wait;
-        for _ in 0..256 {
-            if !self.recv_once(deadline)? {
-                break;
+        if !self.recv_once(deadline)? {
+            return Ok(());
+        }
+        // Once a datagram arrives, drain any already-queued datagrams without blocking
+        // out the remainder of `wait` so smoltcp can react immediately.
+        if self.sock.set_nonblocking(true).is_ok() {
+            let mut result = Ok(());
+            for _ in 0..255 {
+                match self.recv_and_decapsulate() {
+                    Ok(true) => continue,
+                    Ok(false) => break,
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
             }
+            let _ = self.sock.set_nonblocking(false);
+            result?;
         }
         Ok(())
     }

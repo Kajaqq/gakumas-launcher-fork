@@ -114,14 +114,30 @@ impl Ready {
     }
 }
 
+fn is_dmm_domain(host: &str) -> bool {
+    host == "dmm.com"
+        || host.ends_with(".dmm.com")
+        || host == "dmm.co.jp"
+        || host.ends_with(".dmm.co.jp")
+}
+
 fn prepare(mut client: TcpStream, stack: Stack, stopped: Arc<AtomicBool>, slot: Slot, tx: mpsc::Sender<Ready>) {
     let _ = client.set_write_timeout(Some(Duration::from_secs(1)));
     let request = match read_request(&mut client, &stopped) {
         Ok(r) => r, Err(status) => { reject(&mut client, status); return; }
     };
     let started = Instant::now();
-    let cached = stack.try_lock().ok().and_then(|s| s.cached_ip(&request.host));
-    let ip = match cached.map(Ok).unwrap_or_else(|| resolve_v4(&request.host)) {
+    let ip = if let Ok(literal) = request.host.parse::<Ipv4Addr>() {
+        Ok(literal)
+    } else if let Some(cached) = stack.try_lock().ok().and_then(|s| s.cached_ip(&request.host)) {
+        Ok(cached)
+    } else if is_dmm_domain(&request.host) {
+        TunnelStack::resolve_in_tunnel_shared(&stack, &request.host, Duration::from_secs(3))
+            .or_else(|_| resolve_v4(&request.host))
+    } else {
+        resolve_v4(&request.host)
+    };
+    let ip = match ip {
         Ok(ip) => ip, Err(e) => { log(&format!("DNS failed: {e}")); reject(&mut client, GATEWAY); return; }
     };
     log(&format!("CONNECT {}:{} ({ip}; DNS {} ms)",request.host, request.port, started.elapsed().as_millis()));
@@ -419,5 +435,15 @@ mod tests {
         }
         assert_eq!(parse(b"GET / HTTP/1.1\r\n\r\n").err(),Some("405 Method Not Allowed"));
         assert_eq!(parse(format!("CONNECT host:443 HTTP/1.1\r\nX: {}", "a".repeat(HEADER_LIMIT)).as_bytes()).err(),Some(LARGE));
+    }
+
+    #[test]
+    fn dmm_domain_matching_covers_subdomains_only() {
+        for host in ["dmm.com", "www.dmm.com", "accounts.dmm.com", "dmm.co.jp", "personal.games.dmm.co.jp"] {
+            assert!(is_dmm_domain(host), "expected DMM domain: {host}");
+        }
+        for host in ["notdmm.com", "dmm.com.evil.test", "example.com", "10.44.0.1"] {
+            assert!(!is_dmm_domain(host), "unexpected DMM domain: {host}");
+        }
     }
 }

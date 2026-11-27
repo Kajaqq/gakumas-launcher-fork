@@ -62,23 +62,13 @@ fn run() -> Result<(), String> {
 
     println!("\n[1] Fetching the VPN Gate server list...");
     let t0 = Instant::now();
-    let list = vpngate::fetch_server_list()?;
-    let mut candidates: Vec<(vpngate::Server, vpngate::OvpnConfig)> = list
-        .into_iter()
-        .filter(|s| s.country == "JP")
-        .filter_map(|s| vpngate::parse_config(&s.config_text).ok().map(|c| (s, c)))
-        .filter(|(_, c)| vpngate::is_tcp(c))
-        .collect();
-    candidates.sort_by(|a, b| {
-        b.0.is_official()
-            .cmp(&a.0.is_official())
-            .then(b.0.score.cmp(&a.0.score))
-    });
+    let raw = vpngate::fetch_server_list_raw()?;
+    let mut candidates = vpngate::japan_candidates(&raw);
     if let Some(name) = &only {
         candidates.retain(|(s, _)| &s.host_name == name);
     }
     println!(
-        "    {} Japanese TCP servers ({} ms)",
+        "    {} Japanese servers ({} ms)",
         candidates.len(),
         t0.elapsed().as_millis()
     );
