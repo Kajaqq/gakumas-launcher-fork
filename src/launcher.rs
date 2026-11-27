@@ -189,6 +189,9 @@ pub struct VpnGateState {
     /// Host names that recently failed to connect or failed the health check (unix secs).
     #[serde(default)]
     pub failed_hosts: HashMap<String, u64>,
+    /// IP addresses that recently failed (covers multi-instance hosts sharing one IP, unix secs).
+    #[serde(default)]
+    pub failed_ips: HashMap<String, u64>,
     /// Host names recently rejected by DMM with 801/803 (unix secs).
     #[serde(default)]
     pub rejected_hosts: HashMap<String, u64>,
@@ -209,6 +212,8 @@ impl VpnGateState {
     fn prune(&mut self, now: u64) {
         self.failed_hosts
             .retain(|_, &mut ts| ts <= now && now - ts < FAILED_HOST_TTL_SECS);
+        self.failed_ips
+            .retain(|_, &mut ts| ts <= now && now - ts < FAILED_HOST_TTL_SECS);
         self.rejected_hosts
             .retain(|_, &mut ts| ts <= now && now - ts < REJECTED_HOST_TTL_SECS);
         self.rejected_subnets
@@ -225,6 +230,12 @@ impl VpnGateState {
     fn is_failed(&self, host: &str, now: u64) -> bool {
         self.failed_hosts
             .get(host)
+            .is_some_and(|&ts| ts <= now && now - ts < FAILED_HOST_TTL_SECS)
+    }
+
+    fn is_failed_ip(&self, ip: &str, now: u64) -> bool {
+        self.failed_ips
+            .get(ip)
             .is_some_and(|&ts| ts <= now && now - ts < FAILED_HOST_TTL_SECS)
     }
 
@@ -315,6 +326,7 @@ impl Store {
     fn record_vpngate_success(&self, info: &VpnGateServerInfo) {
         let _ = self.update_vpngate_state(|state, now| {
             state.failed_hosts.remove(&info.host_name);
+            state.failed_ips.remove(&info.ip);
             state.rejected_hosts.remove(&info.host_name);
             if let Some(subnet) = vpngate::subnet24_of(&info.ip) {
                 state.rejected_subnets.remove(&subnet);
@@ -330,14 +342,21 @@ impl Store {
         });
     }
 
-    fn record_vpngate_failures(&self, hosts: &[String]) {
-        if hosts.is_empty() {
+    fn record_vpngate_failures(&self, failed: &[(String, String)]) {
+        if failed.is_empty() {
             return;
         }
         let _ = self.update_vpngate_state(|state, now| {
-            for host in hosts {
+            for (host, ip) in failed {
                 state.failed_hosts.insert(host.clone(), now);
-                if state.last_good.as_ref().is_some_and(|g| g.host_name == *host) {
+                if !ip.is_empty() {
+                    state.failed_ips.insert(ip.clone(), now);
+                }
+                if state
+                    .last_good
+                    .as_ref()
+                    .is_some_and(|g| g.host_name == *host || (!ip.is_empty() && g.ip == *ip))
+                {
                     state.last_good = None;
                 }
             }
@@ -943,7 +962,7 @@ fn mark_tunnel_failed(failed: &Arc<Mutex<TunnelStack>>, store: Option<&Store>, r
         if rejected_by_dmm {
             store.record_vpngate_rejected(&info.host_name, &info.ip);
         } else {
-            store.record_vpngate_failures(&[info.host_name]);
+            store.record_vpngate_failures(&[(info.host_name, info.ip)]);
         }
     }
 }
@@ -1007,7 +1026,7 @@ fn rotate_tunnel_with_reason(
             store.record_vpngate_rejected(&info.host_name, &info.ip);
         } else {
             netlog(&format!("Rotating away from failed server {} ({})", info.host_name, info.ip));
-            store.record_vpngate_failures(&[info.host_name]);
+            store.record_vpngate_failures(&[(info.host_name, info.ip)]);
         }
     }
     let stack = dial_route(&setup, &store, &mode, tried, rejected_subnets, &|m, _| netlog(m))?;
@@ -1169,7 +1188,13 @@ fn connect_vpngate_candidate(
         timeout: Some(VPNGATE_CONNECT_TIMEOUT),
         cancel: Some(cancel),
     };
-    let tun = Tunnel::connect_with(&cfg, &opts, &mut |_| {})?;
+    let tun = Tunnel::connect_with(&cfg, &opts, &mut |_| {}).map_err(|e| {
+        if e.contains("AUTH_FAILED") {
+            format!("{e} (relay busy or DHCP pool full)")
+        } else {
+            e
+        }
+    })?;
     let mut stack = TunnelStack::new(tun)?;
     if cancel.load(Ordering::Acquire) {
         return Err("connection cancelled".into());
@@ -1190,7 +1215,7 @@ fn connect_vpngate_candidate(
 
 enum RaceOutcome {
     Connected(TunnelStack, VpnGateServerInfo),
-    Failed(String, String),
+    Failed(String, String, String),
     Cancelled,
 }
 
@@ -1201,7 +1226,7 @@ enum RaceOutcome {
 fn race_servers(
     batch: Vec<(vpngate::Server, vpngate::OvpnConfig)>,
     tried: &mut HashSet<String>,
-    failed_out: &mut Vec<String>,
+    failed_out: &mut Vec<(String, String)>,
     refresh_dns_ip: bool,
     progress: ProgressFn,
 ) -> Option<(TunnelStack, VpnGateServerInfo)> {
@@ -1253,7 +1278,7 @@ fn race_servers(
                         if cancel.load(Ordering::Acquire) || e.contains("cancelled") {
                             let _ = tx.send(RaceOutcome::Cancelled);
                         } else {
-                            let _ = tx.send(RaceOutcome::Failed(server.host_name, e));
+                            let _ = tx.send(RaceOutcome::Failed(server.host_name, server.ip, e));
                         }
                     }
                 }
@@ -1279,10 +1304,10 @@ fn race_servers(
                 progress(&format!("Connected to VPN · {}", info.host_name), None);
                 return Some((stack, info));
             }
-            Ok(RaceOutcome::Failed(host, err)) => {
-                netlog(&format!("VPN Gate {host} failed: {err}"));
+            Ok(RaceOutcome::Failed(host, ip, err)) => {
+                netlog(&format!("VPN Gate {host} ({ip}) failed: {err}"));
                 tried.insert(host.clone());
-                failed_out.push(host);
+                failed_out.push((host, ip));
             }
             Ok(RaceOutcome::Cancelled) => {}
             Err(_) => break,
@@ -1375,6 +1400,7 @@ fn select_vpngate_batch(
         if fresh
             && !tried.contains(&good.host_name)
             && !state.is_failed(&good.host_name, now)
+            && !state.is_failed_ip(&good.ip, now)
             && !state.is_rejected_host(&good.host_name, now)
             && !subnet_blocked
         {
@@ -1428,7 +1454,10 @@ fn select_vpngate_batch(
         });
         if state.is_rejected_host(&s.host_name, now) {
             tier2.push((s, c));
-        } else if state.is_failed(&s.host_name, now) || subnet_rejected {
+        } else if state.is_failed(&s.host_name, now)
+            || state.is_failed_ip(&s.ip, now)
+            || subnet_rejected
+        {
             tier1.push((s, c));
         } else {
             tier0.push((s, c));
@@ -1480,7 +1509,7 @@ fn select_vpngate_batch(
 /// Race built-in University of Tsukuba servers (fallback when the server list is unreachable).
 fn try_builtin(
     tried: &mut HashSet<String>,
-    failed_out: &mut Vec<String>,
+    failed_out: &mut Vec<(String, String)>,
     progress: ProgressFn,
 ) -> Option<(TunnelStack, VpnGateServerInfo)> {
     let batch: Vec<(vpngate::Server, vpngate::OvpnConfig)> = vpngate::builtin_official_servers()
@@ -2770,5 +2799,40 @@ mod tests {
         pruned.prune(github::now_secs() + REJECTED_HOST_TTL_SECS + 10);
         assert!(pruned.rejected_hosts.is_empty());
         assert!(pruned.rejected_subnets.is_empty());
+    }
+
+    #[test]
+    fn failed_ip_cooldown_deprioritizes_sibling_hosts_on_same_ip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        let candidates = vec![
+            candidate("split-a", "123.48.124.169", 9_000_000),
+            candidate("split-b", "123.48.124.169", 8_900_000),
+            candidate("vol-clean-1", "115.38.22.45", 5_000_000),
+            candidate("vol-clean-2", "126.206.11.243", 4_900_000),
+        ];
+
+        store.record_vpngate_failures(&[("split-a".into(), "123.48.124.169".into())]);
+        let st = store.vpngate_state();
+        assert!(st.failed_hosts.contains_key("split-a"));
+        assert!(st.failed_ips.contains_key("123.48.124.169"));
+
+        let now = github::now_secs();
+        let batch = select_vpngate_batch(
+            &candidates,
+            &HashSet::new(),
+            &HashSet::new(),
+            &st,
+            now,
+            2,
+        );
+        let names: Vec<&str> = batch.iter().map(|(s, _)| s.host_name.as_str()).collect();
+        // Both split-a and its same-IP sibling split-b are cooled down behind clean volunteers.
+        assert_eq!(names, vec!["vol-clean-1", "vol-clean-2"]);
+
+        let mut pruned = st.clone();
+        pruned.prune(now + FAILED_HOST_TTL_SECS + 10);
+        assert!(pruned.failed_hosts.is_empty());
+        assert!(pruned.failed_ips.is_empty());
     }
 }

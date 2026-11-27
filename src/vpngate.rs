@@ -41,12 +41,20 @@ impl Server {
     /// Higher is better. Unlike the old official-first wall, this lets fast, healthy volunteer
     /// servers compete directly with Tsukuba servers while batch selection enforces `/24` diversity.
     pub fn quality_score(&self) -> u64 {
+        self.quality_score_with_sessions(self.sessions)
+    }
+
+    /// Quality score using an explicit effective session count (e.g. aggregated across
+    /// multiple hostnames sharing the same IP address).
+    pub fn quality_score_with_sessions(&self, effective_sessions: u32) -> u64 {
         // VPN Gate's score is typically 100k..30M; scale into a moderate baseline.
         let mut q: u64 = (self.score / 10_000).min(1_500);
 
-        // Speed bonus: up to +1000 for 500+ Mbps (2 points per Mbps).
+        // Speed bonus: capped at 500 (250+ Mbps). The tunnel only carries small API/webview
+        // traffic (game downloads use the direct connection), so chasing ultra-high-bandwidth
+        // relays over less-loaded ones hurts reliability.
         let mbps = self.speed_bps / 1_000_000;
-        q += (mbps * 2).min(1_000);
+        q += (mbps * 2).min(500);
 
         // Ping bonus/penalty (lower ping => faster handshake & TLS).
         match self.ping_ms {
@@ -65,10 +73,19 @@ impl Server {
             q = q.saturating_sub(200);
         }
 
-        // Mild congestion penalty for heavily loaded relays.
-        if self.sessions > 300 {
-            q = q.saturating_sub(((self.sessions - 300) as u64).min(300));
-        }
+        // Congestion penalty: SoftEther's OpenVPN L3 mode (SecureNAT virtual DHCP + net30)
+        // frequently rejects new clients with AUTH_FAILED once a relay is heavily loaded.
+        // Start penalizing above 40 sessions and ramp steeply past 80/140.
+        let load_penalty: u64 = if effective_sessions <= 40 {
+            0
+        } else if effective_sessions <= 80 {
+            (effective_sessions - 40) as u64 * 3
+        } else if effective_sessions <= 140 {
+            120 + (effective_sessions - 80) as u64 * 5
+        } else {
+            (420 + (effective_sessions - 140) as u64 * 6).min(750)
+        };
+        q = q.saturating_sub(load_penalty);
 
         // Modest preference for Tsukuba official relays without blocking volunteers.
         if self.is_official() {
@@ -112,15 +129,24 @@ pub fn fetch_server_list() -> Result<Vec<Server>, String> {
 
 /// Japanese VPN Gate candidates (both TCP and UDP), ranked by quality score with a slight
 /// tie-break preference for TCP (more likely to traverse restrictive firewalls).
+/// Session load is aggregated per IP so multi-instance hosts sharing one IP are scored by
+/// their combined load.
 pub fn japan_candidates(body: &str) -> Vec<(Server, OvpnConfig)> {
     let mut v: Vec<(Server, OvpnConfig)> = parse_server_list(body)
         .into_iter()
         .filter(|s| s.country == "JP")
         .filter_map(|s| parse_config(&s.config_text).ok().map(|c| (s, c)))
         .collect();
+    let mut sessions_by_ip: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    for (s, _) in &v {
+        *sessions_by_ip.entry(s.ip.clone()).or_insert(0) += s.sessions;
+    }
     v.sort_by(|a, b| {
-        let qa = a.0.quality_score() + if is_tcp(&a.1) { 50 } else { 0 };
-        let qb = b.0.quality_score() + if is_tcp(&b.1) { 50 } else { 0 };
+        let sa = sessions_by_ip.get(&a.0.ip).copied().unwrap_or(a.0.sessions);
+        let sb = sessions_by_ip.get(&b.0.ip).copied().unwrap_or(b.0.sessions);
+        let qa = a.0.quality_score_with_sessions(sa) + if is_tcp(&a.1) { 50 } else { 0 };
+        let qb = b.0.quality_score_with_sessions(sb) + if is_tcp(&b.1) { 50 } else { 0 };
         qb.cmp(&qa).then(b.0.score.cmp(&a.0.score))
     });
     v
@@ -345,5 +371,34 @@ mod tests {
     fn subnet24_extracts_prefix_only_for_valid_ipv4() {
         assert_eq!(subnet24_of("219.100.37.125").as_deref(), Some("219.100.37"));
         assert_eq!(subnet24_of("not-an-ip"), None);
+    }
+
+    #[test]
+    fn scoring_caps_speed_at_500_penalizes_high_sessions_and_aggregates_shared_ips() {
+        let csv = format!(
+            "*vpn_servers\n\
+             #HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64\n\
+             saturated-official,219.100.37.1,2200000,15,1100000000,Japan,JP,210,86400000,500,9000,2weeks,tsukuba,,{}\n\
+             split-a,123.48.124.169,1600000,9,800000000,Japan,JP,95,86400000,500,9000,2weeks,vol,,{}\n\
+             split-b,123.48.124.169,1550000,8,820000000,Japan,JP,90,86400000,500,9000,2weeks,vol,,{}\n\
+             clean-vol,115.38.22.45,1100000,12,260000000,Japan,JP,25,86400000,500,9000,2weeks,vol,,{}\n\
+             ultra-fast-vol,126.206.11.243,1100000,12,2000000000,Japan,JP,25,86400000,500,9000,2weeks,vol,,{}\n",
+            sample_ovpn("tcp", "219.100.37.1", 443),
+            sample_ovpn("tcp", "123.48.124.169", 1534),
+            sample_ovpn("tcp", "123.48.124.169", 1558),
+            sample_ovpn("tcp", "115.38.22.45", 1194),
+            sample_ovpn("tcp", "126.206.11.243", 1194),
+        );
+        let ranked = japan_candidates(&csv);
+        // 260 Mbps and 2000 Mbps both hit the 500-point speed cap, so equal score/ping/sessions tie.
+        let clean = ranked.iter().find(|(s, _)| s.host_name == "clean-vol").unwrap();
+        let ultra = ranked.iter().find(|(s, _)| s.host_name == "ultra-fast-vol").unwrap();
+        assert_eq!(clean.0.quality_score(), ultra.0.quality_score());
+
+        // Low-load volunteer outranks both the 210-session official relay and the 95+90=185 shared-IP host.
+        let pos = |name: &str| ranked.iter().position(|(s, _)| s.host_name == name).unwrap();
+        assert!(pos("clean-vol") < pos("saturated-official"));
+        assert!(pos("clean-vol") < pos("split-a"));
+        assert!(pos("clean-vol") < pos("split-b"));
     }
 }
