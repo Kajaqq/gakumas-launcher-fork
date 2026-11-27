@@ -2,11 +2,14 @@
 //!
 //! On Wayland a GTK 3 window cannot hand its icon to the compositor. KWin, the
 //! Plasma task manager and GNOME Shell instead look up the desktop entry whose
-//! file name matches the window's `app_id` (`local.gakumas.launcher`, from
-//! `identifier` with `enableGTKAppId`) and show its `Icon=`. Without that entry
-//! they fall back to the generic Wayland icon, both when started from a terminal
-//! and from a differently named shortcut. The launcher ships as a bare binary,
-//! so it installs the entry into the user's data dir itself on startup.
+//! file name matches the window's `app_id` and show its `Icon=`. Without that
+//! entry they fall back to the generic Wayland icon, both when started from a
+//! terminal and from a differently named shortcut. The launcher ships as a bare
+//! binary, so it installs the entry into the user's data dir itself on startup.
+//!
+//! GTK 3 takes the `app_id` from the program name (`g_get_prgname`), not from the
+//! GtkApplication id, so `main` sets the program name to [`APP_ID`] before GTK
+//! starts.
 //!
 //! The module builds on every platform so its tests run anywhere; only the
 //! Linux build calls [`install`].
@@ -16,7 +19,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Must equal `identifier` in tauri.conf.json: it is the Wayland `app_id`.
+/// The Wayland `app_id` (set as the GTK program name in `main`) and the
+/// desktop entry's file name. Kept equal to `identifier` in tauri.conf.json.
 pub const APP_ID: &str = "local.gakumas.launcher";
 const APP_NAME: &str = "Gakumas Launcher";
 const ICON_PNG: &[u8] = include_bytes!("../icons/icon.png");

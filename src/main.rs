@@ -776,8 +776,15 @@ fn main() {
     // Before any window exists: Wayland compositors resolve the window icon from
     // the desktop entry matching the app id when the window first maps.
     #[cfg(target_os = "linux")]
-    if let Err(e) = gakumas_launcher::desktop_entry::install() {
-        eprintln!("desktop entry: {e}");
+    {
+        // GTK 3 sends the program name, not the GtkApplication id, as the
+        // xdg_toplevel app id. It defaults to the binary name ("GakumasLauncher"),
+        // which matches no desktop entry, so KDE shows the generic Wayland icon.
+        // GTK only derives it from argv[0] while it is unset, so set it first.
+        glib::set_prgname(Some(gakumas_launcher::desktop_entry::APP_ID));
+        if let Err(e) = gakumas_launcher::desktop_entry::install() {
+            eprintln!("desktop entry: {e}");
+        }
     }
 
     tauri::Builder::default()
