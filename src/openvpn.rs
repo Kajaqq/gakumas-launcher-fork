@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -60,6 +61,12 @@ const CONTROL_CHUNK: usize = 1000;
 const RETRANSMIT_AFTER: Duration = Duration::from_millis(1500);
 /// 터널 안 IP 패킷 최대 크기 기본값. 작게 잡아 TCP 세그먼트가 터널에서 잘리지 않게 함
 const DEFAULT_MTU: usize = 1350;
+/// Default outbound keepalive when the server does not push `ping`.
+const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(15);
+/// Fail the tunnel after this many consecutive data-channel decryption/auth errors.
+const MAX_CONSECUTIVE_DATA_ERRORS: u32 = 8;
+/// Slice duration used when polling during connect so cancellation is responsive.
+const HANDSHAKE_POLL_SLICE: Duration = Duration::from_millis(150);
 
 /// 서버 key-method 2 응답의 난수 두 개 (random1, random2)
 type ServerRandoms = ([u8; 32], [u8; 32]);
@@ -643,7 +650,7 @@ fn append_frame(batch: &mut Vec<u8>, packet: &[u8]) {
 }
 
 enum Link {
-    Tcp { s: TcpStream, rbuf: Vec<u8>, writer: TcpWriter },
+    Tcp { s: TcpStream, rbuf: Vec<u8>, rpos: usize, writer: TcpWriter },
     Udp(UdpSocket),
 }
 
@@ -653,8 +660,29 @@ impl Drop for Link {
     }
 }
 
+fn take_tcp_frame(rbuf: &mut Vec<u8>, rpos: &mut usize) -> Option<Vec<u8>> {
+    let avail = rbuf.len() - *rpos;
+    if avail < 2 {
+        return None;
+    }
+    let n = u16::from_be_bytes([rbuf[*rpos], rbuf[*rpos + 1]]) as usize;
+    if avail < 2 + n {
+        return None;
+    }
+    let pkt = rbuf[*rpos + 2..*rpos + 2 + n].to_vec();
+    *rpos += 2 + n;
+    if *rpos == rbuf.len() {
+        rbuf.clear();
+        *rpos = 0;
+    } else if *rpos >= 32 * 1024 {
+        rbuf.drain(..*rpos);
+        *rpos = 0;
+    }
+    Some(pkt)
+}
+
 impl Link {
-    fn open(addr: SocketAddr, udp: bool) -> Result<Link, String> {
+    fn open(addr: SocketAddr, udp: bool, connect_timeout: Duration) -> Result<Link, String> {
         if udp {
             let bind: SocketAddr = if addr.is_ipv4() {
                 "0.0.0.0:0".parse().unwrap()
@@ -665,7 +693,7 @@ impl Link {
             s.connect(addr).map_err(|e| format!("UDP: {e}"))?;
             Ok(Link::Udp(s))
         } else {
-            let s = TcpStream::connect_timeout(&addr, Duration::from_secs(10))
+            let s = TcpStream::connect_timeout(&addr, connect_timeout.max(Duration::from_millis(500)))
                 .map_err(|e| format!("TCP connect: {e}"))?;
             s.set_nodelay(true).ok();
             s.set_write_timeout(Some(Duration::from_secs(10))).ok();
@@ -674,6 +702,7 @@ impl Link {
             Ok(Link::Tcp {
                 s,
                 rbuf: Vec::new(),
+                rpos: 0,
                 writer,
             })
         }
@@ -693,19 +722,95 @@ impl Link {
         }
     }
 
+    /// Pop a complete packet already buffered in memory without any syscall.
+    fn try_recv_buffered(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Link::Tcp { rbuf, rpos, .. } => take_tcp_frame(rbuf, rpos),
+            Link::Udp(_) => None,
+        }
+    }
+
+    /// Drain up to `max` immediately-available packets without blocking.
+    fn drain_ready(&mut self, max: usize, out: &mut Vec<Vec<u8>>) -> Result<(), String> {
+        let timed_out = |e: &io::Error| {
+            e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut
+        };
+        match self {
+            Link::Tcp { s, rbuf, rpos, writer } => {
+                while out.len() < max {
+                    if let Some(pkt) = take_tcp_frame(rbuf, rpos) {
+                        out.push(pkt);
+                    } else {
+                        break;
+                    }
+                }
+                if out.len() >= max {
+                    return Ok(());
+                }
+                // Poll with a minimal read timeout rather than nonblocking mode: the writer
+                // thread shares this socket (try_clone), and nonblocking mode would apply to
+                // its writes too. SO_RCVTIMEO only affects reads; recv_until resets it.
+                s.set_read_timeout(Some(Duration::from_millis(1)))
+                    .map_err(|e| e.to_string())?;
+                let mut tmp = [0u8; 16384];
+                while out.len() < max {
+                    match s.read(&mut tmp) {
+                        Ok(0) => {
+                            return Err(writer.failure.try_recv().unwrap_or_else(|_| "VPN server closed the connection".into()));
+                        }
+                        Ok(n) => {
+                            rbuf.extend_from_slice(&tmp[..n]);
+                            while out.len() < max {
+                                if let Some(pkt) = take_tcp_frame(rbuf, rpos) {
+                                    out.push(pkt);
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) if timed_out(&e) || e.kind() == io::ErrorKind::Interrupted => break,
+                        Err(e) => return Err(format!("VPN connection: {e}")),
+                    }
+                }
+                Ok(())
+            }
+            Link::Udp(s) => {
+                if s.set_nonblocking(true).is_err() {
+                    return Ok(());
+                }
+                let mut err = None;
+                let mut tmp = vec![0u8; 65536];
+                while out.len() < max {
+                    match s.recv(&mut tmp) {
+                        Ok(n) => out.push(tmp[..n].to_vec()),
+                        Err(e) if timed_out(&e) || e.kind() == io::ErrorKind::Interrupted => break,
+                        Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                            err = Some("VPN server is not responding (UDP port closed)".into());
+                            break;
+                        }
+                        Err(e) => {
+                            err = Some(format!("VPN connection: {e}"));
+                            break;
+                        }
+                    }
+                }
+                let _ = s.set_nonblocking(false);
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn recv_until(&mut self, deadline: Instant) -> Result<Option<Vec<u8>>, String> {
         let timed_out = |e: &io::Error| {
             e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut
         };
         match self {
-            Link::Tcp { s, rbuf, writer } => loop {
-                if rbuf.len() >= 2 {
-                    let n = u16::from_be_bytes([rbuf[0], rbuf[1]]) as usize;
-                    if rbuf.len() >= 2 + n {
-                        let pkt = rbuf[2..2 + n].to_vec();
-                        rbuf.drain(..2 + n);
-                        return Ok(Some(pkt));
-                    }
+            Link::Tcp { s, rbuf, rpos, writer } => loop {
+                if let Some(pkt) = take_tcp_frame(rbuf, rpos) {
+                    return Ok(Some(pkt));
                 }
                 let now = Instant::now();
                 if now >= deadline {
@@ -1037,6 +1142,17 @@ pub struct ConnectOptions<'a> {
     /// true 면 설정 파일의 CA 로 서버 인증서가 확인돼야 연결
     pub strict_verify: bool,
     pub credentials: Option<(&'a str, &'a str)>,
+    /// Overall handshake budget across all stages (defaults to 30s).
+    pub timeout: Option<Duration>,
+    /// Optional cancellation flag so competing race workers abort quickly.
+    pub cancel: Option<&'a AtomicBool>,
+}
+
+fn check_cancelled(cancel: Option<&AtomicBool>) -> Result<(), String> {
+    if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+        return Err("connection cancelled".into());
+    }
+    Ok(())
 }
 
 pub struct Tunnel {
@@ -1055,7 +1171,10 @@ pub struct Tunnel {
     data: Option<DataCipher>,
     data_pid: u32,
     ping_interval: Option<Duration>,
+    ping_restart: Option<Duration>,
     last_data_send: Instant,
+    last_rx: Instant,
+    consecutive_rx_errors: u32,
     compress: Compress,
     fragment: bool,
     frags: HashMap<u8, BTreeMap<u8, Vec<u8>>>,
@@ -1130,6 +1249,8 @@ impl Tunnel {
                 tls_name,
                 strict_verify: false,
                 credentials: None,
+                timeout: None,
+                cancel: None,
             },
             log,
         )
@@ -1141,15 +1262,33 @@ impl Tunnel {
         opts: &ConnectOptions,
         log: &mut dyn FnMut(String),
     ) -> Result<Tunnel, String> {
+        check_cancelled(opts.cancel)?;
         if cfg.auth_user_pass && opts.credentials.is_none() {
             return Err("VPN username and password are required".into());
         }
+        let total_budget = opts.timeout.unwrap_or(Duration::from_secs(30));
+        let total_deadline = Instant::now() + total_budget;
+        let remaining = || total_deadline.saturating_duration_since(Instant::now());
+
         let addr = (opts.remote.host.as_str(), opts.remote.port)
             .to_socket_addrs()
             .map_err(|e| format!("Failed to resolve {}: {e}", opts.remote.host))?
             .min_by_key(|a| !a.is_ipv4())
             .ok_or_else(|| format!("Failed to resolve {}", opts.remote.host))?;
-        let link = Link::open(addr, opts.remote.udp)?;
+        check_cancelled(opts.cancel)?;
+        // Raced candidates (the only callers with a cancel flag) get a short TCP connect so
+        // a slow relay can't eat the handshake budget; a single user VPN keeps 10s.
+        let tcp_cap = if opts.cancel.is_some() {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(10)
+        };
+        let tcp_timeout = remaining().min(tcp_cap);
+        if tcp_timeout.is_zero() {
+            return Err("VPN connection timed out".into());
+        }
+        let link = Link::open(addr, opts.remote.udp, tcp_timeout)?;
+        check_cancelled(opts.cancel)?;
         log(format!(
             "{} connected to {addr}",
             if opts.remote.udp { "UDP" } else { "TCP" }
@@ -1166,6 +1305,7 @@ impl Tunnel {
             Some(f) => DEFAULT_MTU.min(f.saturating_sub(100).max(576)),
             None => DEFAULT_MTU,
         };
+        let now = Instant::now();
         let mut t = Tunnel {
             link,
             wrap: Wrap::new(cfg)?,
@@ -1182,7 +1322,10 @@ impl Tunnel {
             data: None,
             data_pid: 1,
             ping_interval: None,
-            last_data_send: Instant::now(),
+            ping_restart: None,
+            last_data_send: now,
+            last_rx: now,
+            consecutive_rx_errors: 0,
             compress: cfg.compress,
             fragment: cfg.fragment.is_some(),
             frags: HashMap::new(),
@@ -1197,17 +1340,25 @@ impl Tunnel {
 
         // 1) 세션 시작
         t.send_control(OP_HARD_RESET_CLIENT_V2, &[])?;
-        t.wait_for(Duration::from_secs(10), "no reply to session reset", |t| {
-            Ok(t.remote_sid.is_some())
-        })?;
+        t.wait_for(
+            remaining().min(Duration::from_secs(8)),
+            opts.cancel,
+            "no reply to session reset",
+            |t| Ok(t.remote_sid.is_some()),
+        )?;
         log("session reset acknowledged".to_string());
 
         // 2) 제어 채널 TLS
         t.flush_tls()?;
-        t.wait_for(Duration::from_secs(20), "TLS handshake timed out", |t| {
-            t.flush_tls()?;
-            Ok(!t.tls.is_handshaking())
-        })?;
+        t.wait_for(
+            remaining().min(Duration::from_secs(15)),
+            opts.cancel,
+            "TLS handshake timed out",
+            |t| {
+                t.flush_tls()?;
+                Ok(!t.tls.is_handshaking())
+            },
+        )?;
         t.server_cert_status = status.lock().unwrap().clone();
         log(format!(
             "TLS handshake done ({:?}); VPN server certificate {}",
@@ -1241,10 +1392,15 @@ impl Tunnel {
             .map_err(|e| format!("TLS write: {e}"))?;
         t.flush_tls()?;
         let mut randoms = None;
-        t.wait_for(Duration::from_secs(15), "no key exchange reply", |t| {
-            randoms = t.take_server_key_method()?;
-            Ok(randoms.is_some())
-        })?;
+        t.wait_for(
+            remaining().min(Duration::from_secs(10)),
+            opts.cancel,
+            "no key exchange reply",
+            |t| {
+                randoms = t.take_server_key_method()?;
+                Ok(randoms.is_some())
+            },
+        )?;
         let (sr1, sr2) = randoms.unwrap();
         t.key_material = Some(t.derive_key_material(&pre_master, &r1, &r2, &sr1, &sr2));
         log(format!(
@@ -1253,10 +1409,11 @@ impl Tunnel {
         ));
 
         // 4) 터널 주소와 데이터 채널 설정 받기 (길면 push-continuation 으로 나뉘어 옴)
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = (Instant::now() + Duration::from_secs(20)).min(total_deadline);
         let mut next_request = Instant::now();
         let mut options: Vec<String> = Vec::new();
         loop {
+            check_cancelled(opts.cancel)?;
             let mut done = false;
             while let Some(r) = t.take_control_message("PUSH_REPLY")? {
                 let body = r.trim_start_matches("PUSH_REPLY").trim_start_matches(',');
@@ -1283,12 +1440,12 @@ impl Tunnel {
                     .write_all(b"PUSH_REQUEST\0")
                     .map_err(|e| format!("TLS write: {e}"))?;
                 t.flush_tls()?;
-                next_request = now + Duration::from_secs(3);
+                next_request = now + Duration::from_secs(2);
             }
             t.retransmit()?;
             if let Some(p) = t
                 .link
-                .recv_until((now + Duration::from_millis(300)).min(deadline))?
+                .recv_until((now + HANDSHAKE_POLL_SLICE).min(deadline))?
             {
                 t.handle_packet(p)?;
             }
@@ -1311,11 +1468,13 @@ impl Tunnel {
     fn wait_for(
         &mut self,
         limit: Duration,
+        cancel: Option<&AtomicBool>,
         timeout_msg: &str,
         mut done: impl FnMut(&mut Tunnel) -> Result<bool, String>,
     ) -> Result<(), String> {
         let deadline = Instant::now() + limit;
         loop {
+            check_cancelled(cancel)?;
             if done(self)? {
                 return Ok(());
             }
@@ -1326,7 +1485,7 @@ impl Tunnel {
             self.retransmit()?;
             if let Some(p) = self
                 .link
-                .recv_until((now + Duration::from_millis(300)).min(deadline))?
+                .recv_until((now + HANDSHAKE_POLL_SLICE).min(deadline))?
             {
                 self.handle_packet(p)?;
             }
@@ -1412,11 +1571,22 @@ impl Tunnel {
             return Ok(());
         }
         let opcode = p[0] >> 3;
+        let key_id = p[0] & 7;
         if opcode == OP_DATA_V1 || opcode == OP_DATA_V2 {
+            if key_id != 0 {
+                return Err("VPN session keys rotated (reconnect required)".into());
+            }
             let r = self.decrypt_data(&p);
             match &r {
-                Ok(Some(_)) => self.data_rx += 1,
-                Err(_) => self.data_rx_errors += 1,
+                Ok(Some(_)) => {
+                    self.data_rx += 1;
+                    self.consecutive_rx_errors = 0;
+                    self.last_rx = Instant::now();
+                }
+                Err(_) => {
+                    self.data_rx_errors += 1;
+                    self.consecutive_rx_errors = self.consecutive_rx_errors.saturating_add(1);
+                }
                 _ => {}
             }
             if let Some(ip) = r? {
@@ -1426,8 +1596,8 @@ impl Tunnel {
             }
             return Ok(());
         }
-        if p[0] & 7 != 0 {
-            return Ok(()); // 다른 키 번호 (재협상) - 쓰지 않음
+        if key_id != 0 {
+            return Ok(()); // Control packet for a renegotiation key slot we do not negotiate.
         }
         let raw = match self.wrap.unwrap(&p) {
             Ok(r) => r,
@@ -1435,6 +1605,7 @@ impl Tunnel {
             Err(_) => return Ok(()), // 연결 뒤 들어온 깨진 패킷은 버림
         };
         let c = parse_control(&raw).ok_or("malformed control packet")?;
+        self.last_rx = Instant::now();
         if !c.acks.is_empty() {
             self.unacked.retain(|u| !c.acks.contains(&u.pid));
         }
@@ -1602,6 +1773,10 @@ impl Tunnel {
                 Some("peer-id") => peer_id = parts.get(1).and_then(|n| n.parse().ok()),
                 Some("ping") => {
                     self.ping_interval = parts.get(1).and_then(|n| n.parse::<u32>().ok())
+                        .filter(|n| *n > 0).map(|n| Duration::from_secs(n.into()));
+                }
+                Some("ping-restart") => {
+                    self.ping_restart = parts.get(1).and_then(|n| n.parse::<u32>().ok())
                         .filter(|n| *n > 0).map(|n| Duration::from_secs(n.into()));
                 }
                 Some("dhcp-option") if parts.get(1) == Some(&"DNS") => {
@@ -1843,26 +2018,35 @@ impl Tunnel {
         Ok(())
     }
 
-    /// 서버에서 온 패킷을 최대 `wait` 동안 기다려 처리
+    /// Wait up to `wait` for incoming VPN packets, then drain any already-ready packets
+    /// without stalling out the remainder of `wait`.
     pub fn pump(&mut self, wait: Duration) -> Result<(), String> {
-        // Servers with --ping-restart expect client traffic even while the
-        // browser is idle (for example while the user completes login).
-        if self.ping_interval.is_some_and(|d| self.last_data_send.elapsed() >= d) {
+        let interval = self.ping_interval.unwrap_or(DEFAULT_KEEPALIVE);
+        if self.last_data_send.elapsed() >= interval {
             self.send_ip(&PING_MAGIC)?;
         }
-        let deadline = Instant::now() + wait;
-        for _ in 0..256 {
-            match self.link.recv_until(deadline)? {
-                Some(p) => {
-                    // 연결 뒤에는 깨진 데이터 패킷 하나로 전체를 끊지 않음
-                    if let Err(e) = self.handle_packet(p) {
-                        if !e.contains("authentication") && !e.contains("padding") {
-                            return Err(e);
-                        }
+        let first = match self.link.try_recv_buffered() {
+            Some(p) => Some(p),
+            None => self.link.recv_until(Instant::now() + wait)?,
+        };
+        if let Some(first) = first {
+            let mut packets = Vec::with_capacity(16);
+            packets.push(first);
+            self.link.drain_ready(256, &mut packets)?;
+            for p in packets {
+                if let Err(e) = self.handle_packet(p) {
+                    let recoverable = (e.contains("authentication") || e.contains("padding"))
+                        && self.consecutive_rx_errors < MAX_CONSECUTIVE_DATA_ERRORS;
+                    if !recoverable {
+                        return Err(e);
                     }
                 }
-                None => break,
             }
+        }
+        // Checked after reading, so server pings that queued up while nobody pumped the
+        // tunnel still count as signs of life.
+        if self.ping_restart.is_some_and(|d| self.last_rx.elapsed() >= d) {
+            return Err("VPN server stopped responding (ping-restart)".into());
         }
         Ok(())
     }
@@ -1984,5 +2168,59 @@ mod tests {
         let mut pid = 1;
         let pkt = client.wrap(OP_ACK_V1 << 3, &[1; 8], b"abc", &mut pid);
         assert_eq!(&server.unwrap(&pkt).unwrap()[9..], b"abc");
+    }
+
+    #[test]
+    fn tcp_frame_cursor_extracts_multiple_frames_and_compacts() {
+        let mut rbuf = Vec::new();
+        let mut rpos = 0;
+        append_frame(&mut rbuf, b"one");
+        append_frame(&mut rbuf, b"two");
+        rbuf.extend_from_slice(&[0, 5, b'p', b'a']); // partial third frame
+        assert_eq!(take_tcp_frame(&mut rbuf, &mut rpos).as_deref(), Some(b"one".as_slice()));
+        assert_eq!(take_tcp_frame(&mut rbuf, &mut rpos).as_deref(), Some(b"two".as_slice()));
+        assert_eq!(take_tcp_frame(&mut rbuf, &mut rpos), None);
+        rbuf.extend_from_slice(b"rts");
+        assert_eq!(take_tcp_frame(&mut rbuf, &mut rpos).as_deref(), Some(b"parts".as_slice()));
+        assert!(rbuf.is_empty() && rpos == 0);
+
+        // Large read advances past 32 KB compaction threshold cleanly.
+        let big = vec![0xAA; 33 * 1024];
+        append_frame(&mut rbuf, &big);
+        append_frame(&mut rbuf, b"tail");
+        assert_eq!(take_tcp_frame(&mut rbuf, &mut rpos).unwrap().len(), big.len());
+        assert_eq!(rpos, 0);
+        assert_eq!(take_tcp_frame(&mut rbuf, &mut rpos).as_deref(), Some(b"tail".as_slice()));
+        assert!(rbuf.is_empty());
+    }
+
+    #[test]
+    fn connect_with_respects_pre_set_cancellation_flag() {
+        let cfg = OvpnConfig {
+            remotes: vec![Remote { host: "127.0.0.1".into(), port: 1, udp: false }],
+            remote_random: false,
+            cipher: Some("AES-128-CBC".into()),
+            data_ciphers: vec![],
+            auth: "SHA1".into(),
+            ca_pem: String::new(),
+            cert_pem: None,
+            key_pem: None,
+            tls_auth: None,
+            tls_crypt: None,
+            auth_user_pass: false,
+            compress: Compress::None,
+            fragment: None,
+        };
+        let cancel = AtomicBool::new(true);
+        let opts = ConnectOptions {
+            remote: &cfg.remotes[0],
+            tls_name: "example.test",
+            strict_verify: false,
+            credentials: None,
+            timeout: Some(Duration::from_secs(10)),
+            cancel: Some(&cancel),
+        };
+        let err = Tunnel::connect_with(&cfg, &opts, &mut |_| {}).err().unwrap();
+        assert!(err.contains("cancelled"), "{err}");
     }
 }

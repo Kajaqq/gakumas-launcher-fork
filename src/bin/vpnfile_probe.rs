@@ -100,6 +100,8 @@ fn run() -> Result<(), String> {
                 tls_name: &remote.host,
                 strict_verify: true,
                 credentials: creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
+                timeout: None,
+                cancel: None,
             };
             match Tunnel::connect_with(&cfg, &opts, &mut log) {
                 Ok(t) => {

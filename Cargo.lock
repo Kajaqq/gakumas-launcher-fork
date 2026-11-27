@@ -4806,6 +4806,7 @@ dependencies = [
  "base64 0.22.1",
  "cookie",
  "cookie_store",
+ "flate2",
  "log",
  "native-tls",
  "once_cell",

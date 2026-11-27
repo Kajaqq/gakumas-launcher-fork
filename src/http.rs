@@ -70,6 +70,7 @@ pub(crate) fn download_file_with_progress(
         .map_err(|e| format!("Could not stage {}: {e}", path.display()))?;
     let response = agent
         .get(url)
+        .set("Accept-Encoding", "identity")
         .call()
         .map_err(|e| format!("Failed to download {}: {e}", path.display()))?;
     if response.status() != 200 {

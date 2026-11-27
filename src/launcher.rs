@@ -3,8 +3,9 @@
 //! 로그인 토큰 확인 → 일본 연결(VPN Gate 내장 터널 또는 사용자의 VPN) → 실행 토큰 발급 →
 //! 업데이트(바뀐 파일만, 일반 회선) → 게임 실행
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::fs;
 use std::io::{Read, Write};
 use std::num::NonZeroU64;
@@ -20,16 +21,32 @@ use crate::http::{self, CLIENT_VERSION, DMM_HOST};
 use crate::netstack::{IpTunnel, TunnelStack};
 use crate::openvpn::{self, ConnectOptions, OvpnConfig, Tunnel};
 use crate::wireguard::{WgConfig, WgTunnel};
-use crate::{platform, vpngate};
+use crate::{github, platform, vpngate};
 
 pub const PRODUCT_ID: &str = "gakumas";
 const USER_AGENT: &str = "DMMGamePlayer5-Win/5.5.22 Electron/34.3.0";
-/// 이보다 최근에 받은 목록이면 "갱신" 때 다시 받지 않음 (시작할 때 받은 목록을 그대로 씀)
+/// A cached server list newer than this is reused without re-downloading.
 pub const VPNGATE_RECENT: Duration = Duration::from_secs(10 * 60);
-const VPNGATE_OFFICIAL_TRIES: usize = 3;
-const VPNGATE_MORE_TRIES: usize = 5;
-/// DMM 이 VPN 서버를 거부할 때 다른 서버로 바꿔 시도하는 최대 횟수
-const VPNGATE_LAUNCH_ATTEMPTS: usize = 4;
+/// Cached lists older than this are refreshed before dialing so we don't chase dead IPs.
+const VPNGATE_CACHE_STALE: Duration = Duration::from_secs(60 * 60);
+/// Number of diverse VPN Gate servers raced per batch.
+const VPNGATE_RACE_BATCH: usize = 4;
+/// Delay between starting each slot in a race batch (gives slot 0 / last-good a brief head start).
+const VPNGATE_RACE_STAGGER: Duration = Duration::from_millis(250);
+/// Overall OpenVPN connect deadline per raced VPN Gate server.
+const VPNGATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// In-tunnel DNS health probe deadline required before a VPN Gate server can win a race.
+const VPNGATE_HEALTH_TIMEOUT: Duration = Duration::from_secs(4);
+/// Maximum number of servers/rotations tried when DMM rejects or drops a VPN Gate exit.
+const VPNGATE_LAUNCH_ATTEMPTS: usize = 5;
+/// Persistence TTLs for VPN Gate reputation (`vpngate_state.json`).
+const LAST_GOOD_TTL_SECS: u64 = 24 * 60 * 60;
+const FAILED_HOST_TTL_SECS: u64 = 15 * 60;
+const REJECTED_HOST_TTL_SECS: u64 = 6 * 60 * 60;
+const REJECTED_SUBNET_TTL_SECS: u64 = 2 * 60 * 60;
+/// Idle thresholds for checking a cached shared tunnel before reusing it.
+const IDLE_KEEPALIVE_CHECK: Duration = Duration::from_secs(30);
+const IDLE_DNS_PROBE_CHECK: Duration = Duration::from_secs(90);
 
 /// 진행 상황 알림 (메시지, 진행률 0~100)
 pub type ProgressFn<'a> = &'a dyn Fn(&str, Option<f32>);
@@ -163,6 +180,78 @@ pub struct UpdateCheck {
     pub localify_checked_at: Option<u64>,
 }
 
+/// Saved VPN Gate server reputation used across launches so working relays connect
+/// immediately and dead or DMM-blocked servers/subnets are skipped temporarily.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct VpnGateState {
+    #[serde(default)]
+    pub last_good: Option<GoodServer>,
+    /// Host names that recently failed to connect or failed the health check (unix secs).
+    #[serde(default)]
+    pub failed_hosts: HashMap<String, u64>,
+    /// IP addresses that recently failed (covers multi-instance hosts sharing one IP, unix secs).
+    #[serde(default)]
+    pub failed_ips: HashMap<String, u64>,
+    /// Host names recently rejected by DMM with 801/803 (unix secs).
+    #[serde(default)]
+    pub rejected_hosts: HashMap<String, u64>,
+    /// IPv4 `/24` prefixes recently rejected by DMM with 801/803 (unix secs).
+    #[serde(default)]
+    pub rejected_subnets: HashMap<String, u64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GoodServer {
+    pub host_name: String,
+    pub ip: String,
+    pub config_text: String,
+    pub verified_at: u64,
+}
+
+impl VpnGateState {
+    fn prune(&mut self, now: u64) {
+        self.failed_hosts
+            .retain(|_, &mut ts| ts <= now && now - ts < FAILED_HOST_TTL_SECS);
+        self.failed_ips
+            .retain(|_, &mut ts| ts <= now && now - ts < FAILED_HOST_TTL_SECS);
+        self.rejected_hosts
+            .retain(|_, &mut ts| ts <= now && now - ts < REJECTED_HOST_TTL_SECS);
+        self.rejected_subnets
+            .retain(|_, &mut ts| ts <= now && now - ts < REJECTED_SUBNET_TTL_SECS);
+        if self
+            .last_good
+            .as_ref()
+            .is_some_and(|g| g.verified_at > now || now - g.verified_at >= LAST_GOOD_TTL_SECS)
+        {
+            self.last_good = None;
+        }
+    }
+
+    fn is_failed(&self, host: &str, now: u64) -> bool {
+        self.failed_hosts
+            .get(host)
+            .is_some_and(|&ts| ts <= now && now - ts < FAILED_HOST_TTL_SECS)
+    }
+
+    fn is_failed_ip(&self, ip: &str, now: u64) -> bool {
+        self.failed_ips
+            .get(ip)
+            .is_some_and(|&ts| ts <= now && now - ts < FAILED_HOST_TTL_SECS)
+    }
+
+    fn is_rejected_host(&self, host: &str, now: u64) -> bool {
+        self.rejected_hosts
+            .get(host)
+            .is_some_and(|&ts| ts <= now && now - ts < REJECTED_HOST_TTL_SECS)
+    }
+
+    fn is_rejected_subnet(&self, subnet: &str, now: u64) -> bool {
+        self.rejected_subnets
+            .get(subnet)
+            .is_some_and(|&ts| ts <= now && now - ts < REJECTED_SUBNET_TTL_SECS)
+    }
+}
+
 /// 프로그램 데이터 (설정, 암호화된 로그인 토큰, 기기 ID, VPN Gate 목록 캐시, VPN 설정 파일)
 pub struct Store {
     dir: PathBuf,
@@ -170,6 +259,7 @@ pub struct Store {
 // Rotation reopens the same directory through a second Store. Both writers
 // must serialize access to the shared vpngate.csv.tmp file.
 static VPNGATE_CACHE_LOCK: Mutex<()> = Mutex::new(());
+static VPNGATE_STATE_LOCK: Mutex<()> = Mutex::new(());
 // Installs and the background update check rewrite these records.
 static LOCALIFY_LOCK: Mutex<()> = Mutex::new(());
 static UPDATE_CHECK_LOCK: Mutex<()> = Mutex::new(());
@@ -207,6 +297,82 @@ impl Store {
     /// 저장해 둔 VPN Gate 서버 목록 (없으면 None)
     pub fn cached_vpngate_list(&self) -> Option<String> {
         fs::read_to_string(self.file("vpngate.csv")).ok()
+    }
+
+    /// Cached VPN Gate list along with its file age.
+    fn cached_vpngate_list_with_age(&self) -> Option<(String, Duration)> {
+        let path = self.file("vpngate.csv");
+        let age = file_age(&path)?;
+        let body = fs::read_to_string(&path).ok()?;
+        Some((body, age))
+    }
+
+    /// Saved VPN Gate server reputation (last working server and temporary cooldowns).
+    pub fn vpngate_state(&self) -> VpnGateState {
+        self.record("vpngate_state.json")
+    }
+
+    fn update_vpngate_state(
+        &self,
+        change: impl FnOnce(&mut VpnGateState, u64),
+    ) -> Result<VpnGateState, String> {
+        let now = github::now_secs();
+        self.update_record("vpngate_state.json", &VPNGATE_STATE_LOCK, |state: &mut VpnGateState| {
+            state.prune(now);
+            change(state, now);
+        })
+    }
+
+    fn record_vpngate_success(&self, info: &VpnGateServerInfo) {
+        let _ = self.update_vpngate_state(|state, now| {
+            state.failed_hosts.remove(&info.host_name);
+            state.failed_ips.remove(&info.ip);
+            state.rejected_hosts.remove(&info.host_name);
+            if let Some(subnet) = vpngate::subnet24_of(&info.ip) {
+                state.rejected_subnets.remove(&subnet);
+            }
+            if !info.config_text.is_empty() {
+                state.last_good = Some(GoodServer {
+                    host_name: info.host_name.clone(),
+                    ip: info.ip.clone(),
+                    config_text: info.config_text.clone(),
+                    verified_at: now,
+                });
+            }
+        });
+    }
+
+    fn record_vpngate_failures(&self, failed: &[(String, String)]) {
+        if failed.is_empty() {
+            return;
+        }
+        let _ = self.update_vpngate_state(|state, now| {
+            for (host, ip) in failed {
+                state.failed_hosts.insert(host.clone(), now);
+                if !ip.is_empty() {
+                    state.failed_ips.insert(ip.clone(), now);
+                }
+                if state
+                    .last_good
+                    .as_ref()
+                    .is_some_and(|g| g.host_name == *host || (!ip.is_empty() && g.ip == *ip))
+                {
+                    state.last_good = None;
+                }
+            }
+        });
+    }
+
+    fn record_vpngate_rejected(&self, host: &str, ip: &str) {
+        let _ = self.update_vpngate_state(|state, now| {
+            state.rejected_hosts.insert(host.to_string(), now);
+            if let Some(subnet) = vpngate::subnet24_of(ip) {
+                state.rejected_subnets.insert(subnet, now);
+            }
+            if state.last_good.as_ref().is_some_and(|g| g.host_name == host) {
+                state.last_good = None;
+            }
+        });
     }
 
     /// VPN Gate 서버 목록을 새로 받아 저장. `max_age` 보다 최근 목록이 있으면 그것을 씀.
@@ -547,7 +713,7 @@ fn direct_post(path: &str, body: &Value, token: Option<&str>) -> Result<Value, S
     let text = resp
         .into_string()
         .map_err(|e| format!("Failed to receive the DMM response: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("Failed to parse the DMM response: {e}"))
+    serde_json::from_str(&text).map_err(|e| format!("{DMM_PARSE_ERROR}: {e}"))
 }
 
 fn fetch_manifest_page(
@@ -586,13 +752,26 @@ pub fn netlog(msg: &str) {
     eprintln!("[{h:02}:{m:02}:{s:02}] {msg}");
 }
 
+/// Metadata for a connected VPN Gate exit.
+#[derive(Clone, Debug)]
+struct VpnGateServerInfo {
+    host_name: String,
+    ip: String,
+    config_text: String,
+}
+
 /// One VPN tunnel shared by the launcher, My Games calls and the browser proxy.
 struct SharedTunnel {
     stack: Arc<Mutex<TunnelStack>>,
-    /// Server host names already used — rotation skips these.
+    /// Server host names already used or failed — rotation skips these.
     tried: HashSet<String>,
-    /// The server this tunnel is connected to.
-    server: Option<String>,
+    /// IPv4 `/24` subnets rejected by DMM in this session.
+    rejected_subnets: HashSet<String>,
+    /// The VPN Gate server this tunnel is connected to (`None` for VPN File mode).
+    server: Option<VpnGateServerInfo>,
+    /// False once this tunnel failed or was rejected by DMM; prevents reuse while
+    /// keeping the `Route` entry alive for `browser_proxy`'s reconnect loop.
+    healthy: bool,
 }
 
 // Each route has its own setup lock. Its Arc also serves as the generation
@@ -619,32 +798,47 @@ fn with_route<T>(setup: &Arc<Mutex<()>>, f: impl FnOnce(&mut Route) -> T) -> Res
         .ok_or_else(|| "VPN route changed during connection setup".to_string())
 }
 
-fn open_tunnel(store: &Store, mode: &str, tried: &mut HashSet<String>, progress: ProgressFn)
-    -> Result<(TunnelStack, Option<String>), String>
-{
+fn open_tunnel(
+    store: &Store,
+    mode: &str,
+    tried: &mut HashSet<String>,
+    rejected_subnets: &HashSet<String>,
+    progress: ProgressFn,
+) -> Result<(TunnelStack, Option<VpnGateServerInfo>), String> {
     if mode == MODE_FILE {
         netlog("Opening VPN file tunnel");
         return Ok((open_vpn_file(store, progress)?, None));
     }
-    let (stack, host) = open_vpngate(store, progress, tried)?;
-    netlog(&format!("VPN tunnel connected via {host}"));
-    Ok((stack, Some(host)))
+    let (stack, info) = open_vpngate(store, progress, tried, rejected_subnets)?;
+    netlog(&format!("VPN tunnel connected via {} ({})", info.host_name, info.ip));
+    Ok((stack, Some(info)))
 }
 
 /// Called only under this generation's setup lock. Share failed attempts for a
 /// short interval too, so queued connections don't each start a server search.
 fn dial_route(
-    setup: &Arc<Mutex<()>>, store: &Store, mode: &str, mut tried: HashSet<String>, progress: ProgressFn,
+    setup: &Arc<Mutex<()>>,
+    store: &Store,
+    mode: &str,
+    mut tried: HashSet<String>,
+    rejected_subnets: HashSet<String>,
+    progress: ProgressFn,
 ) -> Result<Arc<Mutex<TunnelStack>>, String> {
     if let Some(error) = with_route(setup, |r| r.last_error.as_ref()
         .filter(|(at, _)| at.elapsed() < Duration::from_secs(3)).map(|(_, e)| e.clone()))? {
         return Err(error);
     }
-    match open_tunnel(store, mode, &mut tried, progress) {
+    match open_tunnel(store, mode, &mut tried, &rejected_subnets, progress) {
         Ok((stack, server)) => {
             let stack = Arc::new(Mutex::new(stack));
             with_route(setup, |r| {
-                r.active = Some(SharedTunnel { stack: stack.clone(), tried, server });
+                r.active = Some(SharedTunnel {
+                    stack: stack.clone(),
+                    tried,
+                    rejected_subnets,
+                    server,
+                    healthy: true,
+                });
                 r.last_error = None;
             })?;
             Ok(stack)
@@ -652,15 +846,38 @@ fn dial_route(
         Err(error) => {
             with_route(setup, |r| {
                 r.last_error = Some((Instant::now(), error.clone()));
-                // A long-lived session may have exhausted every candidate.
-                // On the next search, exclude only the currently failed exit.
+                // Keep the route slot alive (so browser_proxy keeps retrying) but mark
+                // the failed tunnel unhealthy so shared_tunnel never hands it back.
                 if let Some(active) = r.active.as_mut() {
-                    active.tried = active.server.iter().cloned().collect();
+                    active.healthy = false;
+                    // A long-lived session may have exhausted every candidate;
+                    // next search excludes only the currently failed exit.
+                    active.tried = active.server.iter().map(|s| s.host_name.clone()).collect();
                 }
             })?;
             Err(error)
         }
     }
+}
+
+/// Verify that an idle cached tunnel has not been silently dropped by the peer or NAT.
+/// The in-tunnel DNS probe applies only to VPN Gate exits, which had to pass the same
+/// lookup to connect. VPN File tunnels may legitimately run without in-tunnel DNS.
+fn check_idle_tunnel(stack: &Arc<Mutex<TunnelStack>>, dns_probe: bool) -> Result<(), String> {
+    let idle = {
+        let mut s = stack.lock().map_err(|e| e.to_string())?;
+        let idle = s.idle_for();
+        if idle < IDLE_KEEPALIVE_CHECK {
+            return Ok(());
+        }
+        s.keepalive()?;
+        idle
+    };
+    if dns_probe && idle >= IDLE_DNS_PROBE_CHECK {
+        // Shared lookup: other tunnel users keep running while the probe is in flight.
+        TunnelStack::probe_dns_shared(stack, DMM_HOST, VPNGATE_HEALTH_TIMEOUT)?;
+    }
+    Ok(())
 }
 
 pub fn shared_tunnel(
@@ -688,11 +905,29 @@ pub fn shared_tunnel(
     let setup = guard.as_ref().unwrap().setup.clone();
     drop(guard);
     let _opening = setup.lock().map_err(|e| e.to_string())?;
-    if let Some(stack) = with_route(&setup, |r| r.active.as_ref().map(|s| s.stack.clone()))? {
-        return Ok(stack);
-    }
+    let existing = with_route(&setup, |r| {
+        r.active.as_ref().map(|s| {
+            (s.stack.clone(), s.healthy, s.tried.clone(), s.rejected_subnets.clone(), s.server.is_some())
+        })
+    })?;
+    let (tried, rejected_subnets) = match existing {
+        Some((stack, true, tried, rejected_subnets, vpngate)) => match check_idle_tunnel(&stack, vpngate) {
+            Ok(()) => return Ok(stack),
+            Err(e) => {
+                netlog(&format!("Shared tunnel failed idle health check ({e}); reconnecting"));
+                let _ = with_route(&setup, |r| {
+                    if let Some(active) = r.active.as_mut() {
+                        active.healthy = false;
+                    }
+                });
+                (tried, rejected_subnets)
+            }
+        },
+        Some((_, false, tried, rejected_subnets, _)) => (tried, rejected_subnets),
+        None => (HashSet::new(), HashSet::new()),
+    };
     netlog(&format!("Opening shared tunnel (mode={mode})"));
-    dial_route(&setup, store, mode, HashSet::new(), progress)
+    dial_route(&setup, store, mode, tried, rejected_subnets, progress)
 }
 
 pub(crate) struct TunnelRoute(Arc<Mutex<()>>);
@@ -709,8 +944,86 @@ impl TunnelRoute {
     }
 }
 
+/// Why a tunnel is being abandoned. Decides what goes into the persistent reputation
+/// (`vpngate_state.json`): only faults that clearly belong to the exit are saved, so a
+/// drop in the user's own connection or a DMM outage doesn't cool down good servers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TunnelFault {
+    /// DMM answered 801/803 for this exit. Saved immediately.
+    RejectedByDmm,
+    /// The tunnel stopped carrying traffic. Saved only after another server connects,
+    /// which shows the user's own network is up.
+    Transport,
+    /// Not attributable to the exit (e.g. a DMM server error). Kept in this session only.
+    Unattributed,
+}
+
+impl TunnelFault {
+    /// Classify a `JapanLink::post` error.
+    fn of_post_error(e: &str) -> Self {
+        if e.starts_with(DMM_SERVER_ERROR) || e.starts_with(DMM_PARSE_ERROR) {
+            TunnelFault::Unattributed
+        } else {
+            TunnelFault::Transport
+        }
+    }
+}
+
+const DMM_SERVER_ERROR: &str = "DMM server error";
+const DMM_PARSE_ERROR: &str = "Failed to parse the DMM response";
+
+/// Mark `failed` unusable for this session without redialing. Only a DMM rejection is
+/// saved, because nothing here shows whether the user's own network is to blame.
+fn mark_tunnel_failed(failed: &Arc<Mutex<TunnelStack>>, store: &Store, fault: TunnelFault) {
+    let rejected_by_dmm = fault == TunnelFault::RejectedByDmm;
+    let server = {
+        let mut guard = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(active) = guard
+            .as_mut()
+            .and_then(|r| r.active.as_mut())
+            .filter(|s| Arc::ptr_eq(&s.stack, failed))
+        else {
+            return;
+        };
+        active.healthy = false;
+        if rejected_by_dmm {
+            if let Some(info) = &active.server {
+                if let Some(subnet) = vpngate::subnet24_of(&info.ip) {
+                    active.rejected_subnets.insert(subnet);
+                }
+            }
+        }
+        active.server.clone()
+    };
+    if let (true, Some(info)) = (rejected_by_dmm, server) {
+        store.record_vpngate_rejected(&info.host_name, &info.ip);
+    }
+}
+
+fn record_tunnel_success(stack: &Arc<Mutex<TunnelStack>>, store: &Store) {
+    let server = {
+        let guard = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .and_then(|r| r.active.as_ref())
+            .filter(|s| Arc::ptr_eq(&s.stack, stack))
+            .and_then(|s| s.server.clone())
+    };
+    if let Some(info) = server {
+        store.record_vpngate_success(&info);
+    }
+}
+
 /// Rotate only the stack that actually failed, coalescing concurrent reports.
 pub fn rotate_tunnel_if(failed: &Arc<Mutex<TunnelStack>>) -> Result<Arc<Mutex<TunnelStack>>, String> {
+    rotate_tunnel_with_reason(failed, TunnelFault::Transport)
+}
+
+fn rotate_tunnel_with_reason(
+    failed: &Arc<Mutex<TunnelStack>>,
+    fault: TunnelFault,
+) -> Result<Arc<Mutex<TunnelStack>>, String> {
+    let rejected_by_dmm = fault == TunnelFault::RejectedByDmm;
     let (setup, dir, mode) = {
         let guard = ROUTE.lock().map_err(|e| e.to_string())?;
         let r = guard.as_ref().filter(|r| r.active.as_ref().is_some_and(|s| Arc::ptr_eq(&s.stack, failed)))
@@ -718,17 +1031,43 @@ pub fn rotate_tunnel_if(failed: &Arc<Mutex<TunnelStack>>) -> Result<Arc<Mutex<Tu
         (r.setup.clone(), r.dir.clone(), r.mode.clone())
     };
     let _opening = setup.lock().map_err(|e| e.to_string())?;
-    let (stack, tried, server) = with_route(&setup, |r| {
-        r.active.as_ref().map(|s| (s.stack.clone(), s.tried.clone(), s.server.clone()))
+    let (stack, tried, mut rejected_subnets, server) = with_route(&setup, |r| {
+        r.active.as_mut().map(|s| {
+            let same = Arc::ptr_eq(&s.stack, failed);
+            if same {
+                s.healthy = false;
+                if rejected_by_dmm {
+                    if let Some(info) = &s.server {
+                        if let Some(subnet) = vpngate::subnet24_of(&info.ip) {
+                            s.rejected_subnets.insert(subnet);
+                        }
+                    }
+                }
+            }
+            (s.stack.clone(), s.tried.clone(), s.rejected_subnets.clone(), s.server.clone())
+        })
     })?.ok_or("No tunnel to rotate")?;
     if !Arc::ptr_eq(&stack, failed) {
         return Ok(stack);
     }
-    if let Some(server) = server {
-        netlog(&format!("Rotating away from failed server {server}"));
+    let store = Store { dir };
+    if let Some(info) = &server {
+        if rejected_by_dmm {
+            netlog(&format!("Rotating away from DMM-rejected server {} ({})", info.host_name, info.ip));
+            if let Some(subnet) = vpngate::subnet24_of(&info.ip) {
+                rejected_subnets.insert(subnet);
+            }
+            store.record_vpngate_rejected(&info.host_name, &info.ip);
+        } else {
+            netlog(&format!("Rotating away from failed server {} ({})", info.host_name, info.ip));
+        }
     }
-    let stack = dial_route(&setup, &Store { dir }, &mode, tried, &|m, _| netlog(m))?;
+    let stack = dial_route(&setup, &store, &mode, tried, rejected_subnets, &|m, _| netlog(m))?;
     netlog("VPN tunnel rotated successfully");
+    // Another server connected, so the old one (not the user's network) was at fault.
+    if let (TunnelFault::Transport, Some(info)) = (fault, server) {
+        store.record_vpngate_failures(&[(info.host_name, info.ip)]);
+    }
     Ok(stack)
 }
 
@@ -744,11 +1083,23 @@ enum JapanLink {
 }
 
 impl JapanLink {
-    fn rotate_failed_server(&self) -> Result<(), String> {
+    fn rotate_failed_server(&self, fault: TunnelFault) -> Result<(), String> {
         if let JapanLink::Tunnel(stack) = self {
-            rotate_tunnel_if(stack)?;
+            rotate_tunnel_with_reason(stack, fault)?;
         }
         Ok(())
+    }
+
+    fn mark_failed(&self, store: &Store, fault: TunnelFault) {
+        if let JapanLink::Tunnel(stack) = self {
+            mark_tunnel_failed(stack, store, fault);
+        }
+    }
+
+    fn record_success(&self, store: &Store) {
+        if let JapanLink::Tunnel(stack) = self {
+            record_tunnel_success(stack, store);
+        }
     }
 
     fn post(&mut self, path: &str, body: &Value, token: &str) -> Result<Value, String> {
@@ -762,8 +1113,8 @@ impl JapanLink {
                 let (status, b) = http::parse_response(&raw)?;
                 match serde_json::from_slice(&b) {
                     Ok(v) => Ok(v),
-                    Err(_) if status != 200 => Err(format!("DMM server error (HTTP {status})")),
-                    Err(e) => Err(format!("Failed to parse the DMM response: {e}")),
+                    Err(_) if status != 200 => Err(format!("{DMM_SERVER_ERROR} (HTTP {status})")),
+                    Err(e) => Err(format!("{DMM_PARSE_ERROR}: {e}")),
                 }
             }
         }
@@ -853,33 +1204,153 @@ fn open_japan_link(
     Ok(JapanLink::Tunnel(shared_tunnel(store, mode, progress)?))
 }
 
-fn try_servers(
-    list: &[(vpngate::Server, vpngate::OvpnConfig)],
-    tried: &mut HashSet<String>,
-    progress: ProgressFn,
-) -> Option<(TunnelStack, String)> {
-    for (server, cfg) in list {
-        if !tried.insert(server.host_name.clone()) {
-            continue;
+/// Connect to a VPN Gate candidate and verify its data plane via an in-tunnel DNS lookup.
+/// A black-holed tunnel that completes OpenVPN handshake but drops data packets fails here.
+fn connect_vpngate_candidate(
+    server: &vpngate::Server,
+    cfg: &vpngate::OvpnConfig,
+    cancel: &AtomicBool,
+    refresh_dns_ip: bool,
+) -> Result<(TunnelStack, VpnGateServerInfo), String> {
+    let mut cfg = cfg.clone();
+    if refresh_dns_ip {
+        vpngate::refresh_builtin_ip(server, &mut cfg);
+    }
+    let remote = cfg.remotes.first().ok_or("remote missing")?;
+    let opts = ConnectOptions {
+        remote,
+        tls_name: &server.tls_name(),
+        strict_verify: false,
+        credentials: None,
+        timeout: Some(VPNGATE_CONNECT_TIMEOUT),
+        cancel: Some(cancel),
+    };
+    let tun = Tunnel::connect_with(&cfg, &opts, &mut |_| {}).map_err(|e| {
+        if e.contains("AUTH_FAILED") {
+            format!("{e} (relay busy or DHCP pool full)")
+        } else {
+            e
         }
-        progress(&format!("Connecting to VPN · {}", server.host_name), None);
-        match connect_tunnel(cfg, &server.tls_name(), progress) {
-            Ok(stack) => return Some((stack, server.host_name.clone())),
-            Err(e) => progress(&format!("{} connection failed: {e}", server.host_name), None),
+    })?;
+    let mut stack = TunnelStack::new(tun)?;
+    if cancel.load(Ordering::Acquire) {
+        return Err("connection cancelled".into());
+    }
+    stack
+        .resolve_in_tunnel_cancellable(DMM_HOST, VPNGATE_HEALTH_TIMEOUT, Some(cancel))
+        .map_err(|e| format!("tunnel health check failed: {e}"))?;
+    let ip = vpngate::remote_ip(&cfg).to_string();
+    Ok((
+        stack,
+        VpnGateServerInfo {
+            host_name: server.host_name.clone(),
+            ip,
+            config_text: server.config_text.clone(),
+        },
+    ))
+}
+
+enum RaceOutcome {
+    Connected(TunnelStack, VpnGateServerInfo),
+    Failed(String, String, String),
+    Cancelled,
+}
+
+/// Race a small diverse batch of VPN Gate candidates concurrently (with a short stagger so
+/// slot 0 — e.g. last-known-good — gets a brief head start). Returns the first server that
+/// connects AND passes the in-tunnel health check, cancelling all others immediately.
+/// Only the winner and genuinely failed candidates are added to `tried`.
+fn race_servers(
+    batch: Vec<(vpngate::Server, vpngate::OvpnConfig)>,
+    tried: &mut HashSet<String>,
+    failed_out: &mut Vec<(String, String)>,
+    refresh_dns_ip: bool,
+    progress: ProgressFn,
+) -> Option<(TunnelStack, VpnGateServerInfo)> {
+    if batch.is_empty() {
+        return None;
+    }
+    let started = Instant::now();
+    let total = batch.len();
+    let names: Vec<&str> = batch.iter().map(|(s, _)| s.host_name.as_str()).collect();
+    netlog(&format!("Racing {total} VPN Gate servers: {}", names.join(", ")));
+    if total == 1 {
+        progress(&format!("Connecting to VPN · {}", names[0]), None);
+    } else {
+        progress(&format!("Connecting to VPN · trying {total} servers…"), None);
+    }
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel::<RaceOutcome>();
+    let mut spawned = 0usize;
+    for (idx, (server, cfg)) in batch.into_iter().enumerate() {
+        let cancel = cancel.clone();
+        let tx = tx.clone();
+        let delay = VPNGATE_RACE_STAGGER * (idx as u32);
+        let builder = std::thread::Builder::new().name(format!("vpngate-race-{idx}"));
+        if builder
+            .spawn(move || {
+                // Stagger start in 50ms slices so early cancellation prevents opening extra sockets.
+                let start_at = Instant::now() + delay;
+                while Instant::now() < start_at {
+                    if cancel.load(Ordering::Acquire) {
+                        let _ = tx.send(RaceOutcome::Cancelled);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50).min(start_at.saturating_duration_since(Instant::now())));
+                }
+                if cancel.load(Ordering::Acquire) {
+                    let _ = tx.send(RaceOutcome::Cancelled);
+                    return;
+                }
+                match connect_vpngate_candidate(&server, &cfg, &cancel, refresh_dns_ip) {
+                    Ok((stack, info)) => {
+                        if !cancel.swap(true, Ordering::AcqRel) {
+                            let _ = tx.send(RaceOutcome::Connected(stack, info));
+                        } else {
+                            let _ = tx.send(RaceOutcome::Cancelled);
+                        }
+                    }
+                    Err(e) => {
+                        if cancel.load(Ordering::Acquire) || e.contains("cancelled") {
+                            let _ = tx.send(RaceOutcome::Cancelled);
+                        } else {
+                            let _ = tx.send(RaceOutcome::Failed(server.host_name, server.ip, e));
+                        }
+                    }
+                }
+            })
+            .is_ok()
+        {
+            spawned += 1;
+        }
+    }
+    drop(tx);
+
+    for _ in 0..spawned {
+        match rx.recv() {
+            Ok(RaceOutcome::Connected(stack, info)) => {
+                cancel.store(true, Ordering::Release);
+                tried.insert(info.host_name.clone());
+                netlog(&format!(
+                    "VPN Gate connected via {} ({}) in {} ms",
+                    info.host_name,
+                    info.ip,
+                    started.elapsed().as_millis()
+                ));
+                progress(&format!("Connected to VPN · {}", info.host_name), None);
+                return Some((stack, info));
+            }
+            Ok(RaceOutcome::Failed(host, ip, err)) => {
+                netlog(&format!("VPN Gate {host} ({ip}) failed: {err}"));
+                tried.insert(host.clone());
+                failed_out.push((host, ip));
+            }
+            Ok(RaceOutcome::Cancelled) => {}
+            Err(_) => break,
         }
     }
     None
-}
-
-/// 터널을 열고 DMM 주소를 터널 안에서(일본 쪽 DNS 로) 찾아 둠.
-/// 한국 등에서 받은 CDN 주소는 VPN Gate 쪽에서 연결되지 않을 수 있음. 못 찾으면 시스템 DNS 그대로 씀
-fn connect_tunnel(
-    cfg: &vpngate::OvpnConfig,
-    tls_name: &str,
-    progress: ProgressFn,
-) -> Result<TunnelStack, String> {
-    let tun = Tunnel::connect(cfg, tls_name, &mut |_| {})?;
-    stack_with_japan_dns(tun, progress)
 }
 
 /// 터널 위에 TCP/IP 스택을 올리고 DMM 주소를 터널 안에서 찾아 둠
@@ -921,6 +1392,8 @@ fn open_vpn_file(store: &Store, progress: ProgressFn) -> Result<TunnelStack, Str
             tls_name: &remote.host,
             strict_verify: true,
             credentials: creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
+            timeout: Some(Duration::from_secs(25)),
+            cancel: None,
         };
         match Tunnel::connect_with(&cfg, &opts, &mut |_| {}) {
             Ok(tun) => return stack_with_japan_dns(tun, progress),
@@ -936,88 +1409,242 @@ fn open_vpn_file(store: &Store, progress: ProgressFn) -> Result<TunnelStack, Str
     Err(last)
 }
 
-/// 프로그램에 내장된 쓰쿠바대 서버로 시도 (서버 목록을 받을 수 없는 네트워크용).
-/// 마지막으로 확인한 IP 로 먼저 시도하고, 안 되면 DNS 로 찾은 IP 로 한 번 더
-fn try_builtin(tried: &mut HashSet<String>, progress: ProgressFn) -> Option<(TunnelStack, String)> {
-    let mut count = 0;
-    for (server, mut cfg) in vpngate::builtin_official_servers() {
-        if count >= VPNGATE_OFFICIAL_TRIES {
-            break;
-        }
-        if !tried.insert(server.host_name.clone()) {
-            continue;
-        }
-        count += 1;
-        progress(&format!("Connecting to VPN · {}", server.host_name), None);
-        let connect = |cfg: &vpngate::OvpnConfig| connect_tunnel(cfg, &server.tls_name(), progress);
-        let mut result = connect(&cfg);
-        if result.is_err() {
-            let known = vpngate::remote_ip(&cfg).to_string();
-            vpngate::refresh_builtin_ip(&server, &mut cfg);
-            if vpngate::remote_ip(&cfg) != known {
-                result = connect(&cfg);
+/// Select a diverse batch of VPN Gate candidates:
+/// - Places a fresh, healthy `last_good` server in slot 0.
+/// - Deprioritizes recently failed hosts and DMM-rejected hosts/subnets without discarding them completely.
+/// - Enforces `/24` subnet diversity (and at most one Tsukuba official relay per batch) so a single
+///   congested or DMM-blocked IP block never consumes all slots.
+fn select_vpngate_batch(
+    candidates: &[(vpngate::Server, vpngate::OvpnConfig)],
+    tried: &HashSet<String>,
+    session_rejected_subnets: &HashSet<String>,
+    state: &VpnGateState,
+    now: u64,
+    batch_size: usize,
+) -> Vec<(vpngate::Server, vpngate::OvpnConfig)> {
+    let mut batch: Vec<(vpngate::Server, vpngate::OvpnConfig)> = Vec::with_capacity(batch_size);
+    let mut picked_hosts: HashSet<String> = HashSet::new();
+    let mut batch_subnets: HashSet<String> = HashSet::new();
+    let mut official_count: usize = 0;
+
+    // Slot 0: reuse the last DMM-verified server if fresh and not in cooldown.
+    if let Some(good) = &state.last_good {
+        let fresh = good.verified_at <= now && now - good.verified_at < LAST_GOOD_TTL_SECS;
+        let subnet = vpngate::subnet24_of(&good.ip);
+        let subnet_blocked = subnet.as_deref().is_some_and(|s| {
+            session_rejected_subnets.contains(s) || state.is_rejected_subnet(s, now)
+        });
+        if fresh
+            && !tried.contains(&good.host_name)
+            && !state.is_failed(&good.host_name, now)
+            && !state.is_failed_ip(&good.ip, now)
+            && !state.is_rejected_host(&good.host_name, now)
+            && !subnet_blocked
+        {
+            let entry = candidates
+                .iter()
+                .find(|(s, _)| s.host_name == good.host_name)
+                .cloned()
+                .or_else(|| {
+                    vpngate::parse_config(&good.config_text).ok().map(|cfg| {
+                        let server = vpngate::Server {
+                            host_name: good.host_name.clone(),
+                            ip: good.ip.clone(),
+                            score: 0,
+                            ping_ms: None,
+                            speed_bps: 0,
+                            sessions: 0,
+                            uptime_ms: 0,
+                            country: "JP".into(),
+                            config_text: good.config_text.clone(),
+                        };
+                        (server, cfg)
+                    })
+                });
+            if let Some((server, cfg)) = entry {
+                picked_hosts.insert(server.host_name.clone());
+                if let Some(s) = server.subnet24() {
+                    batch_subnets.insert(s);
+                }
+                if server.is_official() {
+                    official_count += 1;
+                }
+                batch.push((server, cfg));
             }
         }
-        match result {
-            Ok(stack) => return Some((stack, server.host_name)),
-            Err(e) => progress(&format!("{} connection failed: {e}", server.host_name), None),
+    }
+
+    if batch.len() >= batch_size {
+        return batch;
+    }
+
+    // Partition remaining untried candidates into preference tiers.
+    let mut tier0 = Vec::new(); // Healthy & non-rejected subnet
+    let mut tier1 = Vec::new(); // Recently failed OR rejected subnet (different host)
+    let mut tier2 = Vec::new(); // Directly rejected host (absolute last resort)
+    for (s, c) in candidates {
+        if tried.contains(&s.host_name) || picked_hosts.contains(&s.host_name) {
+            continue;
+        }
+        let subnet_rejected = s.subnet24().as_deref().is_some_and(|sub| {
+            session_rejected_subnets.contains(sub) || state.is_rejected_subnet(sub, now)
+        });
+        if state.is_rejected_host(&s.host_name, now) {
+            tier2.push((s, c));
+        } else if state.is_failed(&s.host_name, now)
+            || state.is_failed_ip(&s.ip, now)
+            || subnet_rejected
+        {
+            tier1.push((s, c));
+        } else {
+            tier0.push((s, c));
         }
     }
-    None
+
+    // Pass 1: enforce distinct /24 subnets and at most 1 Tsukuba official relay per batch.
+    for tier in [&tier0, &tier1, &tier2] {
+        for &(s, c) in tier {
+            if batch.len() >= batch_size {
+                break;
+            }
+            if picked_hosts.contains(&s.host_name) {
+                continue;
+            }
+            if s.is_official() && official_count >= 1 {
+                continue;
+            }
+            let sub = s.subnet24();
+            if sub.as_deref().is_some_and(|sub| batch_subnets.contains(sub)) {
+                continue;
+            }
+            picked_hosts.insert(s.host_name.clone());
+            if let Some(sub) = sub {
+                batch_subnets.insert(sub);
+            }
+            if s.is_official() {
+                official_count += 1;
+            }
+            batch.push((s.clone(), c.clone()));
+        }
+    }
+
+    // Pass 2: if fewer than `batch_size` distinct subnets exist, fill remaining slots.
+    for tier in [&tier0, &tier1, &tier2] {
+        for &(s, c) in tier {
+            if batch.len() >= batch_size {
+                break;
+            }
+            if picked_hosts.insert(s.host_name.clone()) {
+                batch.push((s.clone(), c.clone()));
+            }
+        }
+    }
+
+    batch
 }
 
-/// 목록에서 아직 시도하지 않은 일본 서버 (쓰쿠바대 서버 먼저, 그다음 점수 순)
-fn untried(
-    body: &str,
-    tried: &HashSet<String>,
-    official_only: bool,
-    take: usize,
-) -> Vec<(vpngate::Server, vpngate::OvpnConfig)> {
-    vpngate::japan_tcp_candidates(body)
+/// Race built-in University of Tsukuba servers (fallback when the server list is unreachable).
+fn try_builtin(
+    tried: &mut HashSet<String>,
+    failed_out: &mut Vec<(String, String)>,
+    progress: ProgressFn,
+) -> Option<(TunnelStack, VpnGateServerInfo)> {
+    let batch: Vec<(vpngate::Server, vpngate::OvpnConfig)> = vpngate::builtin_official_servers()
         .into_iter()
-        .filter(|(s, _)| (!official_only || s.is_official()) && !tried.contains(&s.host_name))
-        .take(take)
-        .collect()
+        .filter(|(s, _)| !tried.contains(&s.host_name))
+        .take(VPNGATE_RACE_BATCH)
+        .collect();
+    race_servers(batch, tried, failed_out, true, progress)
 }
 
-/// VPN Gate 일본 서버에 터널을 염. `tried` 에 든 서버(이미 실패했거나 DMM 이 거부한 서버)는 건너뜀.
-/// 1. 저장된 목록의 쓰쿠바대 서버  2. 목록을 갱신해 나머지 서버
-/// 3. 목록을 받지 못하면 저장된 목록(오래됐어도)의 나머지 서버  4. 프로그램에 내장된 쓰쿠바대 서버
+/// Open a healthy VPN Gate tunnel to Japan, racing diverse batches of candidates.
+/// 1. If a fresh (<1h) cached list is available, race a diverse batch (with `last_good` first).
+/// 2. Otherwise (or if batch 1 fails), refresh the server list (joining any in-flight startup
+///    refresh) and race up to 2 diverse batches across distinct `/24` subnets.
+/// 3. If the list is unreachable, fall back to a stale cache (if any) and built-in Tsukuba servers.
 fn open_vpngate(
     store: &Store,
     progress: ProgressFn,
     tried: &mut HashSet<String>,
-) -> Result<(TunnelStack, String), String> {
-    let cached = store.cached_vpngate_list();
-    if let Some(body) = &cached {
-        let official = untried(body, tried, true, VPNGATE_OFFICIAL_TRIES);
-        if let Some(found) = try_servers(&official, tried, progress) {
-            return Ok(found);
+    rejected_subnets: &HashSet<String>,
+) -> Result<(TunnelStack, VpnGateServerInfo), String> {
+    let state = store.vpngate_state();
+    let now = github::now_secs();
+    let mut failed_hosts = Vec::new();
+
+    let cached = store.cached_vpngate_list_with_age();
+    let mut used_fresh_cache = false;
+    if let Some((body, age)) = &cached {
+        if *age < VPNGATE_CACHE_STALE {
+            let candidates = vpngate::japan_candidates(body);
+            let batch = select_vpngate_batch(
+                &candidates,
+                tried,
+                rejected_subnets,
+                &state,
+                now,
+                VPNGATE_RACE_BATCH,
+            );
+            if let Some(found) = race_servers(batch, tried, &mut failed_hosts, false, progress) {
+                store.record_vpngate_failures(&failed_hosts);
+                return Ok(found);
+            }
+            used_fresh_cache = true;
         }
     }
-    progress("Refreshing the server list", None);
+
+    progress("Refreshing the VPN Gate server list…", None);
     let list_ok = match store.refresh_vpngate_list(VPNGATE_RECENT) {
         Ok(body) => {
-            let all = untried(&body, tried, false, VPNGATE_MORE_TRIES);
-            if let Some(found) = try_servers(&all, tried, progress) {
-                return Ok(found);
+            let candidates = vpngate::japan_candidates(&body);
+            let rounds = if used_fresh_cache { 1 } else { 2 };
+            for _ in 0..rounds {
+                let batch = select_vpngate_batch(
+                    &candidates,
+                    tried,
+                    rejected_subnets,
+                    &state,
+                    now,
+                    VPNGATE_RACE_BATCH,
+                );
+                if batch.is_empty() {
+                    break;
+                }
+                if let Some(found) = race_servers(batch, tried, &mut failed_hosts, false, progress) {
+                    store.record_vpngate_failures(&failed_hosts);
+                    return Ok(found);
+                }
             }
             true
         }
         Err(e) => {
             progress(&e, None);
-            if let Some(body) = &cached {
-                let rest = untried(body, tried, false, VPNGATE_MORE_TRIES);
-                if let Some(found) = try_servers(&rest, tried, progress) {
+            if let Some((body, _)) = &cached {
+                let candidates = vpngate::japan_candidates(body);
+                let batch = select_vpngate_batch(
+                    &candidates,
+                    tried,
+                    rejected_subnets,
+                    &state,
+                    now,
+                    VPNGATE_RACE_BATCH,
+                );
+                if let Some(found) = race_servers(batch, tried, &mut failed_hosts, false, progress) {
+                    store.record_vpngate_failures(&failed_hosts);
                     return Ok(found);
                 }
             }
             false
         }
     };
-    if let Some(found) = try_builtin(tried, progress) {
+
+    if let Some(found) = try_builtin(tried, &mut failed_hosts, progress) {
+        store.record_vpngate_failures(&failed_hosts);
         return Ok(found);
     }
+    // Nothing connected, so the user's own network may be at fault: keep these failures
+    // in `tried` for this session only instead of cooling the servers down persistently.
+
     Err(if list_ok {
         "Failed to connect to a VPN Gate server. Please try again in a moment.".to_string()
     } else {
@@ -1286,13 +1913,17 @@ pub fn start_game_with_profile_setup(
             Ok(r) => r,
             Err(e) if can_retry => {
                 progress(&format!("{e} · trying another server"), None);
-                link.rotate_failed_server()?;
+                link.rotate_failed_server(TunnelFault::of_post_error(&e))?;
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                link.mark_failed(store, TunnelFault::of_post_error(&e));
+                return Err(e);
+            }
         };
         match r["result_code"].as_i64().unwrap_or(-1) {
             100 => {
+                link.record_success(store);
                 if tried_profile_setup {
                     netlog("[profile] DMM accepted launch after windowless setup");
                 }
@@ -1306,9 +1937,12 @@ pub fn start_game_with_profile_setup(
             }
             801 | 803 if can_retry => {
                 progress("DMM rejected the VPN server; trying another server", None);
-                link.rotate_failed_server()?;
+                link.rotate_failed_server(TunnelFault::RejectedByDmm)?;
             }
-            801 | 803 => return Err(region_error(&settings.mode)),
+            801 | 803 => {
+                link.mark_failed(store, TunnelFault::RejectedByDmm);
+                return Err(region_error(&settings.mode));
+            }
             308 => {
                 confirm_terms_once(&mut tried_terms_confirmation, || {
                     progress("Game terms not accepted; confirming...", None);
@@ -2099,5 +2733,154 @@ mod tests {
             server.join().unwrap();
             assert!(matches!(result, Err(message) if message.contains("manifest page 2")));
         }
+    }
+
+    fn candidate(host: &str, ip: &str, score: u64) -> (vpngate::Server, vpngate::OvpnConfig) {
+        let config_text = format!(
+            "client\ndev tun\nproto tcp\nremote {ip} 443\ncipher AES-128-CBC\nauth SHA1\n<ca>\n-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n</ca>\n"
+        );
+        let cfg = vpngate::parse_config(&config_text).unwrap();
+        let server = vpngate::Server {
+            host_name: host.into(),
+            ip: ip.into(),
+            score,
+            ping_ms: Some(20),
+            speed_bps: 200_000_000,
+            sessions: 20,
+            uptime_ms: 7_200_000,
+            country: "JP".into(),
+            config_text,
+        };
+        (server, cfg)
+    }
+
+    #[test]
+    fn vpngate_batch_diversifies_subnets_and_limits_official_relays() {
+        let candidates = vec![
+            candidate("public-vpn-1", "219.100.37.1", 9_000_000),
+            candidate("public-vpn-2", "219.100.37.2", 8_000_000),
+            candidate("public-vpn-3", "219.100.37.3", 7_000_000),
+            candidate("vol-a1", "133.242.10.1", 6_000_000),
+            candidate("vol-a2", "133.242.10.2", 5_900_000),
+            candidate("vol-b", "153.120.5.9", 5_000_000),
+            candidate("vol-c", "160.16.80.12", 4_000_000),
+        ];
+        let batch = select_vpngate_batch(
+            &candidates,
+            &HashSet::new(),
+            &HashSet::new(),
+            &VpnGateState::default(),
+            10_000,
+            4,
+        );
+        let names: Vec<&str> = batch.iter().map(|(s, _)| s.host_name.as_str()).collect();
+        assert_eq!(names, vec!["public-vpn-1", "vol-a1", "vol-b", "vol-c"]);
+        let subnets: HashSet<String> = batch.iter().filter_map(|(s, _)| s.subnet24()).collect();
+        assert_eq!(subnets.len(), 4);
+    }
+
+    #[test]
+    fn vpngate_batch_prioritizes_last_good_and_skips_rejected_subnets() {
+        let candidates = vec![
+            candidate("public-vpn-1", "219.100.37.1", 9_000_000),
+            candidate("public-vpn-2", "219.100.37.2", 8_000_000),
+            candidate("vol-a", "133.242.10.1", 6_000_000),
+            candidate("vol-b", "153.120.5.9", 5_000_000),
+            candidate("vol-good", "160.16.80.12", 3_000_000),
+        ];
+        let now = 100_000;
+        let mut state = VpnGateState::default();
+        state.last_good = Some(GoodServer {
+            host_name: "vol-good".into(),
+            ip: "160.16.80.12".into(),
+            config_text: candidates[4].0.config_text.clone(),
+            verified_at: now - 60,
+        });
+        state.rejected_subnets.insert("219.100.37".into(), now - 30);
+
+        let batch = select_vpngate_batch(
+            &candidates,
+            &HashSet::new(),
+            &HashSet::new(),
+            &state,
+            now,
+            3,
+        );
+        let names: Vec<&str> = batch.iter().map(|(s, _)| s.host_name.as_str()).collect();
+        assert_eq!(names, vec!["vol-good", "vol-a", "vol-b"]);
+    }
+
+    #[test]
+    fn vpngate_state_persists_and_prunes_expired_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        let (srv, _) = candidate("vol-ok", "153.120.5.9", 5_000_000);
+        let info = VpnGateServerInfo {
+            host_name: srv.host_name.clone(),
+            ip: srv.ip.clone(),
+            config_text: srv.config_text.clone(),
+        };
+
+        store.record_vpngate_success(&info);
+        let st = store.vpngate_state();
+        assert_eq!(st.last_good.as_ref().map(|g| g.host_name.as_str()), Some("vol-ok"));
+
+        // Rejecting the server clears last_good and records both host and /24 subnet.
+        store.record_vpngate_rejected("vol-ok", "153.120.5.9");
+        let st = store.vpngate_state();
+        assert!(st.last_good.is_none());
+        assert!(st.rejected_hosts.contains_key("vol-ok"));
+        assert!(st.rejected_subnets.contains_key("153.120.5"));
+
+        // Pruning drops expired entries.
+        let mut pruned = st.clone();
+        pruned.prune(github::now_secs() + REJECTED_HOST_TTL_SECS + 10);
+        assert!(pruned.rejected_hosts.is_empty());
+        assert!(pruned.rejected_subnets.is_empty());
+    }
+
+    #[test]
+    fn dmm_side_launch_errors_are_not_blamed_on_the_vpn_exit() {
+        for e in ["DMM server error (HTTP 503)", "Failed to parse the DMM response: EOF"] {
+            assert_eq!(TunnelFault::of_post_error(e), TunnelFault::Unattributed, "{e}");
+        }
+        for e in ["response timed out", "TLS: handshake failure", "TCP connect timed out"] {
+            assert_eq!(TunnelFault::of_post_error(e), TunnelFault::Transport, "{e}");
+        }
+    }
+
+    #[test]
+    fn failed_ip_cooldown_deprioritizes_sibling_hosts_on_same_ip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        let candidates = vec![
+            candidate("split-a", "123.48.124.169", 9_000_000),
+            candidate("split-b", "123.48.124.169", 8_900_000),
+            candidate("vol-clean-1", "115.38.22.45", 5_000_000),
+            candidate("vol-clean-2", "126.206.11.243", 4_900_000),
+        ];
+
+        store.record_vpngate_failures(&[("split-a".into(), "123.48.124.169".into())]);
+        let st = store.vpngate_state();
+        assert!(st.failed_hosts.contains_key("split-a"));
+        assert!(st.failed_ips.contains_key("123.48.124.169"));
+
+        let now = github::now_secs();
+        let batch = select_vpngate_batch(
+            &candidates,
+            &HashSet::new(),
+            &HashSet::new(),
+            &st,
+            now,
+            2,
+        );
+        let names: Vec<&str> = batch.iter().map(|(s, _)| s.host_name.as_str()).collect();
+        // Both split-a and its same-IP sibling split-b are cooled down behind clean volunteers.
+        assert_eq!(names, vec!["vol-clean-1", "vol-clean-2"]);
+
+        let mut pruned = st.clone();
+        pruned.prune(now + FAILED_HOST_TTL_SECS + 10);
+        assert!(pruned.failed_hosts.is_empty());
+        assert!(pruned.failed_ips.is_empty());
     }
 }
