@@ -1,89 +1,138 @@
 # Gakuen Idolmaster Launcher
 
-A Windows and Linux launcher that runs Gakuen Idolmaster (DMM version) without DMM GAME PLAYER or a VPN. The built-in VPN engines are user space, so no OS-level VPN or network configuration is needed.
+A Windows and Linux launcher that runs Gakuen Idolmaster (DMM version) without requring DMM GAME PLAYER or an external VPN. The built-in VPN engines (OpenVPN and WireGuard) run entirely in user space, so no virtual network adapter or OS-level network configuration is needed.
 
-Download `GakumasLauncher.exe` from [Releases](../../releases) and run it. DMM GAME PLAYER does not need to be installed: the launcher handles login, the launch token, and the game file downloads directly. Point **Game folder → Change** at an existing installation, or at an **empty folder** — the launcher will download the game files from scratch on first start.
+Download `GakumasLauncher.exe` (Windows) or `GakumasLauncher-linux` (Linux; mark executable with `chmod +x`) from [Releases](../../releases) and run it. DMM GAME PLAYER does not need to be installed: the launcher handles login, the launch token, and game file downloads directly. Point **Settings → Game Folder → Change** at an existing installation, or at an **empty folder** to download the game files from scratch on first start.
 
 ## This fork's features
 
 - English localization of the launcher
-- Proton configuration features, including the anti-debug driver fix
-- Localify installer
+- Linux support, including DW-Proton installation, prefix dependency setup, bundled known-good DXVK for Vuplex-WebView support and the CrackProof kernel driver fix
+- Built-in **English Localization (Localify)** installer and updater, with automatic English translation configuration on non-Chinese systems
+- Launcher and Localify self-updater
+- Built-in **DMM Browser**, in-app **Register** flow, automatic first-launch DMM account setup, and fresh game downloads into an empty folder without ever installing DMM GAME PLAYER
+- Custom game executable override
 
 ## Japan connection methods
 
-| Method | Description |
-|---|---|
-| VPN Gate | Default. Connects to the University of Tsukuba's VPN Gate public server only from within the launcher. No additional setup required. |
-| VPN file | Connects from within the launcher using a configuration file from your VPN service. Supports OpenVPN (`.ovpn`) and WireGuard (`.conf`). |
-| Direct connection | Uses this PC's internet connection as-is, without a VPN. If you are outside Japan, connect to Japan with a VPN app first. |
+Select a connection method in the **Japan Connection** panel:
 
-VPN Gate and VPN file do not change Windows network settings; only the launcher's traffic goes through the VPN.
+| Method                | Description                                                                                                                                                                                                                                                                                                                                          |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **VPN Gate**          | Default. Connects from within the launcher to Japanese VPN Gate public servers — preferring University of Tsukuba's official servers, falling back to other Japanese TCP servers from the list (or a built-in Tsukuba server profile if the list is unreachable), and rotating servers automatically if DMM rejects or drops one. No setup required. |
+| **VPN File**          | Connects from within the launcher using a manual configuration file from your VPN service. Supports OpenVPN (`.ovpn`) and WireGuard (`.conf`).                                                                                                                                                                                                       |
+| **Direct Connection** | Uses your PC's internet connection as-is, without a launcher VPN. If you are outside Japan, connect to Japan with a VPN app first.                                                                                                                                                                                                                   |
 
-**Login** and **Register** use your system connection, even when a launcher VPN is selected. **Browser** routes HTTPS through the selected launcher VPN in a separate private session, or uses your system connection in Direct mode. Close the browser before changing VPN settings. If a VPN Gate connection drops, reload the page after the launcher reconnects.
+**VPN Gate** and **VPN File** do not modify Windows or Linux network settings: only the launcher's region-checked DMM API requests and in-app **Browser** traffic go through the VPN. Game file downloads always use your normal internet connection.
 
 ### How to use a VPN file
 
-1. Download the manual configuration file (OpenVPN or WireGuard) for a **Japanese server** from your VPN service's account page.
-2. In the launcher, choose **VPN File** → **Choose File** and select the file you downloaded.
-3. If the OpenVPN file requires a username and password, enter them in **Account**. This is often a manual-setup (OpenVPN) account rather than your service login password.
+1. Download the manual configuration file (OpenVPN `.ovpn` or WireGuard `.conf`) for a **Japanese server** from your VPN service's account page.
+2. In the **Japan Connection** panel, select **VPN File** → **Choose File** and pick the file you downloaded. External OpenVPN certificate, key, or credential files referenced in the same folder are imported automatically.
+3. If the OpenVPN file requires a username and password, enter them in **Account**. This is often a manual-setup (OpenVPN) credential rather than your VPN service's website login.
 
-The configuration file and account are stored encrypted so that they can only be decrypted by this PC's Windows account.
+The configuration file and credentials are stored encrypted on your machine.
 
-## Custom game executable
+## Localization (Localify)
 
-If the game executable has been patched (for example, a Proton-tuned build with protection checks disabled), use **Settings → Executable override → Choose** to select it. The chosen path is used instead of the executable name returned by DMM. Relative paths are resolved inside the game folder; absolute paths are used as-is. **Reset** returns to the default. The game folder must still be set.
+The **Localization (Localify)** panel downloads the latest `DMM_GakumasLocalify_v*.zip` from [gakuen-imas-localify](https://github.com/chinosk6/gakuen-imas-localify) and installs it next to `gakumas.exe`:
+
+- **First install** (no `gakumas-local/` folder yet): Extracts `version.dll` and `gakumas-local/`. Unless your system language is Chinese, it omits the bundled Chinese `local-files`, sets `replaceFont` to `false` in `localizationConfig.json`, and in `config.json` sets `useAPITextureAssets` to `false`, `useAPIAssets` to `true`, and `useAPIAssetsURL` to the [English translation data](https://github.com/NatsumeLS/Gakumas-Translation-Data-EN).
+- **Updates and reinstalls:** When `gakumas-local/` already exists, installing or updating replaces only `version.dll` and leaves your existing localization files alone. (Delete `gakumas-local/` first if you want a clean config reinstall.)
+- **Verification and version tracking:** Downloads are verified against the release's SHA-256 digest, and only the newest archive is kept in the cache. The launcher records the installed tag and the SHA-256 of `version.dll`, displays whether Localify is installed and which version, and compares releases as semver so an older tag is never offered as an update. A `version.dll` the launcher did not install (or one modified externally) counts as an unknown version, and the latest release is offered for it.
+- Installing or updating is refused while the game is running. 
+
+## Account, Browser, and Settings
+
+### DMM Account and Browser
+
+- **Login** and **Register** always use your system connection, even when a launcher VPN is selected - they don't require a Japanese IP.
+- **Login** opens an in-app WebView window. On Windows, WebView2's own password save and autofill are enabled, and DMM's "keep logged in" box is pre-checked unless you uncheck it. The launcher never reads your password.
+- **Register** opens DMM's account signup page in an in-app window. When you close it (if not already logged in), the launcher automatically reuses that browser session to sign in.
+- **Logout** clears both the saved login token and the WebView's stored DMM session and saved passwords.
+- **Automatic first-launch account setup:** When launching with a new DMM account, the launcher automatically confirms game terms, adds Gakumas to **My Games**, and attempts background DMM GAMES profile setup using the current run's login session. If DMM still reports that profile registration is required, open **Browser** to finish setting up your account and try again.
+- **Browser** opens DMM with a built-in navigation bar (Back, Forward, and URL bar) and routes HTTPS through the selected launcher VPN in a separate private (incognito) session, or uses your system connection in **Direct Connection** mode. Close the browser before changing VPN settings or logging out. If a VPN connection drops, reload the page after the launcher reconnects.
+
+### Settings and game updates
+
+- **Start automatically on launch:** Starts the game immediately when the launcher opens (once a game folder is configured).
+- **Exit launcher after starting the game:** Closes the launcher automatically once the game launches.
+- **Game Folder:** Auto-detected from DMM GAME PLAYER if an existing installation is found (on Windows, or inside a configured Proton prefix on Linux). Use **Change** to pick an existing installation or an empty folder. On launch, the launcher checks DMM's update manifest over your normal connection, downloads only missing or changed files (verified by size and MD5), and deletes obsolete files. Updates containing DMM-protected files cannot be downloaded by the launcher and require DMM GAME PLAYER.
+- **Executable override:** If you want to run a different or patched executable instead of the one returned by DMM, use **Settings → Executable override → Choose**. Relative paths are resolved inside the game folder; absolute paths are used as-is. **Reset** returns to the default. The game folder must still be set.
+- **Log:** Click the log button in the bottom-left corner to view or copy timestamped session logs. Attempting to close the launcher while an operation is running prompts for confirmation.
+
+## Updates
+
+### Launcher self-update
+
+The **Launcher update** panel shows the running version and the newest stable release from [the fork's GitHub releases](https://github.com/Portalboy07/gakumas-launcher-fork/releases) that ships a binary for your platform (`GakumasLauncher.exe` or `GakumasLauncher-linux`). Prereleases are offered only to prerelease builds.
+
+Clicking **Update launcher** downloads the platform binary, verifies its SHA-256 digest and executable header, replaces the running executable, and offers to restart (if postponed, the button switches to **Restart to update**). Every build, including forks' builds, updates from this repository's releases. Local builds show `Cargo.toml`'s version, can check for updates, and do not replace themselves.
+
+### Automatic and manual update checks
+
+- On launch, the launcher and Localify are checked together at most once every 24 hours. Localify is looked up during the daily check only while it is installed.
+- If a lookup fails, the other component's result is still saved and the daily check runs again on the next launch.
+- Each panel's **Check for updates** button checks only that panel's component immediately without resetting the 24-hour daily timer.
+- When a check finds an update that can be installed, a popup lists it and asks whether to install now (**Later** skips it until the next check). The popup waits until no other task or popup is open, installs Localify before the launcher, and offers to restart after a launcher update.
 
 ## Linux / Proton
 
-The Linux build runs the Windows game through a user-selected Proton version.
+The Linux build runs the Windows game through [DW-Proton](https://github.com/dawn-winery/dwproton-mirror), which is required for the CrackProof anti-debug driver fix.
 
-1. In the **Proton (Linux)** panel, click **Install DW-Proton** to download and extract the latest DW-Proton release into Steam's `compatibilitytools.d`, or select an already installed Proton from the list. DW-Proton is required for the original executable (it handles the CrackProof anti-debug driver); a pre-unpacked executable works with other Proton builds too.
-2. Click **Create prefix & install dependencies**. This creates the prefix with `wineboot` and installs `corefonts`, `powershell`, `webview2` and `vcrun2022`. It uses the `winetricks` from your `PATH` and the Proton you selected (no Heroic or protontricks needed); WebView2 is installed from Microsoft's bootstrapper if your winetricks lacks that verb.
-3. Use **Game folder → Change** to point at the folder containing `gakumas.exe` (auto-detection from DMM GAME PLAYER only works on Windows). Use **Executable override** to choose a different executable.
-4. Log in and start the game as usual.
+### Requirements
 
-The **Localization (Localify)** panel downloads the latest `DMM_GakumasLocalify_v*.zip` from [gakuen-imas-localify](https://github.com/chinosk6/gakuen-imas-localify) and installs it next to `gakumas.exe`. On a first install (no `gakumas-local` folder yet) it extracts `version.dll` and `gakumas-local/`. Unless the system language is Chinese, it leaves out the bundled Chinese `local-files`, sets `replaceFont` to `false` in `localizationConfig.json`, and in `config.json` sets `useAPITextureAssets` to `false`, `useAPIAssets` to `true`, and `useAPIAssetsURL` to the [English translation data](https://github.com/NatsumeLS/Gakumas-Translation-Data-EN). An update replaces only `version.dll` and leaves existing localization files alone. The download is checked against the release's SHA-256 digest, and only the newest archive is kept in the cache. The launcher records the installed tag and the SHA-256 of `version.dll`, shows whether Localify is installed and which version, and looks for a newer release as part of the shared update check described below. Releases are compared as semver, so an older tag is never offered as an update. A `version.dll` the launcher did not install counts as unknown, and the latest release is offered for it. Installing or updating is refused while the game is running.
+- `winetricks` installed and available in `PATH` (for prefix dependency setup)
+- `tar` with `xz` support (for extracting DW-Proton)
+- Host GStreamer H.264 plugins (such as `gst-plugins-ugly` / `gst-libav`, depending on your distribution) for in-game video playback
 
-Before launching, the launcher downloads and verifies the anti-debug driver (`usrdrv017764.sys`), installs it into the prefix, and registers/starts its service in the **same Wine session** as the game via a generated CMD script. Wine's `NtLoadDriver` is a stub, so doing this beforehand is what lets the original executable run. `WINE_SERVICES_SESSION0=1` and `version.dll=n,b` (native then builtin, for localization mods) are set automatically.
+### Setup
 
-The launcher bundles the DXVK D3D11/DXGI build from
-[GE-Proton10-31](https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/GE-Proton10-31)
-rather than an upstream release: that exact build is needed for the in-game
-Vuplex webview. See [assets/dxvk/SOURCE.md](assets/dxvk/SOURCE.md) for hashes
-and provenance.
+1. Make the binary executable (`chmod +x GakumasLauncher-linux`) and launch it.
+2. In the **Proton (Linux)** panel, click **Install DW-Proton** to download and extract the latest DW-Proton release into Steam's `compatibilitytools.d` (if a DW-Proton version is already installed there, the button selects the newest installed one without downloading again), or pick an already installed tool from the dropdown (listed newest name first). To use a custom Proton directory (or its `proton` script) or a custom Wine prefix path, enter the path and click **Apply**. Both the Proton version and prefix path are remembered in settings.
+3. Click **Create prefix & install dependencies**. This creates the 64-bit prefix with `wineboot`, installs `corefonts`, `powershell`, `vcrun2022`, and `webview2` using `winetricks` from your `PATH` and the selected Proton (no Heroic or protontricks needed; WebView2 falls back to Microsoft's bootstrapper if your `winetricks` lacks that verb), sets up fallback fonts (`msyh.ttc`, `segoeui.ttf`) for the Localify menu, and installs the bundled DXVK DLLs if a game folder is already selected.
+4. Use **Settings → Game Folder → Change** to point at an existing game folder or an empty folder to download the game from scratch. Use **Executable override** if you need a different executable.
+5. Log in and start the game as usual.
 
-The **Launcher update** panel shows the running version and the newest stable release from
-[the fork's GitHub releases](https://github.com/Portalboy07/gakumas-launcher-fork/releases) that has a
-binary for this platform (prereleases are offered only to prerelease builds). **Update launcher**
-downloads `GakumasLauncher.exe` or `GakumasLauncher-linux`, checks it against the release's SHA-256
-digest, replaces the executable, and then offers to restart. Every build, including forks' builds,
-updates from this repository's releases. The release workflow passes the tag's version to the compiler
-(`LAUNCHER_VERSION`), so `Cargo.toml` and `Cargo.lock` are not modified and the build stays
-`--locked`. Local builds show
-`Cargo.toml`'s version, can check for updates, and do not replace themselves.
+### Driver fix, DXVK, and persistent game data
 
-On launch the launcher and Localify are checked together, at most once every 24 hours. Localify is
-looked up only while it is installed. If a lookup fails, the other result is still saved and the
-check runs again on the next launch. Each panel's **Check for updates** button looks up only that
-panel's component, right away, and does not reset the daily check. When a check finds an update that
-can be installed, a popup lists it and asks whether to install it now. **Later** skips it until the next check. The popup waits until no other task or popup
-is open, installs Localify before the launcher, and offers to restart after a launcher update.
+- **Anti-debug driver and launch environment:** Before launching, the launcher downloads and SHA-256-verifies `usrdrv017764.sys`, installs it into the prefix, and registers and starts its service in the **same Wine session** as the game via a generated CMD script. Because Wine's `NtLoadDriver` is a stub, preloading the service this way lets the original executable start. `WINE_SERVICES_SESSION0=1`, `WINEDLLOVERRIDES=version.dll=n,b;winmm=b;d3d11=n;dxgi=n`, and host `GST_PLUGIN_PATH_1_0` plugin directories are configured automatically. This approach is based on [0nikod/gakumas-proton](https://github.com/0nikod/gakumas-proton).
+- **Bundled DXVK:** The launcher bundles the DXVK D3D11/DXGI build from [GE-Proton10-31](https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/GE-Proton10-31) rather than an upstream release — that exact build is needed for the in-game Vuplex webview. On every launch (and during prefix setup if a game folder is set), the DLLs are verified and written into both the game folder and `gakumas_Data/Plugins/x86_64/VuplexWebViewChromium`. See [assets/dxvk/SOURCE.md](assets/dxvk/SOURCE.md) for hashes and provenance.
+- **Persistent game app-data:** The game stores the index of its ~7 GB asset cache in `AppData/LocalLow/BANDAI NAMCO Entertainment Inc_` inside the prefix, so a new prefix would otherwise make it re-download that cache. When the prefix is created and before every launch, the launcher moves this folder to `game-appdata/` in its own data folder and leaves a symlink in the prefix — so deleting or recreating the prefix keeps the data (deleting the launcher's data folder does not). Nothing is deleted during migration:
+  - If both places already hold data, they are merged with the newer copy of each file winning, and the prefix's old folder is kept beside the link as `BANDAI NAMCO Entertainment Inc_.prefix-backup` (`-2`, `-3`, … for later ones).
+  - If an existing symlink pointed elsewhere, that folder's contents are copied in and the old link is kept as `BANDAI NAMCO Entertainment Inc_.wrong-link`.
+  - If the move fails, the game still launches with its data inside the prefix.
 
-The Proton version and prefix are remembered in the launcher's settings.
+## Data folder
 
-The Linux driver-fix approach is based on [0nikod/gakumas-proton](https://github.com/0nikod/gakumas-proton), which documents preloading the `usrdrv017764.sys` anti-debug driver service in the same Wine session so the original executable can start.
+Settings, encrypted credentials, cached downloads, and (on Linux) the default Proton prefix and `game-appdata/` are stored in the launcher's app-local-data folder:
 
-## Build
+- **Windows:** `%LOCALAPPDATA%\local.gakumas.launcher`
+- **Linux:** `~/.local/share/local.gakumas.launcher` (or `$XDG_DATA_HOME/local.gakumas.launcher`)
 
-On Linux, Tauri needs the GTK 3 / WebKit2GTK 4.1 development packages installed first.
+## Building
 
+On Linux (Debian/Ubuntu), install the Tauri GTK 3 / WebKit2GTK 4.1 development packages first:
+
+```sh
+sudo apt-get install -y \
+  libwebkit2gtk-4.1-dev \
+  libgtk-3-dev \
+  libayatana-appindicator3-dev \
+  librsvg2-dev \
+  patchelf
 ```
+
+Then build the release binary:
+
+```sh
 cargo build --release --bin GakumasLauncher
 ```
 
-The binary is written to `target/release/GakumasLauncher`.
+The binary is written to `target/release/GakumasLauncher.exe` on Windows or `target/release/GakumasLauncher` on Linux.
+
+The GitHub release workflow passes the tag's version to the compiler through `LAUNCHER_VERSION` so `Cargo.toml` and `Cargo.lock` are not modified and CI builds stay `--locked`.
 
 ## Note
 
-DMM does not support use from outside Japan. You are responsible for any consequences of using this launcher.
+DMM does not support use from outside Japan. Automating the login requests and utilizing the English Patch is against DMM TOS. There were no confirmed bans yet, but that doesn't mean there can't be. You are responsible for any consequences of using this launcher.
