@@ -47,6 +47,8 @@ The **Localization (Localify)** panel downloads the latest `DMM_GakumasLocalify_
 
 Before launching, the launcher downloads and verifies the anti-debug driver (`usrdrv017764.sys`), installs it into the prefix, and registers/starts its service in the **same Wine session** as the game via a generated CMD script. Wine's `NtLoadDriver` is a stub, so doing this beforehand is what lets the original executable run. `WINE_SERVICES_SESSION0=1` and `version.dll=n,b` (native then builtin, for localization mods) are set automatically.
 
+The game keeps the index of its ~7 GB asset cache in `AppData/LocalLow/BANDAI NAMCO Entertainment Inc_` inside the prefix, so a new prefix would make it download that cache again. When the prefix is created and before every launch, the launcher moves this folder to `game-appdata/` in its own data folder and leaves a symlink in the prefix, so deleting or recreating the prefix keeps the data (deleting the launcher's data folder does not). Nothing is deleted along the way. If both places already hold data, they are merged and the newer copy of each file wins. The prefix's old folder is then kept next to the link as `BANDAI NAMCO Entertainment Inc_.prefix-backup` (`-2`, `-3`, ... for later ones). A symlink that pointed somewhere else has that folder's contents copied in and is kept as `BANDAI NAMCO Entertainment Inc_.wrong-link`. If the move fails, the game still launches with its data inside the prefix.
+
 The launcher bundles the DXVK D3D11/DXGI build from
 [GE-Proton10-31](https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/GE-Proton10-31)
 rather than an upstream release: that exact build is needed for the in-game

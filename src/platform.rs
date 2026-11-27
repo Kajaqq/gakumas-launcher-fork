@@ -203,25 +203,7 @@ mod unix {
 
     /// The Windows user profile inside the configured Proton prefix, if any.
     fn prefix_user_dir() -> Option<PathBuf> {
-        let prefix = crate::proton::configured_prefix()?;
-        let users = prefix.join("drive_c").join("users");
-        let mut candidates = Vec::new();
-        for key in ["USER", "LOGNAME"] {
-            if let Some(u) = std::env::var_os(key) {
-                if !u.is_empty() {
-                    candidates.push(users.join(u));
-                }
-            }
-        }
-        candidates.push(users.join("steamuser"));
-        if let Ok(rd) = fs::read_dir(&users) {
-            for entry in rd.flatten() {
-                if entry.path().is_dir() {
-                    candidates.push(entry.path());
-                }
-            }
-        }
-        candidates.into_iter().find(|p| p.is_dir())
+        crate::proton::wine_user_dir(&crate::proton::configured_prefix()?)
     }
 
     pub fn appdata_dir() -> Option<PathBuf> {
