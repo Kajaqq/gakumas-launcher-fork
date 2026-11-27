@@ -203,7 +203,8 @@ mod unix {
 
     /// The Windows user profile inside the configured Proton prefix, if any.
     fn prefix_user_dir() -> Option<PathBuf> {
-        crate::proton::wine_user_dir(&crate::proton::configured_prefix()?)
+        Some(crate::proton::wine_user_dir(&crate::proton::configured_prefix()?))
+            .filter(|dir| dir.is_dir())
     }
 
     pub fn appdata_dir() -> Option<PathBuf> {

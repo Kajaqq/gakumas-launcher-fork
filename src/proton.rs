@@ -54,24 +54,20 @@ pub fn detect_candidates() -> Vec<(String, String)> {
     };
     let home = PathBuf::from(home);
 
-    // (directory, only names starting with Proton/DW-Proton)
-    let mut roots: Vec<(PathBuf, bool)> = vec![
-        (home.join(".steam/root/compatibilitytools.d"), false),
-        (home.join(".local/share/Steam/compatibilitytools.d"), false),
-        (home.join(".steam/steam/steamapps/common"), true),
-        (home.join(".local/share/Steam/steamapps/common"), true),
+    // DW-Proton installs as a Steam compatibility tool, never under
+    // steamapps/common, where only Valve's own Proton builds live.
+    let roots = [
+        home.join(".steam/root/compatibilitytools.d"),
+        home.join(".local/share/Steam/compatibilitytools.d"),
     ];
 
     let mut found: Vec<(String, String)> = Vec::new();
-    for (dir, filtered) in roots.drain(..) {
+    for dir in roots {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if filtered && !(name.starts_with("Proton") || name.starts_with("DW-Proton")) {
-                continue;
-            }
             if let Some(candidate) = candidate(&entry.path(), &name) {
                 found.push(candidate);
             }
@@ -235,26 +231,19 @@ fn selected_proton(settings: &crate::launcher::Settings) -> Result<PathBuf, Stri
         })
 }
 
-/// Wine executables shipped inside a Proton installation.
-fn proton_scripts(proton: &Path) -> Vec<PathBuf> {
-    let mut scripts = Vec::new();
-    if proton.is_file() {
-        scripts.push(proton.to_path_buf());
-        if let Some(parent) = proton.parent() {
-            scripts.push(parent.join("files/bin/wine64"));
-            scripts.push(parent.join("files/bin/wine"));
-        }
+/// The `proton` script of an installation: the selected path itself, or the
+/// script inside the selected directory.
+fn proton_script(proton: &Path) -> Result<PathBuf, String> {
+    let script = if proton.is_file() {
+        proton.to_path_buf()
     } else {
-        scripts.push(proton.join("proton"));
-        scripts.push(proton.join("files/bin/wine64"));
-        scripts.push(proton.join("files/bin/wine"));
+        proton.join("proton")
+    };
+    if script.is_file() {
+        Ok(script)
+    } else {
+        Err(format!("Proton script not found: {}", proton.display()))
     }
-    scripts
-}
-
-fn is_proton_script(path: &Path) -> bool {
-    path.file_name()
-        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("proton"))
 }
 
 /// The Proton script always uses `<STEAM_COMPAT_DATA_PATH>/pfx` as its prefix.
@@ -291,7 +280,6 @@ fn host_gstreamer_path() -> String {
         "/usr/lib64/gstreamer-1.0",
         "/usr/lib/gstreamer-1.0",
         "/usr/lib/x86_64-linux-gnu/gstreamer-1.0",
-        "/usr/lib/aarch64-linux-gnu/gstreamer-1.0",
     ];
     let existing: Vec<&str> = candidates
         .iter()
@@ -310,8 +298,8 @@ fn host_gstreamer_path() -> String {
     value
 }
 
-/// Set the environment and leading argument required by a runner.
-fn prepare_command(cmd: &mut Command, runner: &Path, prefix: &Path) -> Result<(), String> {
+/// Set the environment and leading verb for a `proton` script invocation.
+fn prepare_command(cmd: &mut Command, prefix: &Path) -> Result<(), String> {
     cmd.env("WINEPREFIX", prefix)
         .env("WINEARCH", "win64")
         .env("PROTON_VERB", "runinprefix")
@@ -319,11 +307,9 @@ fn prepare_command(cmd: &mut Command, runner: &Path, prefix: &Path) -> Result<()
         // Proton overrides GST_PLUGIN_SYSTEM_PATH with its own bundled dirs;
         // add the host H.264 plugins as a user path so in-game videos decode.
         // Detect the distro's plugin dir rather than hardcoding one layout.
-        .env("GST_PLUGIN_PATH_1_0", host_gstreamer_path());
-    if is_proton_script(runner) {
-        cmd.env("STEAM_COMPAT_DATA_PATH", compat_data(prefix)?)
-            .arg("runinprefix");
-    }
+        .env("GST_PLUGIN_PATH_1_0", host_gstreamer_path())
+        .env("STEAM_COMPAT_DATA_PATH", compat_data(prefix)?)
+        .arg("runinprefix");
     Ok(())
 }
 
@@ -350,8 +336,9 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// A tiny shim that makes any tool which expects a `wine` binary use the
-/// selected Proton. Proton's paths can contain spaces, and its own `wine64`
-/// may not exist, so pointing winetricks at it directly is unreliable.
+/// selected Proton. Proton's paths can contain spaces, and its bundled Wine
+/// needs the environment the `proton` script sets up, so winetricks can't
+/// use that Wine directly.
 fn wine_wrapper(base: &Path, proton_script: &Path) -> Result<PathBuf, String> {
     fs::create_dir_all(base)
         .map_err(|e| format!("Failed to create the launcher data folder: {e}"))?;
@@ -434,27 +421,10 @@ fn link_state(link: &Path, target: &Path) -> LinkState {
     }
 }
 
-/// The Windows user profile inside a Wine prefix, if it exists. Proton names
-/// the user `steamuser`; plain Wine uses the Unix login name. `Public` is the
-/// shared profile, never the user's own.
-pub(crate) fn wine_user_dir(prefix: &Path) -> Option<PathBuf> {
-    let users = prefix.join("drive_c").join("users");
-    let mut candidates = Vec::new();
-    for key in ["USER", "LOGNAME"] {
-        if let Some(user) = std::env::var_os(key).filter(|u| !u.is_empty()) {
-            candidates.push(users.join(user));
-        }
-    }
-    candidates.push(users.join("steamuser"));
-    if let Ok(entries) = fs::read_dir(&users) {
-        candidates.extend(
-            entries
-                .flatten()
-                .filter(|entry| entry.file_name() != "Public")
-                .map(|entry| entry.path()),
-        );
-    }
-    candidates.into_iter().find(|p| p.is_dir())
+/// The Windows user profile inside a Proton prefix. Proton always names the
+/// user `steamuser`, whatever the Unix login is.
+pub(crate) fn wine_user_dir(prefix: &Path) -> PathBuf {
+    prefix.join("drive_c/users/steamuser")
 }
 
 /// Keep Unity's `persistentDataPath` outside the Proton prefix.
@@ -473,9 +443,7 @@ fn ensure_game_appdata(prefix: &Path, base: &Path) -> Result<(), String> {
     let base = std::path::absolute(base)
         .map_err(|e| format!("Invalid launcher data folder {base:?}: {e}"))?;
     let stable = base.join("game-appdata").join(GAME_APPDATA_DIR);
-    let local_low = wine_user_dir(prefix)
-        .unwrap_or_else(|| prefix.join("drive_c/users/steamuser"))
-        .join("AppData/LocalLow");
+    let local_low = wine_user_dir(prefix).join("AppData/LocalLow");
     let link = local_low.join(GAME_APPDATA_DIR);
 
     fs::create_dir_all(&stable)
@@ -661,33 +629,21 @@ pub fn setup(
 
     // 1) Generate the prefix with wineboot through Proton.
     progress("Creating the Proton prefix (wineboot)...", None);
-    let mut last_error = String::from("no usable Proton or Wine executable found");
-    let mut created = false;
-    for script in proton_scripts(&proton) {
-        if !script.is_file() {
-            continue;
-        }
-        let mut cmd = Command::new(&script);
-        if let Err(e) = prepare_command(&mut cmd, &script, &prefix) {
-            last_error = e;
-            continue;
-        }
-        let result = cmd.arg("wineboot.exe").output();
-        match result {
-            Ok(output) => {
-                // wineboot commonly returns a non-zero code even when the
-                // prefix was created correctly, so check the prefix itself.
-                if output.status.success() || prefix.join("drive_c").is_dir() {
-                    created = true;
-                    break;
-                }
-                last_error = format!("{} exited with {}", script.display(), output.status);
-            }
-            Err(e) => last_error = format!("{}: {e}", script.display()),
-        }
-    }
-    if !created {
-        return Err(format!("Failed to create the Proton prefix: {last_error}"));
+    let script = proton_script(&proton)?;
+    let mut cmd = Command::new(&script);
+    prepare_command(&mut cmd, &prefix)?;
+    let output = cmd
+        .arg("wineboot.exe")
+        .output()
+        .map_err(|e| format!("Failed to create the Proton prefix: {}: {e}", script.display()))?;
+    // wineboot commonly returns a non-zero code even when the prefix was
+    // created correctly, so check the prefix itself.
+    if !output.status.success() && !prefix.join("drive_c").is_dir() {
+        return Err(format!(
+            "Failed to create the Proton prefix: {} exited with {}",
+            script.display(),
+            output.status
+        ));
     }
     // Moving the game's app data out of the prefix only protects the
     // asset-cache index, so a failure is a warning, not a setup error.
@@ -700,10 +656,6 @@ pub fn setup(
     let tool = find_tool("winetricks").ok_or_else(|| {
         "winetricks was not found in PATH. Please install winetricks and try again.".to_string()
     })?;
-    let script = proton_scripts(&proton)
-        .into_iter()
-        .find(|p| p.is_file())
-        .ok_or_else(|| format!("Proton script not found: {}", proton.display()))?;
     let compat = compat_data(&prefix)?;
     let wine = wine_wrapper(base, &script)?;
 
@@ -803,7 +755,7 @@ pub fn install_dw_proton(
             assets.iter().find(|a| {
                 a["name"]
                     .as_str()
-                    .is_some_and(|n| n.ends_with(".tar.xz") && !n.ends_with(".torrent"))
+                    .is_some_and(|n| n.ends_with(".tar.xz"))
             })
         })
         .ok_or("No DW-Proton archive was found in the latest release")?;
@@ -982,10 +934,7 @@ pub fn launch_game(exe: &Path, args: &str, cwd: &Path) -> Result<(), String> {
             "No Proton installation found. Select one in the Proton settings first.".to_string()
         })?;
 
-    let proton_script = proton_scripts(&proton)
-        .into_iter()
-        .find(|p| p.is_file())
-        .ok_or_else(|| format!("Proton script not found: {}", proton.display()))?;
+    let proton_script = proton_script(&proton)?;
 
     let cwd = if cwd.as_os_str().is_empty() {
         exe.parent().unwrap_or(Path::new("."))
@@ -1045,7 +994,7 @@ pub fn launch_game(exe: &Path, args: &str, cwd: &Path) -> Result<(), String> {
         .map_err(|e| format!("Failed to write the launch script: {e}"))?;
 
     let mut cmd = Command::new(&proton_script);
-    prepare_command(&mut cmd, &proton_script, &prefix)?;
+    prepare_command(&mut cmd, &prefix)?;
     // version.dll: localization proxy; winmm=b: ignore leftover shims;
     // d3d11/dxgi=n: use the tested DXVK pair bundled in the game folder.
     cmd.env("WINEDLLOVERRIDES",
@@ -1267,25 +1216,6 @@ mod tests {
 
         ensure_game_appdata(&t.prefix, &t.base).expect("link into a bare prefix");
         verify_game_appdata(&t.link, &t.stable).expect("verify");
-    }
-
-    #[test]
-    fn uses_the_prefix_wine_user_instead_of_steamuser() {
-        let t = appdata_layout();
-        let users = t.prefix.join("drive_c/users");
-        fs::create_dir_all(users.join("Public")).expect("public");
-        let real = users
-            .join("gakumas-test-user/AppData/LocalLow")
-            .join(GAME_APPDATA_DIR);
-        fs::create_dir_all(&real).expect("wine user dir");
-        fs::write(real.join("cache.bin"), b"index").expect("index");
-
-        assert_eq!(wine_user_dir(&t.prefix), Some(users.join("gakumas-test-user")));
-        ensure_game_appdata(&t.prefix, &t.base).expect("migrate");
-
-        assert!(!users.join("steamuser").exists());
-        assert_eq!(fs::read_link(&real).expect("link"), t.stable);
-        assert_eq!(fs::read(t.stable.join("cache.bin")).expect("moved"), b"index");
     }
 
     #[test]

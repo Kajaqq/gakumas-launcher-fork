@@ -36,9 +36,9 @@ If the game executable has been patched (for example, a Proton-tuned build with 
 
 ## Linux / Proton
 
-The Linux build runs the Windows game through a user-selected Proton version.
+The Linux build runs the Windows game through [DW-Proton](https://github.com/dawn-winery/dwproton-mirror), which is required for the CrackProof anti-debug driver fix.
 
-1. In the **Proton (Linux)** panel, click **Install DW-Proton** to download and extract the latest DW-Proton release into Steam's `compatibilitytools.d`, or select an already installed Proton from the list. DW-Proton is required for the original executable (it handles the CrackProof anti-debug driver); a pre-unpacked executable works with other Proton builds too.
+1. In the **Proton (Linux)** panel, click **Install DW-Proton** to download and extract the latest DW-Proton release into Steam's `compatibilitytools.d`, or select an already installed one from the list. The list shows the compatibility tools in `compatibilitytools.d`, newest name first. The custom path field takes a Proton directory or its `proton` script.
 2. Click **Create prefix & install dependencies**. This creates the prefix with `wineboot` and installs `corefonts`, `powershell`, `webview2` and `vcrun2022`. It uses the `winetricks` from your `PATH` and the Proton you selected (no Heroic or protontricks needed); WebView2 is installed from Microsoft's bootstrapper if your winetricks lacks that verb.
 3. Use **Game folder → Change** to point at the folder containing `gakumas.exe` (auto-detection from DMM GAME PLAYER only works on Windows). Use **Executable override** to choose a different executable.
 4. Log in and start the game as usual.
