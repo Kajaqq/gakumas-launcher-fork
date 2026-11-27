@@ -251,7 +251,13 @@ impl WgTunnel {
             let input: &[u8] = if first { &self.dgram[..n] } else { &[] };
             match self.tunn.decapsulate(src, input, &mut self.buf) {
                 TunnResult::WriteToNetwork(p) => {
-                    self.sock.send(p).map_err(|e| format!("VPN send: {e}"))?;
+                    match self.sock.send(p) {
+                        Ok(_) => {}
+                        // The drain loop runs nonblocking. A full send buffer only drops this
+                        // datagram; WireGuard and the inner TCP retransmit.
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(e) => return Err(format!("VPN send: {e}")),
+                    }
                     first = false; // Flush any queued packets immediately.
                 }
                 TunnResult::WriteToTunnelV4(p, _) => {
@@ -320,7 +326,10 @@ impl IpTunnel for WgTunnel {
                     }
                 }
             }
-            let _ = self.sock.set_nonblocking(false);
+            // Left nonblocking, later sends and timed receives would misbehave.
+            self.sock
+                .set_nonblocking(false)
+                .map_err(|e| format!("VPN socket: {e}"))?;
             result?;
         }
         Ok(())

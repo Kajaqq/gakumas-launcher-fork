@@ -747,16 +747,16 @@ impl Link {
                 if out.len() >= max {
                     return Ok(());
                 }
-                if s.set_nonblocking(true).is_err() {
-                    return Ok(());
-                }
-                let mut err = None;
+                // Poll with a minimal read timeout rather than nonblocking mode: the writer
+                // thread shares this socket (try_clone), and nonblocking mode would apply to
+                // its writes too. SO_RCVTIMEO only affects reads; recv_until resets it.
+                s.set_read_timeout(Some(Duration::from_millis(1)))
+                    .map_err(|e| e.to_string())?;
                 let mut tmp = [0u8; 16384];
                 while out.len() < max {
                     match s.read(&mut tmp) {
                         Ok(0) => {
-                            err = Some(writer.failure.try_recv().unwrap_or_else(|_| "VPN server closed the connection".into()));
-                            break;
+                            return Err(writer.failure.try_recv().unwrap_or_else(|_| "VPN server closed the connection".into()));
                         }
                         Ok(n) => {
                             rbuf.extend_from_slice(&tmp[..n]);
@@ -769,15 +769,8 @@ impl Link {
                             }
                         }
                         Err(e) if timed_out(&e) || e.kind() == io::ErrorKind::Interrupted => break,
-                        Err(e) => {
-                            err = Some(format!("VPN connection: {e}"));
-                            break;
-                        }
+                        Err(e) => return Err(format!("VPN connection: {e}")),
                     }
-                }
-                let _ = s.set_nonblocking(false);
-                if let Some(e) = err {
-                    return Err(e);
                 }
                 Ok(())
             }
@@ -1283,7 +1276,9 @@ impl Tunnel {
             .min_by_key(|a| !a.is_ipv4())
             .ok_or_else(|| format!("Failed to resolve {}", opts.remote.host))?;
         check_cancelled(opts.cancel)?;
-        let tcp_cap = if opts.timeout.is_some() {
+        // Raced candidates (the only callers with a cancel flag) get a short TCP connect so
+        // a slow relay can't eat the handshake budget; a single user VPN keeps 10s.
+        let tcp_cap = if opts.cancel.is_some() {
             Duration::from_secs(5)
         } else {
             Duration::from_secs(10)
@@ -2030,27 +2025,28 @@ impl Tunnel {
         if self.last_data_send.elapsed() >= interval {
             self.send_ip(&PING_MAGIC)?;
         }
-        if self.ping_restart.is_some_and(|d| self.last_rx.elapsed() >= d) {
-            return Err("VPN server stopped responding (ping-restart)".into());
-        }
         let first = match self.link.try_recv_buffered() {
             Some(p) => Some(p),
             None => self.link.recv_until(Instant::now() + wait)?,
         };
-        let Some(first) = first else {
-            return Ok(());
-        };
-        let mut packets = Vec::with_capacity(16);
-        packets.push(first);
-        self.link.drain_ready(256, &mut packets)?;
-        for p in packets {
-            if let Err(e) = self.handle_packet(p) {
-                let recoverable = (e.contains("authentication") || e.contains("padding"))
-                    && self.consecutive_rx_errors < MAX_CONSECUTIVE_DATA_ERRORS;
-                if !recoverable {
-                    return Err(e);
+        if let Some(first) = first {
+            let mut packets = Vec::with_capacity(16);
+            packets.push(first);
+            self.link.drain_ready(256, &mut packets)?;
+            for p in packets {
+                if let Err(e) = self.handle_packet(p) {
+                    let recoverable = (e.contains("authentication") || e.contains("padding"))
+                        && self.consecutive_rx_errors < MAX_CONSECUTIVE_DATA_ERRORS;
+                    if !recoverable {
+                        return Err(e);
+                    }
                 }
             }
+        }
+        // Checked after reading, so server pings that queued up while nobody pumped the
+        // tunnel still count as signs of life.
+        if self.ping_restart.is_some_and(|d| self.last_rx.elapsed() >= d) {
+            return Err("VPN server stopped responding (ping-restart)".into());
         }
         Ok(())
     }

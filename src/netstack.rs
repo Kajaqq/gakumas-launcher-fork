@@ -202,6 +202,36 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1), "DNS race waited too long: {:?}", started.elapsed());
         assert_eq!(client.lock().unwrap().cached_ip("api.dmm.test"), Some(Ipv4Addr::new(203, 0, 113, 42)));
     }
+
+    #[test]
+    fn shared_resolver_fails_fast_after_in_tunnel_dns_failed() {
+        // A tunnel that silently drops everything: no resolver ever answers.
+        struct Blackhole;
+        impl IpTunnel for Blackhole {
+            fn address(&self) -> TunnelAddr {
+                TunnelAddr { local_ip: [10, 0, 0, 1], prefix_len: 24, gateway: None, mtu: 1300, dns: vec![[10, 0, 0, 2]] }
+            }
+            fn send_ip(&mut self, _: &[u8]) -> Result<(), String> { Ok(()) }
+            fn pump(&mut self, _: Duration) -> Result<(), String> { Ok(()) }
+            fn take_inbound(&mut self) -> Option<Vec<u8>> { None }
+        }
+        let stack = Mutex::new(TunnelStack::new(Blackhole).unwrap());
+        assert!(TunnelStack::resolve_in_tunnel_shared(&stack, "a.dmm.test", Duration::from_millis(200)).is_err());
+
+        // A different host on the same tunnel now falls through at once (to system DNS).
+        let started = Instant::now();
+        let err = TunnelStack::resolve_in_tunnel_shared(&stack, "b.dmm.test", Duration::from_secs(3)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(100), "waited {:?}", started.elapsed());
+        assert!(err.contains("failed recently"), "{err}");
+
+        // Cached answers are still served during the backoff, and a success clears it.
+        stack.lock().unwrap().record_lookup("c.dmm.test", &Ok(Ipv4Addr::new(203, 0, 113, 7)), None);
+        assert_eq!(
+            TunnelStack::resolve_in_tunnel_shared(&stack, "c.dmm.test", Duration::from_secs(3)),
+            Ok(Ipv4Addr::new(203, 0, 113, 7))
+        );
+        assert!(stack.lock().unwrap().dns_broken_until.is_none());
+    }
 }
 
 /// 터널 안에서 이 프로그램이 쓰는 주소
@@ -292,6 +322,8 @@ pub struct TunnelStack {
     retired: Vec<(SocketHandle, Instant)>,
     next_port: u16,
     last_activity: Instant,
+    /// While set and in the future, shared lookups skip in-tunnel DNS (it just failed).
+    dns_broken_until: Option<Instant>,
 }
 
 /// DNS-over-TCP 질의 (2바이트 길이 + DNS 메시지, A 레코드)
@@ -373,6 +405,91 @@ fn parse_doh_a_record(raw: &[u8]) -> Result<Ipv4Addr, String> {
         .ok_or_else(|| "no A record".to_string())
 }
 
+/// How long shared lookups skip in-tunnel DNS after a full lookup failed.
+const DNS_BROKEN_BACKOFF: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy)]
+enum DnsPhase {
+    /// DNS over TCP:53 (pushed DNS, then public resolvers).
+    Tcp,
+    /// DNS-over-HTTPS JSON API, for exits that block port 53.
+    Doh,
+}
+
+enum ProbeKind {
+    Tcp { server: Ipv4Addr, id: [u8; 2] },
+    Doh { name: &'static str },
+}
+
+impl ProbeKind {
+    fn label(&self) -> String {
+        match self {
+            ProbeKind::Tcp { server, .. } => format!("DNS {server}"),
+            ProbeKind::Doh { name } => (*name).to_string(),
+        }
+    }
+}
+
+/// One in-flight lookup against one resolver.
+struct DnsProbe {
+    kind: ProbeKind,
+    handle: SocketHandle,
+    exchange: Exchange,
+}
+
+impl DnsProbe {
+    fn answer(&self) -> Result<Ipv4Addr, String> {
+        match self.kind {
+            ProbeKind::Tcp { id, .. } => dns_answer(&self.exchange.response, id),
+            ProbeKind::Doh { .. } => parse_doh_a_record(&self.exchange.response),
+        }
+    }
+}
+
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|c| c.load(Ordering::Acquire))
+}
+
+fn race_error(errors: Vec<String>) -> String {
+    if errors.is_empty() {
+        "no DNS servers".into()
+    } else {
+        errors.join(" / ")
+    }
+}
+
+/// TCP:53 gets two thirds of the budget (bounded), DoH the rest.
+fn tcp_phase_budget(timeout: Duration) -> Duration {
+    (timeout * 2 / 3)
+        .clamp(Duration::from_millis(1200), Duration::from_millis(3500))
+        .min(timeout)
+}
+
+/// Run the TCP:53 phase, then the DoH phase with whatever time is left.
+fn lookup_two_phase(
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+    mut race: impl FnMut(DnsPhase, Duration) -> Result<Ipv4Addr, String>,
+) -> Result<Ipv4Addr, String> {
+    let deadline = Instant::now() + timeout;
+    let mut errors = Vec::new();
+    match race(DnsPhase::Tcp, tcp_phase_budget(timeout)) {
+        Ok(addr) => return Ok(addr),
+        Err(e) => errors.push(e),
+    }
+    if is_cancelled(cancel) {
+        return Err("DNS lookup cancelled".into());
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if !remaining.is_zero() {
+        match race(DnsPhase::Doh, remaining) {
+            Ok(addr) => return Ok(addr),
+            Err(e) => errors.push(e),
+        }
+    }
+    Err(errors.join(" / "))
+}
+
 pub fn resolve_v4(host: &str) -> Result<Ipv4Addr, String> {
     (host, 0)
         .to_socket_addrs()
@@ -424,6 +541,7 @@ impl TunnelStack {
             retired: Vec::new(),
             next_port: 49152 + u16::from_le_bytes([seed[0], seed[1]]) % 16384,
             last_activity: Instant::now(),
+            dns_broken_until: None,
         })
     }
 
@@ -454,6 +572,8 @@ impl TunnelStack {
         self.resolve_in_tunnel_cancellable(host, Duration::from_secs(6), None)
     }
 
+    /// Like [`Self::resolve_in_tunnel`], with an overall deadline and a cancellation flag.
+    /// Always performs a real lookup (ignores the cache and the failure backoff).
     pub fn resolve_in_tunnel_cancellable(
         &mut self,
         host: &str,
@@ -463,197 +583,17 @@ impl TunnelStack {
         if let Ok(ip) = host.parse::<Ipv4Addr>() {
             return Ok(ip);
         }
-        let total_deadline = Instant::now() + timeout;
-        let mut errors = Vec::new();
-
-        // Phase 1: race TCP:53 queries concurrently (pushed DNS first, then 1.1.1.1 & 8.8.8.8).
-        let tcp_budget = (timeout * 2 / 3).clamp(Duration::from_millis(1200), Duration::from_millis(3500)).min(timeout);
-        match self.race_dns_tcp(host, tcp_budget, cancel) {
-            Ok(addr) => {
-                self.hosts.insert(host.to_string(), addr);
-                return Ok(addr);
-            }
-            Err(e) => errors.push(e),
-        }
-
-        if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
-            return Err("DNS lookup cancelled".into());
-        }
-
-        // Phase 2: if port 53 is blocked, race both DoH endpoints concurrently with remaining time.
-        let remaining = total_deadline.saturating_duration_since(Instant::now());
-        if !remaining.is_zero() {
-            match self.race_dns_doh(host, remaining, cancel) {
-                Ok(addr) => {
-                    self.hosts.insert(host.to_string(), addr);
-                    return Ok(addr);
-                }
-                Err(e) => errors.push(e),
-            }
-        }
-
-        Err(errors.join(" / "))
+        let result = lookup_two_phase(timeout, cancel, |phase, budget| {
+            self.race_dns_phase(phase, host, budget, cancel)
+        });
+        self.record_lookup(host, &result, cancel);
+        result
     }
 
-    fn race_dns_tcp(
-        &mut self,
-        host: &str,
-        timeout: Duration,
-        cancel: Option<&AtomicBool>,
-    ) -> Result<Ipv4Addr, String> {
-        struct Probe {
-            server: Ipv4Addr,
-            id: [u8; 2],
-            handle: SocketHandle,
-            exchange: Exchange,
-        }
-        let servers = self.dns_tcp_servers();
-        let mut probes = Vec::with_capacity(servers.len());
-        let mut errors = Vec::new();
-        for s in servers {
-            let server = Ipv4Addr::from(s);
-            let mut id = [0u8; 2];
-            getrandom::getrandom(&mut id).map_err(|e| e.to_string())?;
-            let query = dns_query(host, id);
-            match Exchange::new("", None, &query, timeout, Completion::Custom(dns_tcp_complete))
-                .and_then(|ex| self.start_socket(server, 53).map(|h| (h, ex)))
-            {
-                Ok((handle, exchange)) => probes.push(Probe { server, id, handle, exchange }),
-                Err(e) => errors.push(format!("DNS {server}: {e}")),
-            }
-        }
-        let mut winner = None;
-        let mut step_err = None;
-        while !probes.is_empty() && winner.is_none() {
-            if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
-                step_err = Some("DNS lookup cancelled".into());
-                break;
-            }
-            if let Err(e) = self.step() {
-                step_err = Some(e);
-                break;
-            }
-            let mut i = 0;
-            while i < probes.len() {
-                let tick = if Instant::now() >= probes[i].exchange.deadline {
-                    Err(if probes[i].exchange.connected { "response timed out" } else { "TCP connect timed out" }.into())
-                } else {
-                    let h = probes[i].handle;
-                    probes[i].exchange.advance(self.sockets.get_mut::<tcp::Socket>(h))
-                };
-                match tick {
-                    Ok(false) => i += 1,
-                    Ok(true) => {
-                        let p = probes.swap_remove(i);
-                        self.retire_exchange(p.handle);
-                        match dns_answer(&p.exchange.response, p.id) {
-                            Ok(addr) => {
-                                winner = Some(addr);
-                                break;
-                            }
-                            Err(e) => errors.push(format!("DNS {}: {e}", p.server)),
-                        }
-                    }
-                    Err(e) => {
-                        let p = probes.swap_remove(i);
-                        self.retire_exchange(p.handle);
-                        errors.push(format!("DNS {}: {e}", p.server));
-                    }
-                }
-            }
-        }
-        for p in probes {
-            self.retire_exchange(p.handle);
-        }
-        if let Some(addr) = winner {
-            return Ok(addr);
-        }
-        if let Some(e) = step_err {
-            return Err(e);
-        }
-        Err(errors.join(" / "))
-    }
-
-    fn race_dns_doh(
-        &mut self,
-        host: &str,
-        timeout: Duration,
-        cancel: Option<&AtomicBool>,
-    ) -> Result<Ipv4Addr, String> {
-        struct Probe {
-            name: &'static str,
-            handle: SocketHandle,
-            exchange: Exchange,
-        }
-        let tls = http::dmm_tls_config();
-        let mut probes = Vec::with_capacity(DOH_SERVERS.len());
-        let mut errors = Vec::new();
-        for &(ip, name, path) in DOH_SERVERS {
-            let req = format!(
-                "GET {path}?name={host}&type=A HTTP/1.1\r\nHost: {name}\r\n\
-                 Accept: application/dns-json\r\nConnection: close\r\n\r\n"
-            );
-            match Exchange::new(name, Some(tls.clone()), req.as_bytes(), timeout, Completion::http())
-                .and_then(|ex| self.start_socket(Ipv4Addr::from(ip), 443).map(|h| (h, ex)))
-            {
-                Ok((handle, exchange)) => probes.push(Probe { name, handle, exchange }),
-                Err(e) => errors.push(format!("{name}: {e}")),
-            }
-        }
-        let mut winner = None;
-        let mut step_err = None;
-        while !probes.is_empty() && winner.is_none() {
-            if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
-                step_err = Some("DNS lookup cancelled".into());
-                break;
-            }
-            if let Err(e) = self.step() {
-                step_err = Some(e);
-                break;
-            }
-            let mut i = 0;
-            while i < probes.len() {
-                let tick = if Instant::now() >= probes[i].exchange.deadline {
-                    Err(if probes[i].exchange.connected { "response timed out" } else { "TCP connect timed out" }.into())
-                } else {
-                    let h = probes[i].handle;
-                    probes[i].exchange.advance(self.sockets.get_mut::<tcp::Socket>(h))
-                };
-                match tick {
-                    Ok(false) => i += 1,
-                    Ok(true) => {
-                        let p = probes.swap_remove(i);
-                        self.retire_exchange(p.handle);
-                        match parse_doh_a_record(&p.exchange.response) {
-                            Ok(addr) => {
-                                winner = Some(addr);
-                                break;
-                            }
-                            Err(e) => errors.push(format!("{}: {e}", p.name)),
-                        }
-                    }
-                    Err(e) => {
-                        let p = probes.swap_remove(i);
-                        self.retire_exchange(p.handle);
-                        errors.push(format!("{}: {e}", p.name));
-                    }
-                }
-            }
-        }
-        for p in probes {
-            self.retire_exchange(p.handle);
-        }
-        if let Some(addr) = winner {
-            return Ok(addr);
-        }
-        if let Some(e) = step_err {
-            return Err(e);
-        }
-        Err(errors.join(" / "))
-    }
-
-    /// Resolve `host` inside a shared tunnel (TCP:53 race) without holding the stack lock
-    /// across the whole exchange, caching the result on success.
+    /// Resolve `host` inside a shared tunnel without holding the stack lock across the
+    /// whole exchange. Serves cached answers, and fails fast while a recent lookup on this
+    /// tunnel found in-tunnel DNS unusable, so callers with a system-DNS fallback don't
+    /// wait out the full timeout for every new host.
     pub(crate) fn resolve_in_tunnel_shared(
         shared: &Mutex<Self>,
         host: &str,
@@ -662,94 +602,192 @@ impl TunnelStack {
         if let Ok(ip) = host.parse::<Ipv4Addr>() {
             return Ok(ip);
         }
-        let lock = || shared.lock().map_err(|e| e.to_string());
-        let servers = {
-            let stack = lock()?;
+        {
+            let stack = shared.lock().map_err(|e| e.to_string())?;
             if let Some(ip) = stack.cached_ip(host) {
                 return Ok(ip);
             }
-            stack.dns_tcp_servers()
-        };
-        struct Probe {
-            server: Ipv4Addr,
-            id: [u8; 2],
-            handle: SocketHandle,
-            exchange: Exchange,
+            if stack.dns_broken_until.is_some_and(|until| Instant::now() < until) {
+                return Err("in-tunnel DNS failed recently".into());
+            }
         }
-        let mut probes = Vec::with_capacity(servers.len());
+        Self::lookup_shared(shared, host, timeout)
+    }
+
+    /// Fresh in-tunnel lookup on a shared tunnel (ignores the cache and the failure
+    /// backoff). Used as a data-plane health probe.
+    pub(crate) fn probe_dns_shared(
+        shared: &Mutex<Self>,
+        host: &str,
+        timeout: Duration,
+    ) -> Result<Ipv4Addr, String> {
+        Self::lookup_shared(shared, host, timeout)
+    }
+
+    fn lookup_shared(shared: &Mutex<Self>, host: &str, timeout: Duration) -> Result<Ipv4Addr, String> {
+        let result = lookup_two_phase(timeout, None, |phase, budget| {
+            Self::race_dns_phase_shared(shared, phase, host, budget)
+        });
+        if let Ok(mut stack) = shared.lock() {
+            stack.record_lookup(host, &result, None);
+        }
+        result
+    }
+
+    /// Cache a successful answer, or start the failure backoff after a real (not cancelled) failure.
+    fn record_lookup(&mut self, host: &str, result: &Result<Ipv4Addr, String>, cancel: Option<&AtomicBool>) {
+        match result {
+            Ok(addr) => {
+                self.hosts.insert(host.to_string(), *addr);
+                self.dns_broken_until = None;
+            }
+            Err(_) if !is_cancelled(cancel) => {
+                self.dns_broken_until = Some(Instant::now() + DNS_BROKEN_BACKOFF);
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Open one probe socket per resolver of `phase`. Query IDs are drawn before any
+    /// socket is opened, so an early error never leaves probe sockets behind.
+    fn start_dns_probes(
+        &mut self,
+        phase: DnsPhase,
+        host: &str,
+        timeout: Duration,
+        errors: &mut Vec<String>,
+    ) -> Result<Vec<DnsProbe>, String> {
+        let mut planned: Vec<(ProbeKind, Ipv4Addr, u16, Result<Exchange, String>)> = Vec::new();
+        match phase {
+            DnsPhase::Tcp => {
+                let servers = self.dns_tcp_servers();
+                let mut ids = vec![0u8; servers.len() * 2];
+                getrandom::getrandom(&mut ids).map_err(|e| e.to_string())?;
+                for (s, id) in servers.into_iter().zip(ids.chunks_exact(2)) {
+                    let (server, id) = (Ipv4Addr::from(s), [id[0], id[1]]);
+                    let exchange = Exchange::new(
+                        "",
+                        None,
+                        &dns_query(host, id),
+                        timeout,
+                        Completion::Custom(dns_tcp_complete),
+                    );
+                    planned.push((ProbeKind::Tcp { server, id }, server, 53, exchange));
+                }
+            }
+            DnsPhase::Doh => {
+                let tls = http::dmm_tls_config();
+                for &(ip, name, path) in DOH_SERVERS {
+                    let req = format!(
+                        "GET {path}?name={host}&type=A HTTP/1.1\r\nHost: {name}\r\n\
+                         Accept: application/dns-json\r\nConnection: close\r\n\r\n"
+                    );
+                    let exchange =
+                        Exchange::new(name, Some(tls.clone()), req.as_bytes(), timeout, Completion::http());
+                    planned.push((ProbeKind::Doh { name }, Ipv4Addr::from(ip), 443, exchange));
+                }
+            }
+        }
+        let mut probes = Vec::with_capacity(planned.len());
+        for (kind, ip, port, exchange) in planned {
+            match exchange.and_then(|ex| self.start_socket(ip, port).map(|h| (h, ex))) {
+                Ok((handle, exchange)) => probes.push(DnsProbe { kind, handle, exchange }),
+                Err(e) => errors.push(format!("{}: {e}", kind.label())),
+            }
+        }
+        Ok(probes)
+    }
+
+    /// One stack pump plus one pass over `probes`. Finished probes are retired and
+    /// removed; returns the first valid answer.
+    fn tick_dns_probes(
+        &mut self,
+        probes: &mut Vec<DnsProbe>,
+        errors: &mut Vec<String>,
+    ) -> Result<Option<Ipv4Addr>, String> {
+        self.step()?;
+        let mut i = 0;
+        while i < probes.len() {
+            let p = &mut probes[i];
+            let tick = if Instant::now() >= p.exchange.deadline {
+                Err(if p.exchange.connected { "response timed out" } else { "TCP connect timed out" }.into())
+            } else {
+                p.exchange.advance(self.sockets.get_mut::<tcp::Socket>(p.handle))
+            };
+            if matches!(tick, Ok(false)) {
+                i += 1;
+                continue;
+            }
+            let p = probes.swap_remove(i);
+            self.retire_exchange(p.handle);
+            match tick.and_then(|_| p.answer()) {
+                Ok(addr) => return Ok(Some(addr)),
+                Err(e) => errors.push(format!("{}: {e}", p.kind.label())),
+            }
+        }
+        Ok(None)
+    }
+
+    fn retire_dns_probes(&mut self, probes: Vec<DnsProbe>) {
+        for p in probes {
+            self.retire_exchange(p.handle);
+        }
+    }
+
+    /// Race one phase while holding the stack exclusively.
+    fn race_dns_phase(
+        &mut self,
+        phase: DnsPhase,
+        host: &str,
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Ipv4Addr, String> {
         let mut errors = Vec::new();
-        {
-            let mut stack = lock()?;
-            for s in servers {
-                let server = Ipv4Addr::from(s);
-                let mut id = [0u8; 2];
-                getrandom::getrandom(&mut id).map_err(|e| e.to_string())?;
-                let query = dns_query(host, id);
-                match Exchange::new("", None, &query, timeout, Completion::Custom(dns_tcp_complete))
-                    .and_then(|ex| stack.start_socket(server, 53).map(|h| (h, ex)))
-                {
-                    Ok((handle, exchange)) => probes.push(Probe { server, id, handle, exchange }),
-                    Err(e) => errors.push(format!("DNS {server}: {e}")),
-                }
+        let mut probes = self.start_dns_probes(phase, host, timeout, &mut errors)?;
+        let result = loop {
+            if probes.is_empty() {
+                break Err(race_error(errors));
             }
-        }
-        let mut winner = None;
-        let mut step_err = None;
-        while !probes.is_empty() && winner.is_none() {
-            {
-                let mut stack = lock()?;
-                if let Err(e) = stack.step() {
-                    step_err = Some(e);
-                    break;
-                }
-                let mut i = 0;
-                while i < probes.len() {
-                    let tick = if Instant::now() >= probes[i].exchange.deadline {
-                        Err(if probes[i].exchange.connected { "response timed out" } else { "TCP connect timed out" }.into())
-                    } else {
-                        let h = probes[i].handle;
-                        probes[i].exchange.advance(stack.sockets.get_mut::<tcp::Socket>(h))
-                    };
-                    match tick {
-                        Ok(false) => i += 1,
-                        Ok(true) => {
-                            let p = probes.swap_remove(i);
-                            stack.retire_exchange(p.handle);
-                            match dns_answer(&p.exchange.response, p.id) {
-                                Ok(addr) => {
-                                    stack.hosts.insert(host.to_string(), addr);
-                                    winner = Some(addr);
-                                    break;
-                                }
-                                Err(e) => errors.push(format!("DNS {}: {e}", p.server)),
-                            }
-                        }
-                        Err(e) => {
-                            let p = probes.swap_remove(i);
-                            stack.retire_exchange(p.handle);
-                            errors.push(format!("DNS {}: {e}", p.server));
-                        }
-                    }
-                }
+            if is_cancelled(cancel) {
+                break Err("DNS lookup cancelled".into());
             }
-            if !probes.is_empty() && winner.is_none() {
-                std::thread::sleep(Duration::from_millis(1));
+            match self.tick_dns_probes(&mut probes, &mut errors) {
+                Ok(Some(addr)) => break Ok(addr),
+                Ok(None) => {}
+                Err(e) => break Err(e),
             }
-        }
+        };
+        self.retire_dns_probes(probes);
+        result
+    }
+
+    /// Race one phase on a shared stack, re-locking per tick so other users of the
+    /// tunnel (browser proxy pump, API requests) keep running in between.
+    fn race_dns_phase_shared(
+        shared: &Mutex<Self>,
+        phase: DnsPhase,
+        host: &str,
+        timeout: Duration,
+    ) -> Result<Ipv4Addr, String> {
+        let lock = || shared.lock().map_err(|e| e.to_string());
+        let mut errors = Vec::new();
+        let mut probes = lock()?.start_dns_probes(phase, host, timeout, &mut errors)?;
+        let result = loop {
+            if probes.is_empty() {
+                break Err(race_error(errors));
+            }
+            match lock().and_then(|mut s| s.tick_dns_probes(&mut probes, &mut errors)) {
+                Ok(Some(addr)) => break Ok(addr),
+                Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+                Err(e) => break Err(e),
+            }
+        };
         if !probes.is_empty() {
             if let Ok(mut stack) = lock() {
-                for p in probes {
-                    stack.retire_exchange(p.handle);
-                }
+                stack.retire_dns_probes(probes);
             }
         }
-        if let Some(addr) = winner {
-            return Ok(addr);
-        }
-        if let Some(e) = step_err {
-            return Err(e);
-        }
-        Err(errors.join(" / "))
+        result
     }
 
     fn now(&self) -> SmolInstant {

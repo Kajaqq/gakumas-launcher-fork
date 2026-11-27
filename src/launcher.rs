@@ -713,7 +713,7 @@ fn direct_post(path: &str, body: &Value, token: Option<&str>) -> Result<Value, S
     let text = resp
         .into_string()
         .map_err(|e| format!("Failed to receive the DMM response: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("Failed to parse the DMM response: {e}"))
+    serde_json::from_str(&text).map_err(|e| format!("{DMM_PARSE_ERROR}: {e}"))
 }
 
 fn fetch_manifest_page(
@@ -861,15 +861,21 @@ fn dial_route(
 }
 
 /// Verify that an idle cached tunnel has not been silently dropped by the peer or NAT.
-fn check_idle_tunnel(stack: &Arc<Mutex<TunnelStack>>) -> Result<(), String> {
-    let mut s = stack.lock().map_err(|e| e.to_string())?;
-    let idle = s.idle_for();
-    if idle < IDLE_KEEPALIVE_CHECK {
-        return Ok(());
-    }
-    s.keepalive()?;
-    if idle >= IDLE_DNS_PROBE_CHECK {
-        s.resolve_in_tunnel_cancellable(DMM_HOST, Duration::from_millis(2500), None)?;
+/// The in-tunnel DNS probe applies only to VPN Gate exits, which had to pass the same
+/// lookup to connect. VPN File tunnels may legitimately run without in-tunnel DNS.
+fn check_idle_tunnel(stack: &Arc<Mutex<TunnelStack>>, dns_probe: bool) -> Result<(), String> {
+    let idle = {
+        let mut s = stack.lock().map_err(|e| e.to_string())?;
+        let idle = s.idle_for();
+        if idle < IDLE_KEEPALIVE_CHECK {
+            return Ok(());
+        }
+        s.keepalive()?;
+        idle
+    };
+    if dns_probe && idle >= IDLE_DNS_PROBE_CHECK {
+        // Shared lookup: other tunnel users keep running while the probe is in flight.
+        TunnelStack::probe_dns_shared(stack, DMM_HOST, VPNGATE_HEALTH_TIMEOUT)?;
     }
     Ok(())
 }
@@ -901,11 +907,11 @@ pub fn shared_tunnel(
     let _opening = setup.lock().map_err(|e| e.to_string())?;
     let existing = with_route(&setup, |r| {
         r.active.as_ref().map(|s| {
-            (s.stack.clone(), s.healthy, s.tried.clone(), s.rejected_subnets.clone())
+            (s.stack.clone(), s.healthy, s.tried.clone(), s.rejected_subnets.clone(), s.server.is_some())
         })
     })?;
     let (tried, rejected_subnets) = match existing {
-        Some((stack, true, tried, rejected_subnets)) => match check_idle_tunnel(&stack) {
+        Some((stack, true, tried, rejected_subnets, vpngate)) => match check_idle_tunnel(&stack, vpngate) {
             Ok(()) => return Ok(stack),
             Err(e) => {
                 netlog(&format!("Shared tunnel failed idle health check ({e}); reconnecting"));
@@ -917,7 +923,7 @@ pub fn shared_tunnel(
                 (tried, rejected_subnets)
             }
         },
-        Some((_, false, tried, rejected_subnets)) => (tried, rejected_subnets),
+        Some((_, false, tried, rejected_subnets, _)) => (tried, rejected_subnets),
         None => (HashSet::new(), HashSet::new()),
     };
     netlog(&format!("Opening shared tunnel (mode={mode})"));
@@ -938,7 +944,38 @@ impl TunnelRoute {
     }
 }
 
-fn mark_tunnel_failed(failed: &Arc<Mutex<TunnelStack>>, store: Option<&Store>, rejected_by_dmm: bool) {
+/// Why a tunnel is being abandoned. Decides what goes into the persistent reputation
+/// (`vpngate_state.json`): only faults that clearly belong to the exit are saved, so a
+/// drop in the user's own connection or a DMM outage doesn't cool down good servers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TunnelFault {
+    /// DMM answered 801/803 for this exit. Saved immediately.
+    RejectedByDmm,
+    /// The tunnel stopped carrying traffic. Saved only after another server connects,
+    /// which shows the user's own network is up.
+    Transport,
+    /// Not attributable to the exit (e.g. a DMM server error). Kept in this session only.
+    Unattributed,
+}
+
+impl TunnelFault {
+    /// Classify a `JapanLink::post` error.
+    fn of_post_error(e: &str) -> Self {
+        if e.starts_with(DMM_SERVER_ERROR) || e.starts_with(DMM_PARSE_ERROR) {
+            TunnelFault::Unattributed
+        } else {
+            TunnelFault::Transport
+        }
+    }
+}
+
+const DMM_SERVER_ERROR: &str = "DMM server error";
+const DMM_PARSE_ERROR: &str = "Failed to parse the DMM response";
+
+/// Mark `failed` unusable for this session without redialing. Only a DMM rejection is
+/// saved, because nothing here shows whether the user's own network is to blame.
+fn mark_tunnel_failed(failed: &Arc<Mutex<TunnelStack>>, store: &Store, fault: TunnelFault) {
+    let rejected_by_dmm = fault == TunnelFault::RejectedByDmm;
     let server = {
         let mut guard = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
         let Some(active) = guard
@@ -958,12 +995,8 @@ fn mark_tunnel_failed(failed: &Arc<Mutex<TunnelStack>>, store: Option<&Store>, r
         }
         active.server.clone()
     };
-    if let (Some(store), Some(info)) = (store, server) {
-        if rejected_by_dmm {
-            store.record_vpngate_rejected(&info.host_name, &info.ip);
-        } else {
-            store.record_vpngate_failures(&[(info.host_name, info.ip)]);
-        }
+    if let (true, Some(info)) = (rejected_by_dmm, server) {
+        store.record_vpngate_rejected(&info.host_name, &info.ip);
     }
 }
 
@@ -983,13 +1016,14 @@ fn record_tunnel_success(stack: &Arc<Mutex<TunnelStack>>, store: &Store) {
 
 /// Rotate only the stack that actually failed, coalescing concurrent reports.
 pub fn rotate_tunnel_if(failed: &Arc<Mutex<TunnelStack>>) -> Result<Arc<Mutex<TunnelStack>>, String> {
-    rotate_tunnel_with_reason(failed, false)
+    rotate_tunnel_with_reason(failed, TunnelFault::Transport)
 }
 
 fn rotate_tunnel_with_reason(
     failed: &Arc<Mutex<TunnelStack>>,
-    rejected_by_dmm: bool,
+    fault: TunnelFault,
 ) -> Result<Arc<Mutex<TunnelStack>>, String> {
+    let rejected_by_dmm = fault == TunnelFault::RejectedByDmm;
     let (setup, dir, mode) = {
         let guard = ROUTE.lock().map_err(|e| e.to_string())?;
         let r = guard.as_ref().filter(|r| r.active.as_ref().is_some_and(|s| Arc::ptr_eq(&s.stack, failed)))
@@ -1017,7 +1051,7 @@ fn rotate_tunnel_with_reason(
         return Ok(stack);
     }
     let store = Store { dir };
-    if let Some(info) = server {
+    if let Some(info) = &server {
         if rejected_by_dmm {
             netlog(&format!("Rotating away from DMM-rejected server {} ({})", info.host_name, info.ip));
             if let Some(subnet) = vpngate::subnet24_of(&info.ip) {
@@ -1026,11 +1060,14 @@ fn rotate_tunnel_with_reason(
             store.record_vpngate_rejected(&info.host_name, &info.ip);
         } else {
             netlog(&format!("Rotating away from failed server {} ({})", info.host_name, info.ip));
-            store.record_vpngate_failures(&[(info.host_name, info.ip)]);
         }
     }
     let stack = dial_route(&setup, &store, &mode, tried, rejected_subnets, &|m, _| netlog(m))?;
     netlog("VPN tunnel rotated successfully");
+    // Another server connected, so the old one (not the user's network) was at fault.
+    if let (TunnelFault::Transport, Some(info)) = (fault, server) {
+        store.record_vpngate_failures(&[(info.host_name, info.ip)]);
+    }
     Ok(stack)
 }
 
@@ -1046,16 +1083,16 @@ enum JapanLink {
 }
 
 impl JapanLink {
-    fn rotate_failed_server(&self, rejected_by_dmm: bool) -> Result<(), String> {
+    fn rotate_failed_server(&self, fault: TunnelFault) -> Result<(), String> {
         if let JapanLink::Tunnel(stack) = self {
-            rotate_tunnel_with_reason(stack, rejected_by_dmm)?;
+            rotate_tunnel_with_reason(stack, fault)?;
         }
         Ok(())
     }
 
-    fn mark_failed(&self, store: &Store, rejected_by_dmm: bool) {
+    fn mark_failed(&self, store: &Store, fault: TunnelFault) {
         if let JapanLink::Tunnel(stack) = self {
-            mark_tunnel_failed(stack, Some(store), rejected_by_dmm);
+            mark_tunnel_failed(stack, store, fault);
         }
     }
 
@@ -1076,8 +1113,8 @@ impl JapanLink {
                 let (status, b) = http::parse_response(&raw)?;
                 match serde_json::from_slice(&b) {
                     Ok(v) => Ok(v),
-                    Err(_) if status != 200 => Err(format!("DMM server error (HTTP {status})")),
-                    Err(e) => Err(format!("Failed to parse the DMM response: {e}")),
+                    Err(_) if status != 200 => Err(format!("{DMM_SERVER_ERROR} (HTTP {status})")),
+                    Err(e) => Err(format!("{DMM_PARSE_ERROR}: {e}")),
                 }
             }
         }
@@ -1605,7 +1642,8 @@ fn open_vpngate(
         store.record_vpngate_failures(&failed_hosts);
         return Ok(found);
     }
-    store.record_vpngate_failures(&failed_hosts);
+    // Nothing connected, so the user's own network may be at fault: keep these failures
+    // in `tried` for this session only instead of cooling the servers down persistently.
 
     Err(if list_ok {
         "Failed to connect to a VPN Gate server. Please try again in a moment.".to_string()
@@ -1875,11 +1913,11 @@ pub fn start_game_with_profile_setup(
             Ok(r) => r,
             Err(e) if can_retry => {
                 progress(&format!("{e} · trying another server"), None);
-                link.rotate_failed_server(false)?;
+                link.rotate_failed_server(TunnelFault::of_post_error(&e))?;
                 continue;
             }
             Err(e) => {
-                link.mark_failed(store, false);
+                link.mark_failed(store, TunnelFault::of_post_error(&e));
                 return Err(e);
             }
         };
@@ -1899,10 +1937,10 @@ pub fn start_game_with_profile_setup(
             }
             801 | 803 if can_retry => {
                 progress("DMM rejected the VPN server; trying another server", None);
-                link.rotate_failed_server(true)?;
+                link.rotate_failed_server(TunnelFault::RejectedByDmm)?;
             }
             801 | 803 => {
-                link.mark_failed(store, true);
+                link.mark_failed(store, TunnelFault::RejectedByDmm);
                 return Err(region_error(&settings.mode));
             }
             308 => {
@@ -2799,6 +2837,16 @@ mod tests {
         pruned.prune(github::now_secs() + REJECTED_HOST_TTL_SECS + 10);
         assert!(pruned.rejected_hosts.is_empty());
         assert!(pruned.rejected_subnets.is_empty());
+    }
+
+    #[test]
+    fn dmm_side_launch_errors_are_not_blamed_on_the_vpn_exit() {
+        for e in ["DMM server error (HTTP 503)", "Failed to parse the DMM response: EOF"] {
+            assert_eq!(TunnelFault::of_post_error(e), TunnelFault::Unattributed, "{e}");
+        }
+        for e in ["response timed out", "TLS: handshake failure", "TCP connect timed out"] {
+            assert_eq!(TunnelFault::of_post_error(e), TunnelFault::Transport, "{e}");
+        }
     }
 
     #[test]
