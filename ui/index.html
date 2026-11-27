@@ -236,6 +236,7 @@
   .meter > div { height: 100%; width: 0; border-radius: 999px; background: linear-gradient(90deg, var(--head-a), var(--head-c)); transition: width 0.3s; }
   .status { min-height: 18px; margin: 0 6px 14px; text-align: center; font-size: 14px; font-weight: 700; color: var(--text-sub); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .status.error { color: var(--red); }
+  .status.fading { opacity: 0; transition: opacity 0.4s; }
   .bottom-row { display: flex; align-items: center; gap: 16px; }
   .round {
     flex: none; display: grid; place-items: center; width: 58px; height: 58px; border-radius: 50%; cursor: pointer;
@@ -443,10 +444,25 @@ If you're outside Japan, connect to Japan with a VPN app first.</p>
     const pre = document.querySelector('.modal-log');
     if (pre) { pre.textContent = logLines.join('\n'); pre.scrollTop = pre.scrollHeight; }
   }
+  // Info messages fade out after a few seconds. Errors (which include the setup prompts)
+  // stay until replaced, and nothing fades while a task is running.
+  const STATUS_HIDE_MS = 6000;
+  let statusTimer = null;
   function setStatus(text, error = false) {
-    $('status').textContent = text || '';
-    $('status').title = text || '';
-    $('status').classList.toggle('error', error);
+    clearTimeout(statusTimer);
+    statusTimer = null;
+    const el = $('status');
+    el.classList.remove('fading');
+    el.textContent = text || '';
+    el.title = text || '';
+    el.classList.toggle('error', error);
+    if (text && !error) statusTimer = setTimeout(fadeStatus, STATUS_HIDE_MS);
+  }
+  function fadeStatus() {
+    if (busy) return void (statusTimer = setTimeout(fadeStatus, 1000));
+    const el = $('status');
+    el.classList.add('fading');
+    statusTimer = setTimeout(() => { el.classList.remove('fading'); el.textContent = ''; el.title = ''; statusTimer = null; }, 400);
   }
   function setMeter(pct) {
     const shown = pct != null && pct > 0 && pct < 100;
