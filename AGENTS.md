@@ -44,7 +44,7 @@ Pushing a `v*` tag runs CI, which builds Windows and Linux and publishes `Gakuma
 
 ## Conventions
 
-- Older code comments and doc comments are in **Korean** (this is a fork of a Korean project; `README-KR.md`). Newer fork code and all user-facing strings are in **English**. Write new comments and UI text in English.
+- Older code comments and doc comments are in **Korean** (this is a fork of a Korean project). Newer fork code and all user-facing strings are in **English**. Write new comments and UI text in English.
 - Errors are `Result<_, String>` with user-readable messages, because they're shown directly in the UI.
 - `Researches/` is git-ignored scratch space (everything except its `.gitignore`).
 - Windows release builds link the CRT statically (`.cargo/config.toml`), so the exe doesn't need the VC++ redistributable.
