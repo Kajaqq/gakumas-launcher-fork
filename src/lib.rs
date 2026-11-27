@@ -10,6 +10,7 @@
 
 pub mod platform;
 pub mod browser_proxy;
+pub mod desktop_entry;
 #[cfg(not(windows))]
 pub mod proton;
 

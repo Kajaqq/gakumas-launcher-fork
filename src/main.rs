@@ -773,6 +773,13 @@ fn fit_to_screen(win: &tauri::WebviewWindow) {
 }
 
 fn main() {
+    // Before any window exists: Wayland compositors resolve the window icon from
+    // the desktop entry matching the app id when the window first maps.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = gakumas_launcher::desktop_entry::install() {
+        eprintln!("desktop entry: {e}");
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
