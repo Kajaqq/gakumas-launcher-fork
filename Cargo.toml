@@ -67,8 +67,46 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [profile.release]
+# Balance binary size and runtime speed:
+# - Default to size optimization (`"s"`) with full LTO, symbol stripping, and
+#   abort-on-panic so Tauri/WebView2/UI glue stays compact.
+# - Optimize CPU-bound VPN, crypto, TLS, TCP/IP, and decompression crates for speed.
 opt-level = "s"
 lto = true
-codegen-units = 1
 strip = true
 panic = "abort"
+
+[profile.release.package.aes]
+opt-level = 3
+[profile.release.package.blake2]
+opt-level = 3
+[profile.release.package.boringtun]
+opt-level = 3
+[profile.release.package.cbc]
+opt-level = 3
+[profile.release.package.chacha20]
+opt-level = 3
+[profile.release.package.chacha20poly1305]
+opt-level = 3
+[profile.release.package.ctr]
+opt-level = 3
+[profile.release.package.flate2]
+opt-level = 3
+[profile.release.package.hmac]
+opt-level = 3
+[profile.release.package.md-5]
+opt-level = 3
+[profile.release.package.poly1305]
+opt-level = 3
+[profile.release.package.ring]
+opt-level = 3
+[profile.release.package.rustls]
+opt-level = 2
+[profile.release.package.sha1]
+opt-level = 3
+[profile.release.package.smoltcp]
+opt-level = 2
+[profile.release.package.x25519-dalek]
+opt-level = 3
+[profile.release.package.zlib-rs]
+opt-level = 3
